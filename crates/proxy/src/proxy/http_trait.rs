@@ -80,11 +80,15 @@ fn selection_context(
     }
 }
 
-/// Helper type for rate limiting when we don't need header access
-struct NoHeaderAccessor;
-impl HeaderAccessor for NoHeaderAccessor {
-    fn get_header(&self, _name: &str) -> Option<String> {
-        None
+/// Request headers for rate-limit keys such as `header:X-API-Key`.
+struct RequestHeaderAccessor<'a>(&'a pingora_http::RequestHeader);
+impl HeaderAccessor for RequestHeaderAccessor<'_> {
+    fn get_header(&self, name: &str) -> Option<String> {
+        self.0
+            .headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
     }
 }
 
@@ -1063,8 +1067,18 @@ impl ProxyHttp for ZentinelProxy {
             }
         }
 
+        // Every target out of rotation (e.g. all failing their health check)
+        // is "no healthy upstream": 503, as documented, not a 500.
+        let error_type = if matches!(
+            last_error,
+            Some(zentinel_common::errors::ZentinelError::NoHealthyUpstream)
+        ) {
+            ErrorType::HTTPStatus(503)
+        } else {
+            ErrorType::InternalError
+        };
         Err(Error::explain(
-            ErrorType::InternalError,
+            error_type,
             format!("All upstream attempts failed: {:?}", last_error),
         ))
     }
@@ -1136,11 +1150,15 @@ impl ProxyHttp for ZentinelProxy {
         // Fast path: skip if no rate limiting is configured for this route
         if let Some(route_id) = ctx.route_id.as_deref() {
             if self.rate_limit_manager.has_route_limiter(route_id) {
+                // Headers are passed so a `header:<name>` key sees the
+                // request's value. Passing none put every request into one
+                // shared "unknown" bucket, whatever the header said.
+                let headers = RequestHeaderAccessor(session.req_header());
                 let rate_result = self.rate_limit_manager.check(
                     route_id,
                     &ctx.client_ip,
                     &ctx.path,
-                    Option::<&NoHeaderAccessor>::None,
+                    Some(&headers),
                 );
 
                 // Store rate limit info for response headers (even if allowed)
@@ -1186,12 +1204,17 @@ impl ProxyHttp for ZentinelProxy {
                                 .unwrap_or_else(|| "Rate limit exceeded".to_string());
 
                             // Build response with rate limit headers
-                            let retry_after = rate_result.reset_at.saturating_sub(
-                                std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs(),
-                            );
+                            // The local token bucket knows exactly when the next
+                            // token arrives; round that up to whole seconds.
+                            let retry_after = match rate_result.suggested_delay_ms {
+                                Some(ms) => ms.div_ceil(1000).max(1),
+                                None => rate_result.reset_at.saturating_sub(
+                                    std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs(),
+                                ),
+                            };
                             crate::http_helpers::write_rate_limit_error(
                                 session,
                                 rate_result.status_code,

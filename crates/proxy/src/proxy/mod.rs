@@ -58,7 +58,7 @@ use crate::routing::RouteMatcher;
 
 use crate::scoped_routing::ScopedRouteMatcher;
 use crate::static_files::StaticFileServer;
-use crate::upstream::{ActiveHealthChecker, HealthCheckRunner, UpstreamPool};
+use crate::upstream::{HealthCheckRunner, UpstreamPool};
 use crate::validation::SchemaValidator;
 use listener_addr::ListenerMatchers;
 
@@ -197,26 +197,28 @@ impl ZentinelProxy {
                 .context("Failed to create scoped route matcher")?,
         ));
 
-        // Create upstream pools and active health checkers (global only)
-        let mut pools = HashMap::new();
-        let mut health_check_runner = HealthCheckRunner::new();
+        // Active health checks are started further down, once, from the
+        // flattened config: it already contains the global upstreams, so
+        // registering from `config.upstreams` as well probed every global
+        // target twice per interval. The runner exists before the pools so
+        // each pool can attach to its upstream's health results.
+        let health_check_runner = Arc::new(HealthCheckRunner::new());
 
+        // Create upstream pools (global only)
+        let mut pools = HashMap::new();
         for (upstream_id, upstream_config) in &config.upstreams {
             let mut config_with_id = upstream_config.clone();
             config_with_id.id = upstream_id.clone();
-            let pool = Arc::new(UpstreamPool::new(config_with_id.clone()).await?);
-            pools.insert(upstream_id.clone(), pool);
-
-            // Create active health checker if health check is configured
-            if let Some(checker) = ActiveHealthChecker::new(&config_with_id) {
-                health_check_runner.add_checker(checker);
-            }
+            let pool = UpstreamPool::new(config_with_id)
+                .await?
+                .with_active_health(health_check_runner.view(upstream_id));
+            pools.insert(upstream_id.clone(), Arc::new(pool));
         }
         let upstream_pools = Registry::from_map(pools);
 
         // Create scoped upstream pools from flattened config
         let scoped_upstream_pools =
-            Self::create_scoped_upstream_pools(&flattened, &mut health_check_runner).await?;
+            Self::create_scoped_upstream_pools(&flattened, &health_check_runner).await?;
 
         // Keep discovery-backed pools up to date. The supervisor reads both
         // registries on each tick, so it also covers pools installed by a later
@@ -225,8 +227,6 @@ impl ZentinelProxy {
             upstream_pools.clone(),
             scoped_upstream_pools.clone(),
         );
-
-        let health_check_runner = Arc::new(health_check_runner);
 
         // Create passive health checker
         let passive_health = Arc::new(PassiveHealthChecker::new(
@@ -260,6 +260,7 @@ impl ZentinelProxy {
             upstream_pools.clone(),
             scoped_route_matcher.clone(),
             scoped_upstream_pools.clone(),
+            health_check_runner.clone(),
         )
         .await;
 
@@ -304,13 +305,11 @@ impl ZentinelProxy {
             debug!("Registered audit reload hook");
         }
 
-        // Start active health check runner in background
+        // Start active health checking (one probe loop per upstream)
+        health_check_runner.apply(Self::health_check_upstreams(&flattened));
         if health_check_runner.checker_count() > 0 {
-            let runner = health_check_runner.clone();
-            tokio::spawn(async move {
-                runner.run().await;
-            });
             info!(
+                upstreams = ?health_check_runner.upstream_ids(),
                 "Started active health checking for {} upstreams",
                 health_check_runner.checker_count()
             );
@@ -467,6 +466,7 @@ impl ZentinelProxy {
         upstream_pools: Registry<UpstreamPool>,
         scoped_route_matcher: Arc<tokio::sync::RwLock<ScopedRouteMatcher>>,
         scoped_upstream_pools: ScopedRegistry<UpstreamPool>,
+        health_check_runner: Arc<HealthCheckRunner>,
     ) {
         let mut reload_rx = config_manager.subscribe();
         let config_manager_clone = config_manager.clone();
@@ -514,6 +514,20 @@ impl ZentinelProxy {
                         error!("Failed to reload scoped routes: {}", e);
                     }
 
+                    // Reconcile active health checks with the new config:
+                    // start added checks, restart changed ones, stop removed
+                    // ones. Done before the pool update so a pool-build
+                    // timeout cannot leave the old probes in place.
+                    let changes =
+                        health_check_runner.apply(Self::health_check_upstreams(&flattened));
+                    info!(
+                        started = changes.started,
+                        restarted = changes.restarted,
+                        stopped = changes.stopped,
+                        unchanged = changes.unchanged,
+                        "Health checks reloaded"
+                    );
+
                     // Update upstream pools with timeout to avoid blocking
                     // the reload handler on DNS resolution / connection attempts
                     let pool_update = async {
@@ -523,6 +537,8 @@ impl ZentinelProxy {
                             config_with_id.id = upstream_id.clone();
                             match UpstreamPool::new(config_with_id).await {
                                 Ok(pool) => {
+                                    let pool = pool
+                                        .with_active_health(health_check_runner.view(upstream_id));
                                     new_pools.insert(upstream_id.clone(), Arc::new(pool));
                                 }
                                 Err(e) => {
@@ -538,7 +554,9 @@ impl ZentinelProxy {
                             let old_pools = upstream_pools.replace(new_pools).await;
 
                             // Update scoped upstream pools
-                            let new_scoped_pools = Self::build_scoped_pools_list(&flattened).await;
+                            let new_scoped_pools =
+                                Self::build_scoped_pools_list(&flattened, &health_check_runner)
+                                    .await;
                             let old_scoped_pools =
                                 scoped_upstream_pools.replace_all(new_scoped_pools).await;
 
@@ -561,7 +579,7 @@ impl ZentinelProxy {
     /// Create scoped upstream pools from flattened config
     async fn create_scoped_upstream_pools(
         flattened: &FlattenedConfig,
-        health_check_runner: &mut HealthCheckRunner,
+        health_check_runner: &HealthCheckRunner,
     ) -> Result<ScopedRegistry<UpstreamPool>> {
         let registry = ScopedRegistry::new();
 
@@ -574,7 +592,8 @@ impl ZentinelProxy {
                     .await
                     .with_context(|| {
                         format!("Failed to create upstream pool '{}'", qid.canonical())
-                    })?,
+                    })?
+                    .with_active_health(health_check_runner.view(&qid.canonical())),
             );
 
             // Track exports
@@ -586,11 +605,6 @@ impl ZentinelProxy {
                 registry.insert_exported(qid.clone(), pool).await;
             } else {
                 registry.insert(qid.clone(), pool).await;
-            }
-
-            // Create active health checker if configured
-            if let Some(checker) = ActiveHealthChecker::new(&config_with_id) {
-                health_check_runner.add_checker(checker);
             }
 
             debug!(
@@ -606,9 +620,24 @@ impl ZentinelProxy {
         Ok(registry)
     }
 
+    /// Every upstream (global and namespaced) with its canonical id set, which
+    /// is what the health check runner keys its probe loops by. Global
+    /// upstreams appear in the flattened config under `Scope::Global`, whose
+    /// canonical id is the plain upstream id.
+    fn health_check_upstreams(
+        flattened: &FlattenedConfig,
+    ) -> impl Iterator<Item = zentinel_config::UpstreamConfig> + '_ {
+        flattened.upstreams.iter().map(|(qid, upstream)| {
+            let mut config = upstream.clone();
+            config.id = qid.canonical();
+            config
+        })
+    }
+
     /// Build list of scoped pools for atomic replacement
     async fn build_scoped_pools_list(
         flattened: &FlattenedConfig,
+        health_check_runner: &HealthCheckRunner,
     ) -> Vec<(QualifiedId, Arc<UpstreamPool>, bool)> {
         let mut result = Vec::new();
 
@@ -618,6 +647,7 @@ impl ZentinelProxy {
 
             match UpstreamPool::new(config_with_id).await {
                 Ok(pool) => {
+                    let pool = pool.with_active_health(health_check_runner.view(&qid.canonical()));
                     let is_exported = flattened
                         .exported_upstreams
                         .contains_key(&upstream_config.id);
@@ -723,10 +753,27 @@ impl ZentinelProxy {
                 key = ?global.key,
                 "Initializing global rate limiter"
             );
-            RateLimitManager::with_global_limit(global.max_rps, global.burst)
+            // `key` was parsed and dropped: the global limit was always per
+            // client IP whatever the config said.
+            RateLimitManager::with_global_limit_keyed(
+                global.max_rps,
+                global.burst,
+                global.key.clone(),
+            )
         } else {
             RateLimitManager::new()
         };
+
+        let default_limit = Self::default_route_rate_limit(&config.rate_limits);
+        if let Some(ref default) = default_limit {
+            info!(
+                max_rps = default.max_rps,
+                burst = default.burst,
+                key = ?default.key,
+                "Default rate limit applies to routes without their own limit"
+            );
+        }
+        let mut defaulted_routes = 0usize;
 
         for route in &config.routes {
             // Check for rate limit in route policies
@@ -779,16 +826,53 @@ impl ZentinelProxy {
                     }
                 }
             }
+
+            // `rate-limits { default-rps }` covers every route that has no
+            // limit of its own. A route's own limit (policy or filter) replaces
+            // the default rather than stacking with it.
+            if let Some(ref default) = default_limit {
+                if !manager.has_route_specific_limiter(&route.id) {
+                    manager.register_route(&route.id, default.clone());
+                    defaulted_routes += 1;
+                    debug!(route_id = %route.id, "Registered default rate limiter for route");
+                }
+            }
         }
 
         if manager.route_count() > 0 {
             info!(
                 route_count = manager.route_count(),
-                "Rate limiting initialized"
+                defaulted_routes, "Rate limiting initialized"
             );
         }
 
         manager
+    }
+
+    /// The limiter for routes without one of their own, from
+    /// `rate-limits { default-rps N default-burst M key "..." }`.
+    ///
+    /// These keys were parsed and documented ("Default for routes without
+    /// explicit limits") but nothing outside the config crate read them, so a
+    /// configured default limited nothing. It uses the same limiter as a
+    /// route's `rate-limit` filter: rejects with 429 and the usual
+    /// `X-RateLimit-*` / `Retry-After` headers, keyed by `key` (client IP
+    /// unless set). Each route gets its own bucket, as with a per-route filter.
+    fn default_route_rate_limit(
+        rate_limits: &zentinel_config::GlobalRateLimitConfig,
+    ) -> Option<RateLimitConfig> {
+        let max_rps = rate_limits.default_rps?;
+        Some(RateLimitConfig {
+            max_rps,
+            burst: rate_limits.default_burst.unwrap_or(max_rps),
+            key: rate_limits.key.clone(),
+            action: zentinel_config::RateLimitAction::Reject,
+            status_code: 429,
+            message: None,
+            backend: zentinel_config::RateLimitBackend::Local,
+            max_delay_ms: 5000,
+            max_keys: crate::rate_limit::DEFAULT_MAX_RATE_LIMIT_KEYS,
+        })
     }
 
     /// Initialize inference rate limiters from configuration
@@ -1200,5 +1284,310 @@ mod listener_matcher_tests {
         assert_eq!(listener.id, "public");
         assert_eq!(listener.request_timeout_secs, 17);
         assert_eq!(listener.keepalive_timeout_secs, 23);
+    }
+}
+
+#[cfg(test)]
+mod health_check_wiring_tests {
+    use super::*;
+    use crate::reload::ReloadTrigger;
+    use std::collections::BTreeSet;
+
+    fn config_kdl(targets: &[String], health_check: &str) -> String {
+        let targets: String = targets
+            .iter()
+            .map(|t| format!("target \"{t}\"\n"))
+            .collect();
+        format!(
+            r#"
+            schema-version "1.0"
+            system {{ worker-threads 0 }}
+            listeners {{
+                listener "http" {{ address "127.0.0.1:19290" protocol "http" }}
+            }}
+            routes {{
+                route "default" {{
+                    matches {{ path-prefix "/" }}
+                    upstream "backend"
+                }}
+            }}
+            upstreams {{
+                upstream "backend" {{
+                    {targets}
+                    {health_check}
+                }}
+            }}
+            "#
+        )
+    }
+
+    const CHECK: &str = r#"health-check {
+        type "http" { path "/health" }
+        interval-secs 1
+        healthy-threshold 1
+        unhealthy-threshold 1
+    }"#;
+
+    fn init_crypto_provider() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+
+    /// An HTTP server that answers every request with `status`.
+    async fn backend(status: u16) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr").to_string();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let _ = sock.read(&mut buf).await;
+                    let resp = format!(
+                        "HTTP/1.1 {status} X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// Distinct targets chosen in `n` selections.
+    async fn selected(proxy: &ZentinelProxy, n: usize) -> BTreeSet<String> {
+        let pool = proxy
+            .upstream_pools
+            .get("backend")
+            .await
+            .expect("pool exists");
+        let mut seen = BTreeSet::new();
+        for _ in 0..n {
+            let peer = pool.select_peer(None).await.expect("a target is selected");
+            seen.insert(pingora_core::upstreams::peer::Peer::address(&peer).to_string());
+        }
+        seen
+    }
+
+    /// Poll `selected` until it returns `expected`, for up to 6 s.
+    async fn routes_to(proxy: &ZentinelProxy, expected: &BTreeSet<String>) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+        while tokio::time::Instant::now() < deadline {
+            if &selected(proxy, 20).await == expected {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    async fn reload_and_wait_for(proxy: &ZentinelProxy, expected: usize) -> usize {
+        proxy
+            .config_manager
+            .reload(ReloadTrigger::Signal)
+            .await
+            .expect("reload succeeds");
+        // The reload handler applies the new config on its own task.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while proxy.health_check_runner.checker_count() != expected
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        proxy.health_check_runner.checker_count()
+    }
+
+    /// Three defects, one test: `ZentinelProxy::new` registers process-global
+    /// metrics, so only one proxy can be built per test binary.
+    ///
+    /// 1. Startup registered each global upstream's health check twice: once
+    ///    from `config.upstreams`, once from the flattened config, which lists
+    ///    the global upstreams again. Every target was probed twice per
+    ///    interval, and the log said "health checking for 2 upstreams" for one.
+    /// 2. Probe results never reached target selection: a target failing its
+    ///    health check stayed in rotation.
+    /// 3. A SIGHUP reload rebuilt routes and pools but never touched the
+    ///    health check runner, so a check added by a reload never probed and
+    ///    one removed by a reload kept probing.
+    #[tokio::test]
+    async fn health_checks_route_around_failures_and_follow_reloads() {
+        init_crypto_provider();
+        let good = backend(200).await;
+        let bad = backend(500).await;
+        let targets = [good.clone(), bad.clone()];
+        let only_good: BTreeSet<String> = [good.clone()].into();
+        let both: BTreeSet<String> = targets.iter().cloned().collect();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("zentinel.kdl");
+        std::fs::write(&path, config_kdl(&targets, CHECK)).expect("write config");
+
+        let proxy = ZentinelProxy::new(Some(path.to_str().unwrap()))
+            .await
+            .expect("proxy builds");
+        assert_eq!(
+            proxy.health_check_runner.checker_count(),
+            1,
+            "one upstream with a health check must get exactly one checker"
+        );
+
+        // The failing target leaves rotation once probed...
+        assert!(
+            routes_to(&proxy, &only_good).await,
+            "a target failing its health check stayed in rotation"
+        );
+
+        // ...comes back when the check is removed, in the reloaded pools...
+        std::fs::write(&path, config_kdl(&targets, "")).expect("write config");
+        assert_eq!(
+            reload_and_wait_for(&proxy, 0).await,
+            0,
+            "a health check removed by reload was not stopped"
+        );
+        assert!(
+            routes_to(&proxy, &both).await,
+            "removing the health check did not readmit the target"
+        );
+
+        // ...and a check added by reload takes it out again.
+        std::fs::write(&path, config_kdl(&targets, CHECK)).expect("write config");
+        assert_eq!(
+            reload_and_wait_for(&proxy, 1).await,
+            1,
+            "a health check added by reload was not started"
+        );
+        assert!(
+            routes_to(&proxy, &only_good).await,
+            "a health check added by reload did not take the failing target out"
+        );
+    }
+}
+
+#[cfg(test)]
+mod default_rate_limit_tests {
+    use super::*;
+
+    struct NoHeaders;
+    impl crate::rate_limit::HeaderAccessor for NoHeaders {
+        fn get_header(&self, _name: &str) -> Option<String> {
+            None
+        }
+    }
+
+    fn config(rate_limits: &str) -> Config {
+        let kdl = format!(
+            r#"
+            schema-version "1.0"
+            system {{ worker-threads 0 }}
+            listeners {{
+                listener "http" {{ address "127.0.0.1:19290" protocol "http" }}
+            }}
+            {rate_limits}
+            filters {{
+                filter "own-limit" {{
+                    type "rate-limit"
+                    max-rps 4
+                    burst 4
+                }}
+            }}
+            routes {{
+                route "plain" {{
+                    matches {{ path-prefix "/plain" }}
+                    upstream "backend"
+                }}
+                route "own" {{
+                    matches {{ path-prefix "/own" }}
+                    upstream "backend"
+                    filters "own-limit"
+                }}
+            }}
+            upstreams {{
+                upstream "backend" {{ target "127.0.0.1:19291" }}
+            }}
+            "#
+        );
+        Config::from_kdl(&kdl).expect("config parses")
+    }
+
+    /// Status of `n` back-to-back requests from one client to a route.
+    fn statuses(manager: &RateLimitManager, route: &str, n: usize) -> Vec<u16> {
+        (0..n)
+            .map(|_| {
+                let r = manager.check(route, "203.0.113.7", "/", Option::<&NoHeaders>::None);
+                if r.allowed {
+                    200
+                } else {
+                    r.status_code
+                }
+            })
+            .collect()
+    }
+
+    /// `rate-limits { default-rps }` was parsed and documented as the limit
+    /// for routes without one of their own, and nothing read it: every
+    /// request to such a route was allowed.
+    #[test]
+    fn default_rps_limits_routes_without_their_own_limit() {
+        let config = config("rate-limits { default-rps 2; default-burst 2 }");
+        assert_eq!(config.rate_limits.default_rps, Some(2));
+        let manager = ZentinelProxy::initialize_rate_limiters(&config);
+
+        assert_eq!(statuses(&manager, "plain", 4), vec![200, 200, 429, 429]);
+
+        // The headers come from the same result: limit and remaining.
+        let limited = manager.check("plain", "203.0.113.7", "/", Option::<&NoHeaders>::None);
+        assert_eq!(limited.limit, 2);
+        assert_eq!(limited.remaining, 0);
+
+        // Another client has its own bucket.
+        let other = manager.check("plain", "198.51.100.1", "/", Option::<&NoHeaders>::None);
+        assert!(other.allowed);
+    }
+
+    #[test]
+    fn a_route_with_its_own_limit_ignores_the_default() {
+        let config = config("rate-limits { default-rps 2 }");
+        let manager = ZentinelProxy::initialize_rate_limiters(&config);
+
+        assert_eq!(
+            statuses(&manager, "own", 6),
+            vec![200, 200, 200, 200, 429, 429]
+        );
+    }
+
+    /// `global { key }` was parsed and ignored: the global limiter was
+    /// always keyed by client IP. Keyed by path, clients share one bucket
+    /// per path.
+    #[test]
+    fn the_global_limit_uses_its_configured_key() {
+        let config = config("rate-limits { global { max-rps 2; burst 2; key \"path\" } }");
+        let manager = ZentinelProxy::initialize_rate_limiters(&config);
+        let check = |ip: &str, path: &str| {
+            manager
+                .check("plain", ip, path, Option::<&NoHeaders>::None)
+                .allowed
+        };
+
+        assert!(check("198.51.100.1", "/x"));
+        assert!(check("198.51.100.2", "/x"));
+        assert!(
+            !check("198.51.100.3", "/x"),
+            "a path-keyed global limit was applied per client IP"
+        );
+        // Another path has its own bucket.
+        assert!(check("198.51.100.1", "/y"));
+    }
+
+    #[test]
+    fn without_a_default_unlimited_routes_stay_unlimited() {
+        let config = config("");
+        let manager = ZentinelProxy::initialize_rate_limiters(&config);
+
+        assert!(!manager.has_route_limiter("plain"));
+        assert_eq!(statuses(&manager, "plain", 10), vec![200; 10]);
+        assert_eq!(
+            statuses(&manager, "own", 6),
+            vec![200, 200, 200, 200, 429, 429]
+        );
     }
 }
