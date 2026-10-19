@@ -27,7 +27,7 @@ use crate::routing::RouteMatcher;
 /// A dual-stack `[::]` bind reports IPv4 peers in mapped form, so without this
 /// the same connection compares unequal depending on which family the socket
 /// was opened with.
-fn canonical_ip(ip: IpAddr) -> IpAddr {
+pub(crate) fn canonical_ip(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
             Some(v4) => IpAddr::V4(v4),

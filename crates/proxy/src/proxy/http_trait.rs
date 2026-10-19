@@ -47,6 +47,39 @@ fn to_socket_addr(
     addr.as_inet().copied()
 }
 
+/// The load-balancer view of a request: the client IP (as set in
+/// `early_request_filter`, so behind `trusted-proxies` it is the real client)
+/// and the request headers keyed by lowercase name, repeated fields joined
+/// (`cookie` with "; ", others with ", ").
+fn selection_context(
+    req: &pingora::http::RequestHeader,
+    ctx: &RequestContext,
+) -> crate::upstream::RequestContext {
+    let mut headers: std::collections::HashMap<String, String> =
+        std::collections::HashMap::with_capacity(req.headers.keys_len());
+    for (name, value) in req.headers.iter() {
+        let Ok(value) = value.to_str() else { continue };
+        let separator = if name == http::header::COOKIE {
+            "; "
+        } else {
+            ", "
+        };
+        headers
+            .entry(name.as_str().to_string())
+            .and_modify(|existing| {
+                existing.push_str(separator);
+                existing.push_str(value);
+            })
+            .or_insert_with(|| value.to_string());
+    }
+    crate::upstream::RequestContext {
+        client_ip: ctx.client_socket_addr(),
+        headers,
+        path: ctx.path.clone(),
+        method: ctx.method.clone(),
+    }
+}
+
 /// Helper type for rate limiting when we don't need header access
 struct NoHeaderAccessor;
 impl HeaderAccessor for NoHeaderAccessor {
@@ -74,6 +107,39 @@ impl ZentinelProxy {
         // the configured `0.0.0.0`. The lookup resolves that.
         let addr = to_socket_addr(session.downstream_session.server_addr()?)?;
         matchers.get(addr).cloned()
+    }
+
+    /// Set the `X-Forwarded-*` headers on the downstream request and record
+    /// the client IP in `ctx`. The trust rule lives in [`super::forwarded`].
+    ///
+    /// The client IP must be set here, before `request_filter`: rate limiting,
+    /// geo filters and agents read it there, and it used to be set only later
+    /// in `upstream_peer`, which left every client sharing one rate-limit key.
+    fn apply_forwarded(&self, session: &mut Session, ctx: &mut RequestContext) {
+        // Listener addresses are validated as IP:PORT, so the peer is always an
+        // inet address; anything else is left as it was.
+        let Some(peer) = session.client_addr().and_then(to_socket_addr) else {
+            return;
+        };
+        let tls = session.digest().is_some_and(|d| d.ssl_digest.is_some());
+        let config = std::sync::Arc::clone(
+            ctx.config
+                .get_or_insert_with(|| self.config_manager.current()),
+        );
+        let trusted = session
+            .downstream_session
+            .server_addr()
+            .and_then(to_socket_addr)
+            .and_then(|local| listener_for_addr(&config.listeners, local))
+            .map(|listener| listener.trusted_proxies.as_slice())
+            .unwrap_or(&[]);
+        let client = super::forwarded::apply_forwarded_headers(
+            session.req_header_mut(),
+            peer.ip(),
+            tls,
+            trusted,
+        );
+        ctx.client_ip = client.to_string();
     }
 }
 
@@ -222,6 +288,10 @@ impl ProxyHttp for ZentinelProxy {
         // (proxied, builtin, static, rejected). Paired with dec_requests() in logging().
         self.reload_coordinator.inc_requests();
 
+        // X-Forwarded-* and the client IP, before anything reads either: route
+        // matching on headers, rate limiting, geo filters and agents (#515).
+        self.apply_forwarded(session, ctx);
+
         // Extract request info for routing
         let req_header = session.req_header();
         let method = req_header.method.as_str();
@@ -356,7 +426,7 @@ impl ProxyHttp for ZentinelProxy {
         if let Some(call) = ctx.mcp_proxied_call.clone() {
             if let Some(pool) = self.upstream_pools.get(&call.upstream).await {
                 let selection_ctx = crate::upstream::RequestContext {
-                    client_ip: ctx.client_ip.parse().ok(),
+                    client_ip: ctx.client_socket_addr(),
                     headers: std::collections::HashMap::new(),
                     path: call.path.clone(),
                     method: "POST".to_string(),
@@ -857,6 +927,12 @@ impl ProxyHttp for ZentinelProxy {
             "Starting upstream peer selection"
         );
 
+        // What client-aware balancers key on. This used to be `None`, so on
+        // the main proxy path `ip-hash` hashed nothing and sent every client
+        // to the same target, consistent/maglev hashing by client IP did the
+        // same, and a sticky-session cookie was never read back.
+        let selection_ctx = selection_context(session.req_header(), ctx);
+
         let mut last_error = None;
         let selection_start = std::time::Instant::now();
 
@@ -871,7 +947,7 @@ impl ProxyHttp for ZentinelProxy {
                 "Attempting to select upstream peer"
             );
 
-            match pool.select_peer_with_metadata(None).await {
+            match pool.select_peer_with_metadata(Some(&selection_ctx)).await {
                 Ok((mut peer, metadata)) => {
                     let selection_duration = selection_start.elapsed();
                     // Track active request for drain lifecycle
@@ -1685,12 +1761,21 @@ impl ProxyHttp for ZentinelProxy {
             }
         }
 
-        // Get client address before mutable borrow
-        let client_addr = session
-            .client_addr()
-            .map(|a| format!("{}", a))
-            .unwrap_or_else(|| "unknown".to_string());
-        let client_port = session.client_addr().map(|_| 0).unwrap_or(0);
+        // The client as agents see it: the same address rate limiting and the
+        // upstream's X-Forwarded-For use. This was the raw peer formatted as
+        // "ip:port", and the port was always sent as 0. The port is now the
+        // peer's when the peer is the client, and 0 when the client address
+        // came from a trusted proxy's X-Forwarded-For (its port is unknown).
+        let peer = session.client_addr().and_then(to_socket_addr);
+        let client_addr = if ctx.client_ip.is_empty() {
+            "unknown".to_string()
+        } else {
+            ctx.client_ip.clone()
+        };
+        let client_port = peer
+            .filter(|p| super::listener_addr::canonical_ip(p.ip()).to_string() == client_addr)
+            .map(|p| p.port())
+            .unwrap_or(0);
 
         let req_header = session.req_header_mut();
 
@@ -2688,7 +2773,7 @@ impl ProxyHttp for ZentinelProxy {
 
                     // Create request context for shadow (simplified from proxy context)
                     let shadow_ctx = crate::upstream::RequestContext {
-                        client_ip: ctx.client_ip.parse().ok(),
+                        client_ip: ctx.client_socket_addr(),
                         headers: std::collections::HashMap::new(), // Empty for now
                         path: ctx.path.clone(),
                         method: ctx.method.clone(),
@@ -4590,7 +4675,7 @@ impl ZentinelProxy {
         // sticky sessions — pick the same target a proxied request would rather
         // than a different one for every fan-out.
         let selection_ctx = crate::upstream::RequestContext {
-            client_ip: ctx.client_ip.parse().ok(),
+            client_ip: ctx.client_socket_addr(),
             headers: std::collections::HashMap::new(),
             path: path.to_string(),
             method: "POST".to_string(),
@@ -5448,5 +5533,34 @@ mod proxy_error_body_tests {
     #[test]
     fn a_status_without_a_canonical_reason_is_not_called_a_server_error() {
         assert_eq!(error_field(599), "599 Error");
+    }
+}
+
+#[cfg(test)]
+mod selection_context_tests {
+    use super::*;
+
+    /// The main proxy path passed no context to peer selection, so
+    /// client-keyed balancers had nothing to key on.
+    #[test]
+    fn carries_client_ip_and_joined_headers() {
+        let mut req = pingora::http::RequestHeader::build("GET", b"/x", None).unwrap();
+        req.append_header("Cookie", "a=1").unwrap();
+        req.append_header("Cookie", "zentinel_sticky=0.sig")
+            .unwrap();
+        req.append_header("X-Tenant", "t1").unwrap();
+        let mut ctx = RequestContext::new();
+        ctx.client_ip = "198.51.100.7".to_string();
+        ctx.path = "/x".to_string();
+        ctx.method = "GET".to_string();
+
+        let sel = selection_context(&req, &ctx);
+        assert_eq!(sel.client_ip, Some("198.51.100.7:0".parse().unwrap()));
+        assert_eq!(
+            sel.headers.get("cookie").map(String::as_str),
+            Some("a=1; zentinel_sticky=0.sig")
+        );
+        assert_eq!(sel.headers.get("x-tenant").map(String::as_str), Some("t1"));
+        assert_eq!(sel.path, "/x");
     }
 }
