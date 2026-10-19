@@ -747,6 +747,28 @@ fn check_values(
                 report(Some(problem));
             }
         }
+        // The same positions the closed-block check lists for `limits`, so a
+        // `limits` node inside free-form agent configuration is left alone. A
+        // scoped block is checked from its namespace or service, which is
+        // where its id is.
+        ("limits", _) if parent.is_none() => {
+            for problem in crate::kdl::unapplied_limits_settings(node, None) {
+                report(Some(problem));
+            }
+        }
+        (kind @ ("namespace" | "service"), Some(scope_id)) => {
+            for limits in node
+                .children()
+                .into_iter()
+                .flat_map(|c| c.nodes())
+                .filter(|n| n.name().value() == "limits")
+            {
+                for problem in crate::kdl::unapplied_limits_settings(limits, Some((kind, scope_id)))
+                {
+                    report(Some(problem));
+                }
+            }
+        }
         ("matches", _) if parent == Some("route") => check_run_together_matches(node, result),
         _ => {}
     }
@@ -2306,7 +2328,12 @@ mod tests {
             }
             "#,
         );
-        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        // Plus the service block's own report that it is not applied.
+        let unknown = warnings
+            .iter()
+            .filter(|w| w.contains("'max-body-size-bytes'"))
+            .count();
+        assert_eq!(unknown, 2, "{warnings:?}");
     }
 
     #[test]
@@ -2324,6 +2351,49 @@ mod tests {
             "#,
         );
         assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// #542: a `0` connection or in-flight limit loaded and limited nothing
+    /// while these keys were never applied. Now that they are, `0` stays "no
+    /// limit" rather than refusing everything, and says so.
+    #[test]
+    fn a_zero_concurrency_limit_is_reported_as_ignored() {
+        let warnings = warnings_for(
+            r#"
+            limits {
+                max-in-flight-requests 0
+                max-total-connections 0
+                max-connections-per-client 5
+            }
+            "#,
+        );
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings
+            .iter()
+            .all(|w| w.contains("is being ignored") && w.contains(" 0'")));
+    }
+
+    /// #542: namespace limits are applied to the namespace's routes; a
+    /// service's are not, since no listener serves a service's routes.
+    #[test]
+    fn service_limits_are_reported_and_namespace_limits_are_not() {
+        let warnings = warnings_for(
+            r#"
+            namespace "ns" {
+                limits {
+                    max-body-size 1000
+                    max-in-flight-requests 5
+                    max-connections-per-client 5
+                }
+                service "svc" {
+                    limits { max-body-size 10 }
+                }
+            }
+            "#,
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("service 'svc'"), "{warnings:?}");
+        assert!(warnings[0].contains("is being ignored"), "{warnings:?}");
     }
 
     /// The values from #521 that each fell back to a default without a word.

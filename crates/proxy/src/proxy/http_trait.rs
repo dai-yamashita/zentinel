@@ -93,6 +93,86 @@ impl HeaderAccessor for RequestHeaderAccessor<'_> {
 }
 
 impl ZentinelProxy {
+    /// Count this request against `limits { max-in-flight-requests }`, or
+    /// answer it with 503 when the limit is full. Returns `true` when the
+    /// request was answered here.
+    ///
+    /// 503 rather than 429: the limit protects the proxy and its upstreams
+    /// from load as a whole, not from one client sending too much, and a
+    /// client that has sent one request may still be refused. `Retry-After`
+    /// is one second, since in-flight requests usually finish quicker than
+    /// that.
+    ///
+    /// Called from `request_filter`, so builtin handlers (health, status,
+    /// metrics), which are answered in `early_request_filter`, are never
+    /// refused: a health check failing because the proxy is busy would take
+    /// a working proxy out of its load balancer.
+    async fn refuse_over_in_flight_limit(
+        &self,
+        session: &mut Session,
+        ctx: &mut RequestContext,
+    ) -> Result<bool, Box<Error>> {
+        let config = std::sync::Arc::clone(
+            ctx.config
+                .get_or_insert_with(|| self.config_manager.current()),
+        );
+        let limit = config.limits.max_in_flight_requests;
+        let Some(global) = self.in_flight.try_acquire_global(limit) else {
+            return self.refuse_in_flight(session, ctx, "global", limit).await;
+        };
+        let Some(namespace) = ctx.namespace.clone() else {
+            ctx.in_flight.push(global);
+            return Ok(false);
+        };
+        // A namespace's limit has its own counter: the namespace may have
+        // that many requests in flight, within the global limit (#542).
+        let ns_limit = ctx
+            .namespace_limits()
+            .and_then(|l| l.max_in_flight_requests);
+        match self.in_flight.try_acquire_namespace(&namespace, ns_limit) {
+            Some(scoped) => {
+                ctx.in_flight.extend([global, scoped]);
+                Ok(false)
+            }
+            None => {
+                drop(global);
+                self.refuse_in_flight(session, ctx, &namespace, ns_limit)
+                    .await
+            }
+        }
+    }
+
+    async fn refuse_in_flight(
+        &self,
+        session: &mut Session,
+        ctx: &RequestContext,
+        scope: &str,
+        limit: Option<usize>,
+    ) -> Result<bool, Box<Error>> {
+        warn!(
+            correlation_id = %ctx.trace_id,
+            route_id = ctx.route_id.as_deref().unwrap_or("unknown"),
+            scope = scope,
+            limit = limit.unwrap_or_default(),
+            "Request refused: max-in-flight-requests reached"
+        );
+        self.metrics
+            .record_blocked_request("in_flight_limit_exceeded");
+        write_in_flight_refusal(session, &ctx.trace_id).await?;
+        Ok(true)
+    }
+
+    /// The namespace the listener this request arrived on is bound to.
+    fn listener_namespace(&self, session: &Session, ctx: &mut RequestContext) -> Option<String> {
+        let local = to_socket_addr(session.downstream_session.server_addr()?)?;
+        let config = ctx
+            .config
+            .get_or_insert_with(|| self.config_manager.current());
+        listener_for_addr(&config.listeners, local)?
+            .namespace
+            .clone()
+    }
+
     /// Route matcher for the listener a request arrived on.
     ///
     /// Returns `Some` only when the arrival listener is bound to a namespace
@@ -379,6 +459,12 @@ impl ProxyHttp for ZentinelProxy {
 
         ctx.route_id = Some(route_match.route_id.to_string());
         ctx.route_config = Some(route_match.config.clone());
+        // A route from a namespace-bound listener is that namespace's, and its
+        // `limits` apply to the request (#542). It also fills the access
+        // log's `namespace`, which nothing set before.
+        if listener_matcher.is_some() {
+            ctx.namespace = self.listener_namespace(session, ctx);
+        }
 
         // Parse incoming W3C trace context if present
         if let Some(traceparent) = req_header.headers.get(crate::otel::TRACEPARENT_HEADER) {
@@ -1117,6 +1203,10 @@ impl ProxyHttp for ZentinelProxy {
             }
         }
 
+        if self.refuse_over_in_flight_limit(session, ctx).await? {
+            return Ok(true);
+        }
+
         // Refuse a body declared larger than the limit before reading any of
         // it or connecting upstream. Chunked bodies, which declare no length,
         // are counted as they stream in `request_body_filter`.
@@ -1812,19 +1902,24 @@ impl ProxyHttp for ZentinelProxy {
         let config = ctx
             .config
             .get_or_insert_with(|| self.config_manager.current());
+        let (global_header_count, global_header_size) = (
+            config.limits.max_header_count,
+            config.limits.max_header_size_bytes,
+        );
+        // The namespace's limits, where smaller, apply instead (#542).
+        let max_header_count = ctx.max_header_count(global_header_count);
+        let max_header_size = ctx.max_header_size(global_header_size);
 
         // Enforce header limits (fast path: skip if limits are very high)
         const HEADER_LIMIT_THRESHOLD: usize = 1024 * 1024; // 1MB = effectively unlimited
 
         // Header count check - O(1)
         let header_count = req_header.headers.len();
-        if config.limits.max_header_count < HEADER_LIMIT_THRESHOLD
-            && header_count > config.limits.max_header_count
-        {
+        if max_header_count < HEADER_LIMIT_THRESHOLD && header_count > max_header_count {
             warn!(
                 correlation_id = %ctx.trace_id,
                 header_count = header_count,
-                limit = config.limits.max_header_count,
+                limit = max_header_count,
                 "Request blocked: exceeds header count limit"
             );
 
@@ -1833,18 +1928,18 @@ impl ProxyHttp for ZentinelProxy {
         }
 
         // Header size check - O(n), skip if limit is very high
-        if config.limits.max_header_size_bytes < HEADER_LIMIT_THRESHOLD {
+        if max_header_size < HEADER_LIMIT_THRESHOLD {
             let total_header_size: usize = req_header
                 .headers
                 .iter()
                 .map(|(k, v)| k.as_str().len() + v.len())
                 .sum();
 
-            if total_header_size > config.limits.max_header_size_bytes {
+            if total_header_size > max_header_size {
                 warn!(
                     correlation_id = %ctx.trace_id,
                     header_size = total_header_size,
-                    limit = config.limits.max_header_size_bytes,
+                    limit = max_header_size,
                     "Request blocked: exceeds header size limit"
                 );
 
@@ -4186,6 +4281,30 @@ impl ProxyHttp for ZentinelProxy {
 /// oversized request (#517). Marking it downstream matters as much as the
 /// status: raised while the body streams, it reaches `error_while_proxy`,
 /// which would otherwise count it against the upstream peer.
+/// The 503 for a request over `max-in-flight-requests`.
+///
+/// The same JSON body and headers `fail_to_proxy` sends, so clients see one
+/// error format, plus `Retry-After`, which that path cannot add. Written here
+/// rather than returned as an error so the refusal never reaches the
+/// upstream error accounting: no upstream was involved.
+async fn write_in_flight_refusal(session: &mut Session, trace_id: &str) -> Result<(), Box<Error>> {
+    let body = proxy_error_body(503, trace_id);
+    let mut header = ResponseHeader::build(503, None)?;
+    header.insert_header("Content-Type", "application/json")?;
+    header.insert_header("Content-Length", body.len().to_string())?;
+    header.insert_header("Retry-After", "1")?;
+    header.insert_header("X-Correlation-Id", trace_id)?;
+    // Shed the connection along with the request: the proxy is at capacity.
+    session.set_keepalive(None);
+    session
+        .write_response_header(Box::new(header), false)
+        .await?;
+    session
+        .write_response_body(Some(Bytes::from(body)), true)
+        .await?;
+    Ok(())
+}
+
 fn body_too_large() -> Box<Error> {
     Error::explain(
         ErrorType::HTTPStatus(413),

@@ -1082,10 +1082,93 @@ pub(crate) const RECOGNIZED_LIMITS_KEYS: &[&str] = &[
     "max-in-flight-requests",
 ];
 
-/// Parse limits configuration block
-pub fn parse_limits_config(node: &kdl::KdlNode) -> Result<Limits> {
-    let mut limits = Limits::default();
+/// The connection and in-flight limits of a `limits` block.
+///
+/// Each is unlimited unless written, and `0` is read as unlimited too: these
+/// keys were parsed and never applied before #542, so a `0` loaded and limited
+/// nothing, and enforcing it now would refuse every connection or request.
+/// [`unapplied_limits_settings`] reports the `0`.
+const CONCURRENCY_LIMIT_KEYS: &[&str] = &[
+    "max-connections-per-client",
+    "max-total-connections",
+    "max-in-flight-requests",
+];
 
+/// A concurrency limit's value: `None` (unlimited) when absent or `0`.
+fn concurrency_limit(node: &kdl::KdlNode, key: &str) -> Option<usize> {
+    get_int_entry(node, key)
+        .filter(|v| *v != 0)
+        .map(|v| v as usize)
+}
+
+/// Settings in a `limits` block that are read but not applied.
+///
+/// Shared by the parser, which logs each one at load, and by `zentinel lint` /
+/// `zentinel test`, which report them; both therefore say the same thing.
+///
+/// `scope` is where the block sits: `None` at the top level, or the kind and
+/// id of the enclosing block (`("service", "payments")`).
+pub(crate) fn unapplied_limits_settings(
+    node: &kdl::KdlNode,
+    scope: Option<(&str, &str)>,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    // A service's routes are matched by no listener: only a namespace's own
+    // routes are served, on a listener bound to it with `namespace`. Its
+    // limits therefore have no request to apply to.
+    if let Some(("service", service)) = scope {
+        if node.children().is_some_and(|c| !c.nodes().is_empty()) {
+            problems.push(format!(
+                "The 'limits' block of service '{service}' is not applied and is being \
+                 ignored: a service's routes are not served by any listener, so there is \
+                 no request for its limits to apply to. Set the limits on the namespace."
+            ));
+            return problems;
+        }
+    }
+    for key in CONCURRENCY_LIMIT_KEYS {
+        if get_int_entry(node, key) == Some(0) {
+            problems.push(format!(
+                "'{key} 0' is being ignored: 0 would refuse everything, so it is read as \
+                 no limit. Remove the line for no limit, or set a positive number."
+            ));
+        }
+    }
+    problems
+}
+
+/// Parse the top-level `limits` block.
+pub fn parse_limits_config(node: &kdl::KdlNode) -> Result<Limits> {
+    for problem in unapplied_limits_settings(node, None) {
+        warn!("{}", problem);
+    }
+    Ok(parse_limits_onto(node, Limits::default()))
+}
+
+/// Parse a namespace's or service's `limits` block. `kind` is `"namespace"`
+/// or `"service"`, `id` its id.
+///
+/// Starts from no bound at all rather than from the defaults. A scope's
+/// limits only ever tighten the enclosing ones (the proxy applies the
+/// smallest), so a key the block does not write has to leave the enclosing
+/// value in force: starting from the defaults, a namespace that wrote only
+/// `max-body-size` would also have put its routes back on the default 8 KiB
+/// `max-header-size` under a global block that raised it.
+pub fn parse_scope_limits_config(node: &kdl::KdlNode, kind: &str, id: &str) -> Result<Limits> {
+    for problem in unapplied_limits_settings(node, Some((kind, id))) {
+        warn!("{}", problem);
+    }
+    let unbounded = Limits {
+        max_header_size_bytes: usize::MAX,
+        max_header_count: usize::MAX,
+        max_body_size_bytes: usize::MAX,
+        ..Limits::default()
+    };
+    Ok(parse_limits_onto(node, unbounded))
+}
+
+/// Apply the keys a `limits` block writes on top of `limits`.
+fn parse_limits_onto(node: &kdl::KdlNode, mut limits: Limits) -> Limits {
     if let Some(v) = get_int_entry(node, "max-header-size") {
         limits.max_header_size_bytes = v as usize;
     }
@@ -1101,17 +1184,11 @@ pub fn parse_limits_config(node: &kdl::KdlNode) -> Result<Limits> {
         // could not change. Nothing reads the buffer size at request time.
         limits.max_body_buffer_bytes = limits.max_body_buffer_bytes.min(limits.max_body_size_bytes);
     }
-    if let Some(v) = get_int_entry(node, "max-connections-per-client") {
-        limits.max_connections_per_client = v as usize;
-    }
-    if let Some(v) = get_int_entry(node, "max-total-connections") {
-        limits.max_total_connections = v as usize;
-    }
-    if let Some(v) = get_int_entry(node, "max-in-flight-requests") {
-        limits.max_in_flight_requests = v as usize;
-    }
+    limits.max_connections_per_client = concurrency_limit(node, "max-connections-per-client");
+    limits.max_total_connections = concurrency_limit(node, "max-total-connections");
+    limits.max_in_flight_requests = concurrency_limit(node, "max-in-flight-requests");
 
-    Ok(limits)
+    limits
 }
 
 // ============================================================================
@@ -2000,6 +2077,59 @@ mod tests {
         let config = parse_tracing_config(node).unwrap();
         assert_eq!(config.sampling_rate, 0.01); // default
         assert_eq!(config.service_name, "zentinel"); // default
+    }
+
+    /// #542: the connection and in-flight limits are unlimited unless
+    /// written, and a written `0` stays unlimited, as it was while nothing
+    /// applied them.
+    #[test]
+    fn concurrency_limits_are_unlimited_unless_written_and_zero_is_unlimited() {
+        let parse = |kdl: &str| {
+            let doc: kdl::KdlDocument = kdl.parse().unwrap();
+            parse_limits_config(doc.nodes().first().unwrap()).unwrap()
+        };
+
+        let unset = parse("limits { max-body-size 1024 }");
+        assert_eq!(unset.max_connections_per_client, None);
+        assert_eq!(unset.max_total_connections, None);
+        assert_eq!(unset.max_in_flight_requests, None);
+
+        let set = parse(
+            "limits {\n max-connections-per-client 7\n max-total-connections 70\n \
+             max-in-flight-requests 700\n}",
+        );
+        assert_eq!(set.max_connections_per_client, Some(7));
+        assert_eq!(set.max_total_connections, Some(70));
+        assert_eq!(set.max_in_flight_requests, Some(700));
+
+        let zero = parse("limits {\n max-in-flight-requests 0\n max-total-connections 0\n}");
+        assert_eq!(zero.max_in_flight_requests, None);
+        assert_eq!(zero.max_total_connections, None);
+    }
+
+    /// #542: a namespace's `limits` holds only what it writes, so applying
+    /// "the smallest of global and namespace" cannot pull in a default the
+    /// namespace never set.
+    #[test]
+    fn scope_limits_leave_unwritten_keys_unbounded() {
+        let config = crate::Config::from_kdl(
+            r#"
+            schema-version "1.0"
+            system { worker-threads 1 }
+            listeners { listener "l" { address "127.0.0.1:8080"; namespace "ns"; } }
+            limits { max-header-size 65536 }
+            namespace "ns" {
+                limits { max-body-size 1000 }
+            }
+            "#,
+        )
+        .unwrap();
+        let ns = config.namespaces[0].limits.as_ref().unwrap();
+        assert_eq!(ns.max_body_size_bytes, 1000);
+        assert_eq!(ns.max_header_size_bytes, usize::MAX);
+        assert_eq!(ns.max_header_count, usize::MAX);
+        assert_eq!(ns.max_in_flight_requests, None);
+        assert_eq!(config.limits.max_header_size_bytes, 65536);
     }
 
     #[test]
