@@ -267,6 +267,12 @@ impl ProxyHttp for ZentinelProxy {
         ctx.path = path.to_string();
         ctx.host = Some(host.to_string());
 
+        // Assign the trace id before route matching, not after it succeeds: a
+        // request that matches no route is still answered (404), and that
+        // answer's `trace_id` and `X-Correlation-Id` were empty, so it could
+        // not be tied to its log lines the way every other error can (#525).
+        ctx.trace_id = self.get_trace_id(session);
+
         // Select the matcher for the listener this request arrived on. A
         // namespace-bound listener matches only its own route set (isolated);
         // every other listener uses the global matcher.
@@ -297,7 +303,6 @@ impl ProxyHttp for ZentinelProxy {
             }
         };
 
-        ctx.trace_id = self.get_trace_id(session);
         ctx.route_id = Some(route_match.route_id.to_string());
         ctx.route_config = Some(route_match.config.clone());
 
@@ -501,7 +506,12 @@ impl ProxyHttp for ZentinelProxy {
             // Set trace_id if not already set by early_request_filter
             if ctx.trace_id.is_empty() {
                 ctx.trace_id = self.get_trace_id(session);
+            }
 
+            // early_request_filter parses the trace context and starts the
+            // span only for requests it matched; this one it did not (a
+            // query-parameter route, say), so neither has happened yet.
+            if ctx.otel_span.is_none() && ctx.trace_context.is_none() {
                 // Parse incoming W3C trace context if present
                 if let Some(traceparent) = req_header.headers.get(crate::otel::TRACEPARENT_HEADER) {
                     if let Ok(s) = traceparent.to_str() {
@@ -1014,6 +1024,35 @@ impl ProxyHttp for ZentinelProxy {
                     .set_read_timeout(Some(std::time::Duration::from_secs(request_timeout_secs)));
                 // Store keepalive for response phase
                 ctx.listener_keepalive_timeout_secs = Some(keepalive_timeout_secs);
+            }
+        }
+
+        // Refuse a body declared larger than the limit before reading any of
+        // it or connecting upstream. Chunked bodies, which declare no length,
+        // are counted as they stream in `request_body_filter`.
+        let declared_length = session
+            .req_header()
+            .headers
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        if let Some(declared) = declared_length {
+            let global_limit = ctx
+                .config
+                .get_or_insert_with(|| self.config_manager.current())
+                .limits
+                .max_body_size_bytes;
+            let limit = ctx.max_body_size(global_limit);
+            if declared > limit as u64 {
+                warn!(
+                    correlation_id = %ctx.trace_id,
+                    route_id = ctx.route_id.as_deref().unwrap_or("unknown"),
+                    content_length = declared,
+                    limit = limit,
+                    "Request body size limit exceeded"
+                );
+                self.metrics.record_blocked_request("body_size_exceeded");
+                return Err(body_too_large());
             }
         }
 
@@ -1847,22 +1886,25 @@ impl ProxyHttp for ZentinelProxy {
                 "Processing request body chunk"
             );
 
-            // Check body size limit (use cached config)
-            let config = ctx
+            // Check body size limit (use cached config). This catches bodies
+            // whose length was not declared up front; a Content-Length over
+            // the limit is refused in `request_filter` before any upstream is
+            // contacted.
+            let global_limit = ctx
                 .config
-                .get_or_insert_with(|| self.config_manager.current());
-            if ctx.request_body_bytes > config.limits.max_body_size_bytes as u64 {
+                .get_or_insert_with(|| self.config_manager.current())
+                .limits
+                .max_body_size_bytes;
+            let limit = ctx.max_body_size(global_limit);
+            if ctx.request_body_bytes > limit as u64 {
                 warn!(
                     correlation_id = %ctx.trace_id,
                     body_bytes = ctx.request_body_bytes,
-                    limit = config.limits.max_body_size_bytes,
+                    limit = limit,
                     "Request body size limit exceeded"
                 );
                 self.metrics.record_blocked_request("body_size_exceeded");
-                return Err(Error::explain(
-                    ErrorType::InternalError,
-                    "Request body too large",
-                ));
+                return Err(body_too_large());
             }
         }
 
@@ -2355,7 +2397,8 @@ impl ProxyHttp for ZentinelProxy {
             }
         }
 
-        // Generate custom error pages for error responses
+        // Replace upstream error responses with the route's custom error
+        // page, where one is configured for the status
         if status >= 400 {
             trace!(
                 correlation_id = %ctx.trace_id,
@@ -2738,6 +2781,17 @@ impl ProxyHttp for ZentinelProxy {
             }
             // Skip normal body processing for WebSocket
             return Ok(None);
+        }
+
+        // A custom error page replaced the upstream's error response in
+        // `response_filter`; its body replaces the upstream's here, in one
+        // piece at end of stream, so it matches the headers already sent.
+        if ctx.error_page_body.is_some() {
+            *body = if end_of_stream {
+                ctx.error_page_body.take()
+            } else {
+                None
+            };
         }
 
         // Cut an MCP listing down to what the route permits before anything
@@ -3491,19 +3545,7 @@ impl ProxyHttp for ZentinelProxy {
         // Write error response to ensure client receives a proper HTTP response
         // This is necessary because some errors occur before the upstream connection
         // is established, and Pingora may not send a response automatically
-        let error_message = match error_code {
-            400 => "Bad Request",
-            502 => "Bad Gateway",
-            503 => "Service Unavailable",
-            504 => "Gateway Timeout",
-            _ => "Internal Server Error",
-        };
-
-        // Build a minimal error response body
-        let body = format!(
-            r#"{{"error":"{} {}","trace_id":"{}"}}"#,
-            error_code, error_message, ctx.trace_id
-        );
+        let body = proxy_error_body(error_code, &ctx.trace_id);
 
         // Write the response header
         let mut header = pingora::http::ResponseHeader::build(error_code, None).unwrap();
@@ -3587,15 +3629,22 @@ impl ProxyHttp for ZentinelProxy {
         );
 
         // Record failure with circuit breaker via upstream pool
-        // This is done asynchronously since we can't await in a sync fn
-        let peer_address = peer.address().to_string();
-        let upstream_pools = self.upstream_pools.clone();
-        let upstream_id_owned = upstream_id.to_string();
-        tokio::spawn(async move {
-            if let Some(pool) = upstream_pools.get(&upstream_id_owned).await {
-                pool.report_result(&peer_address, false).await;
-            }
-        });
+        // This is done asynchronously since we can't await in a sync fn.
+        //
+        // Not for an error the client caused -- an oversized body refused
+        // mid-stream, a client that went away. The peer did nothing wrong,
+        // and counting these let a client trip the circuit breaker on a
+        // healthy upstream.
+        if *e.esource() != pingora::ErrorSource::Downstream {
+            let peer_address = peer.address().to_string();
+            let upstream_pools = self.upstream_pools.clone();
+            let upstream_id_owned = upstream_id.to_string();
+            tokio::spawn(async move {
+                if let Some(pool) = upstream_pools.get(&upstream_id_owned).await {
+                    pool.report_result(&peer_address, false).await;
+                }
+            });
+        }
 
         // Metrics tracking
         self.metrics
@@ -4017,6 +4066,39 @@ impl ProxyHttp for ZentinelProxy {
 // =============================================================================
 // Helper methods for body streaming (not part of ProxyHttp trait)
 // =============================================================================
+
+/// The error for a request body over its limit: 413, attributed to the client.
+///
+/// It used to be an `InternalError`, so the client got a 500 for its own
+/// oversized request (#517). Marking it downstream matters as much as the
+/// status: raised while the body streams, it reaches `error_while_proxy`,
+/// which would otherwise count it against the upstream peer.
+fn body_too_large() -> Box<Error> {
+    Error::explain(
+        ErrorType::HTTPStatus(413),
+        "Request body exceeds the configured limit",
+    )
+    .into_down()
+}
+
+/// The JSON body `fail_to_proxy` answers with: `{"error":"<code> <reason>",
+/// "trace_id":"..."}`.
+///
+/// The reason is the status's canonical one. A hand-kept table of five
+/// statuses used to supply it, and everything else fell through to "Internal
+/// Server Error": a no-route 404 said "404 Internal Server Error", and so did
+/// every 401, 403, 413 and 429 that reached this path (#525).
+fn proxy_error_body(status: u16, trace_id: &str) -> String {
+    let reason = http::StatusCode::from_u16(status)
+        .ok()
+        .and_then(|s| s.canonical_reason())
+        .unwrap_or("Error");
+    serde_json::json!({
+        "error": format!("{status} {reason}"),
+        "trace_id": trace_id,
+    })
+    .to_string()
+}
 
 /// The `Mcp-Session-Id` the client presented, if any.
 fn client_session(session: &Session) -> Option<String> {
@@ -5338,5 +5420,33 @@ mod cache_status_tests {
             1,
             "insert_header replaces; this test documents why append is required"
         );
+    }
+}
+
+#[cfg(test)]
+mod proxy_error_body_tests {
+    use super::proxy_error_body;
+
+    fn error_field(status: u16) -> String {
+        let body: serde_json::Value =
+            serde_json::from_str(&proxy_error_body(status, "abc")).unwrap();
+        assert_eq!(body["trace_id"], "abc");
+        body["error"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn the_reason_is_the_status_canonical_one() {
+        assert_eq!(error_field(404), "404 Not Found");
+        assert_eq!(error_field(413), "413 Payload Too Large");
+        assert_eq!(error_field(403), "403 Forbidden");
+        assert_eq!(error_field(429), "429 Too Many Requests");
+        assert_eq!(error_field(500), "500 Internal Server Error");
+        assert_eq!(error_field(502), "502 Bad Gateway");
+        assert_eq!(error_field(503), "503 Service Unavailable");
+    }
+
+    #[test]
+    fn a_status_without_a_canonical_reason_is_not_called_a_server_error() {
+        assert_eq!(error_field(599), "599 Error");
     }
 }

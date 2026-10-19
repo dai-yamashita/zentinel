@@ -215,6 +215,14 @@ pub struct RequestContext {
     /// came, and timed out (504 after 30 s) instead of being served.
     pub(crate) validated_request_body: Option<bytes::Bytes>,
 
+    /// The body of a custom error page that replaces an upstream error
+    /// response, sent by `response_body_filter` in place of the upstream's.
+    ///
+    /// The page's headers are set in `response_filter`; without the body to
+    /// go with them, the client got the upstream's body under the page's
+    /// Content-Type and Content-Length.
+    pub(crate) error_page_body: Option<bytes::Bytes>,
+
     // === Body Decompression ===
     /// Whether decompression is enabled for body inspection
     pub(crate) decompression_enabled: bool,
@@ -422,6 +430,7 @@ impl RequestContext {
             mcp_listing_body: Vec::new(),
             mcp_proxied_call: None,
             validated_request_body: None,
+            error_page_body: None,
             a2a_method: None,
             body_inspection_agents: Vec::new(),
             decompression_enabled: false,
@@ -765,6 +774,20 @@ impl RequestContext {
         }
         self.inference_provider_override = provider_override;
     }
+
+    /// The request body limit that applies to this request, given the
+    /// global `limits` one.
+    ///
+    /// A route's `policies { max-body-size }` can only tighten the global
+    /// limit, never lift it: the global limit is the operator's bound on what
+    /// the proxy accepts at all. Until #517 the route setting was parsed and
+    /// then never read, so a route limited to 1 KB accepted the global 10 MB.
+    pub(crate) fn max_body_size(&self, global_limit: usize) -> usize {
+        self.route_config
+            .as_ref()
+            .and_then(|route| route.policies.max_body_size)
+            .map_or(global_limit, |route_limit| route_limit.0.min(global_limit))
+    }
 }
 
 impl Default for RequestContext {
@@ -939,5 +962,36 @@ mod tests {
             FallbackReason::ConnectionError("timeout".to_string()).to_string(),
             "connection_error_timeout"
         );
+    }
+
+    fn ctx_with_route_limit(limit: Option<usize>) -> RequestContext {
+        let mut route: RouteConfig = serde_json::from_value(serde_json::json!({
+            "id": "r",
+            "matches": [],
+        }))
+        .unwrap();
+        route.policies.max_body_size = limit.map(zentinel_common::types::ByteSize);
+        let mut ctx = RequestContext::new();
+        ctx.route_config = Some(Arc::new(route));
+        ctx
+    }
+
+    #[test]
+    fn a_route_body_limit_tightens_the_global_one() {
+        assert_eq!(ctx_with_route_limit(Some(1024)).max_body_size(10_000), 1024);
+    }
+
+    #[test]
+    fn a_route_body_limit_cannot_lift_the_global_one() {
+        assert_eq!(
+            ctx_with_route_limit(Some(1 << 30)).max_body_size(10_000),
+            10_000
+        );
+    }
+
+    #[test]
+    fn without_a_route_limit_the_global_one_applies() {
+        assert_eq!(ctx_with_route_limit(None).max_body_size(10_000), 10_000);
+        assert_eq!(RequestContext::new().max_body_size(10_000), 10_000);
     }
 }
