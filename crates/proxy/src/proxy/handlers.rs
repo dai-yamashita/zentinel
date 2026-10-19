@@ -364,18 +364,23 @@ impl ZentinelProxy {
             .config
             .get_or_insert_with(|| self.config_manager.current());
 
-        // Extract agent IDs and their failure modes from filter chain by looking up filter definitions
-        let agent_filters: Vec<(String, zentinel_config::FailureMode)> = route_config
+        // The agents of the filter chain, each with its filter's failure mode
+        // and timeout. `phase` is not read: the agent's own `events` decide
+        // what it receives (reported by lint, #542).
+        let agent_filters: Vec<crate::agents::FilterAgent> = route_config
             .filters
             .iter()
             .filter_map(|filter_id| {
                 config.filters.get(filter_id).and_then(|filter_config| {
                     if let zentinel_config::Filter::Agent(agent_filter) = &filter_config.filter {
-                        // Use filter's failure mode if specified, otherwise fall back to route's policy
-                        let failure_mode = agent_filter
-                            .failure_mode
-                            .unwrap_or(route_config.policies.failure_mode);
-                        Some((agent_filter.agent.clone(), failure_mode))
+                        Some(crate::agents::FilterAgent {
+                            id: agent_filter.agent.clone(),
+                            // Filter's failure mode if specified, otherwise the route's policy
+                            failure_mode: agent_filter
+                                .failure_mode
+                                .unwrap_or(route_config.policies.failure_mode),
+                            timeout_ms: agent_filter.timeout_ms,
+                        })
                     } else {
                         None
                     }
@@ -388,7 +393,7 @@ impl ZentinelProxy {
         }
 
         // Extract just the agent IDs for logging and body inspection
-        let agent_ids: Vec<String> = agent_filters.iter().map(|(id, _)| id.clone()).collect();
+        let agent_ids: Vec<String> = agent_filters.iter().map(|a| a.id.clone()).collect();
 
         // Save agent IDs in context for response-phase processing
         ctx.route_agent_ids = agent_ids.clone();
@@ -691,6 +696,45 @@ impl ZentinelProxy {
         Ok(())
     }
 
+    /// The route's custom page for an error the proxy raises itself, as a
+    /// response header and body, or `None` when the route has no page for
+    /// `status` and the default error body applies.
+    pub(super) async fn custom_error_page(
+        &self,
+        status: u16,
+        ctx: &RequestContext,
+    ) -> Option<(ResponseHeader, bytes::Bytes)> {
+        let route_id = ctx.route_id.as_deref()?;
+        let handler = self.error_handlers.get(route_id).await?;
+        if !handler.has_custom_page(status) {
+            return None;
+        }
+        let status_code = http::StatusCode::from_u16(status).ok()?;
+        let page = match handler.generate_response(status_code, None, &ctx.trace_id, None) {
+            Ok(page) => page,
+            Err(e) => {
+                warn!(
+                    correlation_id = %ctx.trace_id,
+                    route_id = route_id,
+                    status = status,
+                    error = %e,
+                    "Failed to generate custom error page, sending the default error body"
+                );
+                return None;
+            }
+        };
+        let (parts, body) = page.into_parts();
+        let body = http_body_util::BodyExt::collect(body)
+            .await
+            .map(|collected| collected.to_bytes())
+            .unwrap_or_default();
+        let mut header = ResponseHeader::build(status, None).ok()?;
+        for (key, value) in parts.headers.iter() {
+            header.insert_header(key.clone(), value.clone()).ok()?;
+        }
+        Some((header, body))
+    }
+
     /// Write HTTP response to session
     pub(super) async fn write_http_response(
         &self,
@@ -875,5 +919,69 @@ mod tests {
             .unwrap()
             .is_none());
         assert_eq!(header(&other, "content-type"), Some("application/json"));
+    }
+
+    /// #542: a route's `error-pages` block reaches the error handler. No KDL
+    /// parser read it before, so no page could be configured and upstream
+    /// errors always passed through.
+    #[tokio::test]
+    async fn a_page_configured_in_kdl_replaces_the_upstream_error() {
+        let config = zentinel_config::Config::from_kdl(
+            r#"
+            system { worker-threads 1 }
+            listeners {
+                listener "http" {
+                    address "127.0.0.1:8080"
+                    protocol "http"
+                }
+            }
+            upstreams {
+                upstream "u" {
+                    target "127.0.0.1:9" { weight 1 }
+                }
+            }
+            routes {
+                route "r" {
+                    matches { path-prefix "/" }
+                    upstream "u"
+                    error-pages {
+                        pages {
+                            "404" {
+                                format "json"
+                                message "No such thing here"
+                                headers {
+                                    Cache-Control "no-store"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            "#,
+        )
+        .expect("config loads");
+        let route = &config.routes[0];
+        let handler = ErrorHandler::new(route.service_type.clone(), route.error_pages.clone());
+
+        let mut resp = upstream_error(404, "text/html", "<h1>nginx 404</h1>");
+        let body = substitute_error_page(&handler, &mut resp, "trace-1")
+            .await
+            .unwrap()
+            .expect("the configured 404 page replaces the upstream's");
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["message"], "No such thing here");
+        assert_eq!(
+            header(&resp, "content-type"),
+            Some("application/json; charset=utf-8")
+        );
+        assert_eq!(header(&resp, "cache-control"), Some("no-store"));
+
+        // A status without a page is still the upstream's own (#522).
+        let mut other = upstream_error(500, "text/plain", "boom");
+        assert!(substitute_error_page(&handler, &mut other, "t")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(header(&other, "content-type"), Some("text/plain"));
     }
 }

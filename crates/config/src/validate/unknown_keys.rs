@@ -508,6 +508,11 @@ const CLOSED_BLOCKS: &[ClosedBlock] = &[
         keys: crate::kdl::RECOGNIZED_TRACING_BACKEND_KEYS,
     },
     ClosedBlock {
+        name: "error-pages",
+        nesting: Nesting::In("route"),
+        keys: crate::kdl::error_pages::RECOGNIZED_ERROR_PAGES_KEYS,
+    },
+    ClosedBlock {
         name: "policies",
         nesting: Nesting::Anywhere,
         keys: &[
@@ -576,12 +581,15 @@ struct Context {
     /// For each agent id, the agent filters that use it and set no failure
     /// mode of their own (or one that is ignored).
     filters_without_failure_mode: std::collections::HashMap<String, Vec<String>>,
+    /// Each agent block's `timeout-ms`, or the default when it sets none.
+    agent_timeouts: std::collections::HashMap<String, u64>,
 }
 
 impl Context {
     fn of<'a>(documents: impl IntoIterator<Item = &'a kdl::KdlDocument>) -> Self {
         let mut context = Context {
             filters_without_failure_mode: Default::default(),
+            agent_timeouts: Default::default(),
         };
         for document in documents {
             for node in document.nodes() {
@@ -592,6 +600,20 @@ impl Context {
     }
 
     fn collect(&mut self, node: &kdl::KdlNode) {
+        // An agent definition, as opposed to a filter's `agent "id"` line,
+        // which has no block.
+        if node.name().value() == "agent" && node.children().is_some() {
+            if let Some(agent_id) = first_arg(node) {
+                let timeout = node
+                    .children()
+                    .and_then(|c| c.get("timeout-ms"))
+                    .and_then(|n| n.entries().first())
+                    .and_then(|e| e.value().as_integer())
+                    .map(|v| v as u64)
+                    .unwrap_or(crate::kdl::DEFAULT_AGENT_TIMEOUT_MS);
+                self.agent_timeouts.insert(agent_id.to_string(), timeout);
+            }
+        }
         if node.name().value() == "filter" && child_value(node, "type") == Some("agent") {
             if let (Some(filter_id), Some(agent_id)) = (first_arg(node), child_value(node, "agent"))
             {
@@ -676,9 +698,32 @@ fn check_values(
             report(crate::kdl::routes::resolve_service_type(node, route_id).1);
             report(crate::kdl::routes::resolve_priority(node, route_id).1);
             report(crate::kdl::routes::resolve_builtin_handler(node, route_id).1);
+            let service_type = crate::kdl::routes::resolve_service_type(node, route_id).0;
+            let (_, problems) =
+                crate::kdl::error_pages::resolve_error_pages(node, route_id, &service_type);
+            for problem in problems {
+                report(Some(problem));
+            }
         }
+        ("pages", _) if parent == Some("error-pages") => check_error_page_keys(node, result),
         ("upstream", Some(upstream_id)) => {
-            report(crate::kdl::upstreams::resolve_load_balancing(node, upstream_id).1);
+            let (algorithm, problem) =
+                crate::kdl::upstreams::resolve_load_balancing(node, upstream_id);
+            report(problem);
+            // The sticky settings are read only when the algorithm is sticky.
+            if algorithm == crate::LoadBalancingAlgorithm::Sticky {
+                if let Some(sticky) = node
+                    .children()
+                    .and_then(|c| c.get("load-balancing"))
+                    .and_then(|n| n.children())
+                {
+                    let (_, problems) =
+                        crate::kdl::upstreams::resolve_sticky_session_config(sticky, upstream_id);
+                    for problem in problems {
+                        report(Some(problem));
+                    }
+                }
+            }
             if let Some(check) = node.children().and_then(|c| c.get("health-check")) {
                 report(crate::kdl::upstreams::health_check_type_problem(
                     check,
@@ -688,6 +733,10 @@ fn check_values(
         }
         ("filter", Some(filter_id)) if child_value(node, "type") == Some("agent") => {
             report(crate::kdl::filters::resolve_agent_filter_failure_mode(node, filter_id).1);
+            report(crate::kdl::filters::agent_filter_phase_problem(
+                node, filter_id,
+            ));
+            report(agent_filter_timeout_problem(node, filter_id, context));
         }
         ("agent", Some(agent_id)) if parent == Some("agents") => {
             report(agent_failure_mode_problem(node, agent_id, context));
@@ -701,6 +750,59 @@ fn check_values(
         ("matches", _) if parent == Some("route") => check_run_together_matches(node, result),
         _ => {}
     }
+}
+
+/// The keys of each page in an `error-pages` block's `pages`.
+///
+/// Pages are named by their status (`"503" { ... }`), so no fixed block name
+/// describes them and they cannot sit in `CLOSED_BLOCKS`; this applies the
+/// same check to every child of `pages` instead.
+fn check_error_page_keys(pages: &kdl::KdlNode, result: &mut ValidationResult) {
+    const ERROR_PAGE: ClosedBlock = ClosedBlock {
+        name: "error page",
+        nesting: Nesting::In("pages"),
+        keys: crate::kdl::error_pages::RECOGNIZED_ERROR_PAGE_KEYS,
+    };
+    for page in pages.children().map(|c| c.nodes()).unwrap_or_default() {
+        for key in page.children().map(|c| c.nodes()).unwrap_or_default() {
+            let name = key.name().value();
+            if !ERROR_PAGE.keys.contains(&name) {
+                result.add_warning(ValidationWarning::new(unknown_key_message(
+                    &ERROR_PAGE,
+                    name,
+                )));
+            }
+            check_run_together(&ERROR_PAGE, key, result);
+        }
+    }
+}
+
+/// Whether an agent filter's `timeout-ms` is unusable, or longer than its
+/// agent's.
+///
+/// The filter's value can only shorten the agent's `timeout-ms` (see
+/// `resolve_agent_filter_timeout`), so a longer one does nothing past the
+/// agent's.
+fn agent_filter_timeout_problem(
+    filter: &kdl::KdlNode,
+    filter_id: &str,
+    context: &Context,
+) -> Option<String> {
+    let (timeout, problem) = crate::kdl::filters::resolve_agent_filter_timeout(filter, filter_id);
+    if problem.is_some() {
+        return problem;
+    }
+    let timeout = timeout?;
+    let agent_id = child_value(filter, "agent")?;
+    let agent_timeout = *context.agent_timeouts.get(agent_id)?;
+    (timeout > agent_timeout).then(|| {
+        format!(
+            "'timeout-ms {timeout}' on filter '{filter_id}' is longer than agent \
+             '{agent_id}''s timeout-ms {agent_timeout} and is being ignored beyond it: a filter \
+             can shorten its agent's timeout, not extend it. Raise timeout-ms on the agent \
+             instead."
+        )
+    })
 }
 
 /// Whether an agent block's `failure-mode` is being relied on where it does
@@ -2476,5 +2578,158 @@ mod tests {
              config is wrong or CLOSED_BLOCKS is under-listed:\n{}",
             complaints.join("\n")
         );
+    }
+
+    /// #542: `error-pages` is read now, so a correct block is quiet, and the
+    /// parts of it the parser cannot use are reported.
+    #[test]
+    fn error_pages_are_checked_not_reported_wholesale() {
+        let clean = warnings_for(
+            r#"routes {
+                route "r" {
+                    error-pages {
+                        default-format "json"
+                        pages {
+                            "404" {
+                                format "json"
+                                message "nope"
+                                headers { Cache-Control "no-store" }
+                            }
+                        }
+                    }
+                }
+            }"#,
+        );
+        assert!(clean.is_empty(), "{clean:?}");
+
+        let warnings = warnings_for(
+            r#"routes {
+                route "r" {
+                    error-pages {
+                        include-stack-trace #true
+                        pages {
+                            "503" {
+                                format "yaml"
+                                mesage "typo"
+                            }
+                            "oops" { message "x" }
+                        }
+                    }
+                }
+            }"#,
+        );
+        assert_eq!(warnings.len(), 4, "{warnings:#?}");
+        assert!(warnings.iter().all(|w| w.contains("is being ignored")));
+        assert!(warnings.iter().any(|w| w.contains("'include-stack-trace'")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("'mesage'") && w.contains("Did you mean 'message'?")));
+        assert!(warnings.iter().any(|w| w.contains("'format \"yaml\"'")));
+        assert!(warnings.iter().any(|w| w.contains("'oops'")));
+    }
+
+    /// #542: an agent filter's `phase` is parsed and never applied, and its
+    /// `timeout-ms` can only shorten the agent's. Both are reported.
+    #[test]
+    fn agent_filter_phase_and_overlong_timeout_are_reported() {
+        let config = |filter_timeout: &str, phase: &str| {
+            format!(
+                r#"agents {{
+                    agent "waf" type="waf" {{
+                        unix-socket "/tmp/waf.sock"
+                        timeout-ms 200
+                    }}
+                }}
+                filters {{
+                    filter "f" {{
+                        type "agent"
+                        agent "waf"
+                        failure-mode "closed"
+                        {filter_timeout}
+                        {phase}
+                    }}
+                }}"#
+            )
+        };
+
+        assert!(warnings_for(&config("timeout-ms 50", "")).is_empty());
+
+        let warnings = warnings_for(&config("timeout-ms 500", r#"phase "response""#));
+        assert_eq!(warnings.len(), 2, "{warnings:#?}");
+        assert!(warnings.iter().all(|w| w.contains("is being ignored")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("'timeout-ms 500'") && w.contains("timeout-ms 200")));
+        assert!(warnings.iter().any(|w| w.contains("'phase \"response\"'")));
+
+        let warnings = warnings_for(&config("timeout-ms 0", ""));
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert!(warnings[0].contains("not a positive number"));
+    }
+
+    /// An agent without `timeout-ms` has the parser's default, and a filter
+    /// asking for longer than that is reported against the default.
+    #[test]
+    fn agent_filter_timeout_is_compared_with_the_default_agent_timeout() {
+        let warnings = warnings_for(
+            r#"agents {
+                agent "a" type="custom" { unix-socket "/tmp/a.sock" }
+            }
+            filters {
+                filter "f" {
+                    type "agent"
+                    agent "a"
+                    failure-mode "open"
+                    timeout-ms 5000
+                }
+            }"#,
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert!(warnings[0].contains("timeout-ms 1000"));
+    }
+
+    /// #542: an unknown sticky `fallback` silently became round robin, and an
+    /// unknown `cookie-same-site` lax. Both behaviours stay, and are reported
+    /// like the other #521 values.
+    #[test]
+    fn unknown_sticky_fallback_and_same_site_are_reported() {
+        let config = |fallback: &str, same_site: &str| {
+            format!(
+                r#"upstreams {{
+                    upstream "u" {{
+                        target "127.0.0.1:9000"
+                        load-balancing "sticky" {{
+                            cookie-name "S"
+                            cookie-same-site "{same_site}"
+                            fallback "{fallback}"
+                        }}
+                    }}
+                }}"#
+            )
+        };
+
+        assert!(warnings_for(&config("least-connections", "strict")).is_empty());
+
+        let warnings = warnings_for(&config("least-conections", "strct"));
+        assert_eq!(warnings.len(), 2, "{warnings:#?}");
+        assert!(warnings.iter().all(|w| w.contains("is being ignored")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("'fallback \"least-conections\"'")
+                && w.contains("Did you mean 'least_connections'?")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("'cookie-same-site \"strct\"'")));
+
+        // The fallback the parser applies is still round robin.
+        let config = crate::Config::from_kdl(&format!(
+            "system {{ worker-threads 1 }}\n\
+             listeners {{ listener \"l\" {{ address \"127.0.0.1:8080\"; protocol \"http\" }} }}\n\
+             {}",
+            config("least-conections", "strct")
+        ))
+        .expect("loads");
+        let sticky = config.upstreams["u"].sticky_session.as_ref().unwrap();
+        assert_eq!(sticky.fallback, crate::LoadBalancingAlgorithm::RoundRobin);
     }
 }
