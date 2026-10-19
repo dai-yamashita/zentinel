@@ -256,7 +256,12 @@ impl ZentinelProxy {
             Duration::from_secs(30), // Max drain time
         ));
 
+        // Initialize rate limit manager. Built before the reload handler,
+        // which rebuilds its limiters from every reloaded config.
+        let rate_limit_manager = Arc::new(Self::initialize_rate_limiters(&config));
+
         // Setup configuration reload subscription
+
         Self::setup_reload_handler(
             config_manager.clone(),
             route_matcher.clone(),
@@ -265,6 +270,7 @@ impl ZentinelProxy {
             scoped_route_matcher.clone(),
             scoped_upstream_pools.clone(),
             health_check_runner.clone(),
+            rate_limit_manager.clone(),
         )
         .await;
 
@@ -318,9 +324,6 @@ impl ZentinelProxy {
                 health_check_runner.checker_count()
             );
         }
-
-        // Initialize rate limit manager
-        let rate_limit_manager = Arc::new(Self::initialize_rate_limiters(&config));
 
         // Initialize inference rate limit manager (for token-based LLM rate limiting)
         let inference_rate_limit_manager =
@@ -472,6 +475,7 @@ impl ZentinelProxy {
         scoped_route_matcher: Arc<tokio::sync::RwLock<ScopedRouteMatcher>>,
         scoped_upstream_pools: ScopedRegistry<UpstreamPool>,
         health_check_runner: Arc<HealthCheckRunner>,
+        rate_limit_manager: Arc<RateLimitManager>,
     ) {
         let mut reload_rx = config_manager.subscribe();
         let config_manager_clone = config_manager.clone();
@@ -508,6 +512,20 @@ impl ZentinelProxy {
 
                     // Rebuild per-listener (namespace-bound) route matchers
                     *listener_matchers.write() = Self::build_listener_matchers(&new_config);
+
+                    // Rebuild rate limiters. They were built once at startup, so a
+                    // changed, added or removed limit (route filter or policy,
+                    // `global`, `default-rps`) only took effect after a restart.
+                    // Unchanged limiters keep their buckets.
+                    let changes =
+                        rate_limit_manager.reconcile(Self::initialize_rate_limiters(&new_config));
+                    info!(
+                        added = changes.added,
+                        replaced = changes.replaced,
+                        removed = changes.removed,
+                        unchanged = changes.unchanged,
+                        "Rate limiters reloaded"
+                    );
 
                     // Update scoped route matcher
                     if let Err(e) = scoped_route_matcher
@@ -1515,47 +1533,52 @@ mod default_rate_limit_tests {
     }
 
     /// Status of `n` back-to-back requests from one client to a route.
-    fn statuses(manager: &RateLimitManager, route: &str, n: usize) -> Vec<u16> {
-        (0..n)
-            .map(|_| {
-                let r = manager.check(route, "203.0.113.7", "/", Option::<&NoHeaders>::None);
-                if r.allowed {
-                    200
-                } else {
-                    r.status_code
-                }
-            })
-            .collect()
+    async fn statuses(manager: &RateLimitManager, route: &str, n: usize) -> Vec<u16> {
+        let mut statuses = Vec::with_capacity(n);
+        for _ in 0..n {
+            let r = manager
+                .check(route, "203.0.113.7", "/", Option::<&NoHeaders>::None)
+                .await;
+            statuses.push(if r.allowed { 200 } else { r.status_code });
+        }
+        statuses
     }
 
     /// `rate-limits { default-rps }` was parsed and documented as the limit
     /// for routes without one of their own, and nothing read it: every
     /// request to such a route was allowed.
-    #[test]
-    fn default_rps_limits_routes_without_their_own_limit() {
+    #[tokio::test]
+    async fn default_rps_limits_routes_without_their_own_limit() {
         let config = config("rate-limits { default-rps 2; default-burst 2 }");
         assert_eq!(config.rate_limits.default_rps, Some(2));
         let manager = ZentinelProxy::initialize_rate_limiters(&config);
 
-        assert_eq!(statuses(&manager, "plain", 4), vec![200, 200, 429, 429]);
+        assert_eq!(
+            statuses(&manager, "plain", 4).await,
+            vec![200, 200, 429, 429]
+        );
 
         // The headers come from the same result: limit and remaining.
-        let limited = manager.check("plain", "203.0.113.7", "/", Option::<&NoHeaders>::None);
+        let limited = manager
+            .check("plain", "203.0.113.7", "/", Option::<&NoHeaders>::None)
+            .await;
         assert_eq!(limited.limit, 2);
         assert_eq!(limited.remaining, 0);
 
         // Another client has its own bucket.
-        let other = manager.check("plain", "198.51.100.1", "/", Option::<&NoHeaders>::None);
+        let other = manager
+            .check("plain", "198.51.100.1", "/", Option::<&NoHeaders>::None)
+            .await;
         assert!(other.allowed);
     }
 
-    #[test]
-    fn a_route_with_its_own_limit_ignores_the_default() {
+    #[tokio::test]
+    async fn a_route_with_its_own_limit_ignores_the_default() {
         let config = config("rate-limits { default-rps 2 }");
         let manager = ZentinelProxy::initialize_rate_limiters(&config);
 
         assert_eq!(
-            statuses(&manager, "own", 6),
+            statuses(&manager, "own", 6).await,
             vec![200, 200, 200, 200, 429, 429]
         );
     }
@@ -1563,36 +1586,100 @@ mod default_rate_limit_tests {
     /// `global { key }` was parsed and ignored: the global limiter was
     /// always keyed by client IP. Keyed by path, clients share one bucket
     /// per path.
-    #[test]
-    fn the_global_limit_uses_its_configured_key() {
+    #[tokio::test]
+    async fn the_global_limit_uses_its_configured_key() {
         let config = config("rate-limits { global { max-rps 2; burst 2; key \"path\" } }");
         let manager = ZentinelProxy::initialize_rate_limiters(&config);
-        let check = |ip: &str, path: &str| {
-            manager
-                .check("plain", ip, path, Option::<&NoHeaders>::None)
-                .allowed
+        let check = |ip: &'static str, path: &'static str| {
+            let manager = &manager;
+            async move {
+                manager
+                    .check("plain", ip, path, Option::<&NoHeaders>::None)
+                    .await
+                    .allowed
+            }
         };
 
-        assert!(check("198.51.100.1", "/x"));
-        assert!(check("198.51.100.2", "/x"));
+        assert!(check("198.51.100.1", "/x").await);
+        assert!(check("198.51.100.2", "/x").await);
         assert!(
-            !check("198.51.100.3", "/x"),
+            !check("198.51.100.3", "/x").await,
             "a path-keyed global limit was applied per client IP"
         );
         // Another path has its own bucket.
-        assert!(check("198.51.100.1", "/y"));
+        assert!(check("198.51.100.1", "/y").await);
     }
 
-    #[test]
-    fn without_a_default_unlimited_routes_stay_unlimited() {
+    #[tokio::test]
+    async fn without_a_default_unlimited_routes_stay_unlimited() {
         let config = config("");
         let manager = ZentinelProxy::initialize_rate_limiters(&config);
 
         assert!(!manager.has_route_limiter("plain"));
-        assert_eq!(statuses(&manager, "plain", 10), vec![200; 10]);
+        assert_eq!(statuses(&manager, "plain", 10).await, vec![200; 10]);
         assert_eq!(
-            statuses(&manager, "own", 6),
+            statuses(&manager, "own", 6).await,
             vec![200, 200, 200, 200, 429, 429]
         );
+    }
+
+    /// What a reload does: `reconcile` with limiters built from the new
+    /// config. Limiters were built once at startup, so none of these
+    /// changes took effect before a restart.
+    #[tokio::test]
+    async fn reload_applies_changed_added_and_removed_limits() {
+        let manager =
+            ZentinelProxy::initialize_rate_limiters(&config("rate-limits { default-rps 100 }"));
+        assert_eq!(statuses(&manager, "plain", 8).await, vec![200; 8]);
+
+        // Changed: the default drops to 1/s with a bucket of 1.
+        let changes = manager.reconcile(ZentinelProxy::initialize_rate_limiters(&config(
+            "rate-limits { default-rps 1; default-burst 1 }",
+        )));
+        assert_eq!(changes.replaced, 1, "{changes:?}");
+        assert_eq!(
+            statuses(&manager, "plain", 4).await,
+            vec![200, 429, 429, 429]
+        );
+
+        // Removed: the route is unlimited again.
+        let changes = manager.reconcile(ZentinelProxy::initialize_rate_limiters(&config("")));
+        assert_eq!(changes.removed, 1, "{changes:?}");
+        assert!(!manager.has_route_limiter("plain"));
+        assert_eq!(statuses(&manager, "plain", 8).await, vec![200; 8]);
+
+        // Added: a global limit appears.
+        let changes = manager.reconcile(ZentinelProxy::initialize_rate_limiters(&config(
+            "rate-limits { global { max-rps 1; burst 2 } }",
+        )));
+        assert_eq!(changes.added, 1, "{changes:?}");
+        assert_eq!(statuses(&manager, "plain", 3).await, vec![200, 200, 429]);
+    }
+
+    /// Reloading an unrelated part of the config must not refill every
+    /// bucket: a client at its limit stays there.
+    #[tokio::test]
+    async fn reload_keeps_buckets_of_unchanged_limits() {
+        let kdl = "rate-limits { default-rps 1; default-burst 2 }";
+        let manager = ZentinelProxy::initialize_rate_limiters(&config(kdl));
+        // The "own" filter (4/4) is untouched by any of this.
+        assert_eq!(statuses(&manager, "plain", 3).await, vec![200, 200, 429]);
+        assert_eq!(
+            statuses(&manager, "own", 5).await,
+            vec![200, 200, 200, 200, 429]
+        );
+
+        let changes = manager.reconcile(ZentinelProxy::initialize_rate_limiters(&config(kdl)));
+        assert_eq!(
+            (
+                changes.unchanged,
+                changes.added,
+                changes.replaced,
+                changes.removed
+            ),
+            (2, 0, 0, 0)
+        );
+        assert_eq!(statuses(&manager, "plain", 1).await, vec![429]);
+        assert_eq!(statuses(&manager, "own", 1).await, vec![429]);
     }
 }
