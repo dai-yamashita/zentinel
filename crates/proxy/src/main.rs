@@ -76,6 +76,11 @@ enum Commands {
         /// Configuration file to test
         #[arg(short = 'c', long = "config")]
         config: Option<String>,
+
+        /// Fail if any setting is being ignored (unknown keys, run-together
+        /// lines, values that fall back to a default)
+        #[arg(long = "strict")]
+        strict: bool,
     },
     /// Run the proxy server (default)
     Run {
@@ -123,12 +128,14 @@ fn main() -> Result<()> {
 
     // Handle test flag or test subcommand
     if cli.test {
-        return test_config(cli.config.as_deref());
+        return test_config(cli.config.as_deref(), false);
     }
 
     // Handle subcommands
     match cli.command {
-        Some(Commands::Test { config }) => test_config(config.as_deref().or(cli.config.as_deref())),
+        Some(Commands::Test { config, strict }) => {
+            test_config(config.as_deref().or(cli.config.as_deref()), strict)
+        }
         Some(Commands::Run { config }) => {
             run_server(config.or(cli.config), cli.verbose, cli.daemon, cli.upgrade)
         }
@@ -160,7 +167,14 @@ fn main() -> Result<()> {
 }
 
 /// Test configuration file and exit
-fn test_config(config_path: Option<&str>) -> Result<()> {
+///
+/// Also prints every setting that is being ignored -- the findings of the
+/// unknown-key check that `lint` runs, without lint's best-practice advice.
+/// `test` is what operators run before a reload, so a typo'd key reported
+/// only by `lint` reached almost nobody. The findings are warnings and leave
+/// the exit code alone, since such configs have always passed; `strict` makes
+/// them fatal.
+fn test_config(config_path: Option<&str>, strict: bool) -> Result<()> {
     // Initialize minimal logging for config test
     tracing_subscriber::fmt()
         .with_target(false)
@@ -205,12 +219,47 @@ fn test_config(config_path: Option<&str>) -> Result<()> {
         }
     }
 
+    let ignored = ignored_settings(config_path);
+    for message in &ignored {
+        println!("  ⚠  {}", message);
+    }
+    if strict && !ignored.is_empty() {
+        anyhow::bail!(
+            "configuration file {} has {} setting(s) that are being ignored (--strict)",
+            config_path.unwrap_or("(embedded)"),
+            ignored.len()
+        );
+    }
+
     println!(
         "zentinel: configuration file {} test is successful",
         config_path.unwrap_or("(embedded)")
     );
 
     Ok(())
+}
+
+/// Settings in the configuration file that no parser applies.
+///
+/// This needs the source text rather than the parsed config: by the time a
+/// `Config` exists, keys no parser recognised have already been dropped. So it
+/// is only meaningful for a config read from a file; the embedded default and
+/// a directory of files yield nothing.
+fn ignored_settings(config_path: Option<&str>) -> Vec<String> {
+    let Some(path) = config_path else {
+        return Vec::new();
+    };
+    match std::fs::read_to_string(path) {
+        Ok(source) => {
+            let mut result = zentinel_config::validate::ValidationResult::new();
+            zentinel_config::validate::unknown_keys::check_unknown_keys(&source, &mut result);
+            result.warnings.into_iter().map(|w| w.message).collect()
+        }
+        Err(e) => {
+            warn!(path = %path, error = %e, "Could not re-read config to check for ignored settings");
+            Vec::new()
+        }
+    }
 }
 
 /// Validate configuration with connectivity checks
@@ -337,18 +386,8 @@ fn lint_config(config_path: Option<&str>) -> Result<()> {
     // Lint for best practices
     let mut result = zentinel_config::validate::lint::lint_config(&config);
 
-    // Unknown-key checking needs the source text, not the parsed config: by
-    // the time a Config exists, keys no parser recognised have already been
-    // dropped. Only meaningful for a config read from a file.
-    if let Some(path) = config_path {
-        match std::fs::read_to_string(path) {
-            Ok(source) => {
-                zentinel_config::validate::unknown_keys::check_unknown_keys(&source, &mut result)
-            }
-            Err(e) => {
-                warn!(path = %path, error = %e, "Could not re-read config to check for unknown keys")
-            }
-        }
+    for message in ignored_settings(config_path) {
+        result.add_warning(zentinel_config::validate::ValidationWarning::new(message));
     }
 
     // Print results
@@ -702,6 +741,18 @@ fn init_logging(verbose: bool, timestamps: bool) {
     }
 }
 
+/// Pingora's command-line options, from the CLI flags and the config.
+///
+/// `system { daemon #true }` was parsed and never read: only `-d` started a
+/// daemon (#527). Either now does. There is no way to switch daemon mode off
+/// from the command line, as there was none before.
+fn pingora_options(daemon: bool, upgrade: bool, server: &zentinel_config::ServerConfig) -> Opt {
+    let mut opt = Opt::default();
+    opt.daemon = daemon || server.daemon;
+    opt.upgrade = upgrade;
+    opt
+}
+
 /// Run the proxy server
 fn run_server(
     config_path: Option<String>,
@@ -718,12 +769,6 @@ fn run_server(
     // are buffered here and emitted as soon as the subscriber exists rather than
     // being lost.
     let mut startup_log = StartupLog::default();
-
-    // Build Pingora options
-    let mut pingora_opt = Opt::default();
-    pingora_opt.daemon = daemon;
-    pingora_opt.upgrade = upgrade;
-    // Note: We'll configure threads via ServerConf after loading our config
 
     // Get config path with priority: CLI arg > env var > None (embedded default)
     let effective_config_path = config_path.or_else(|| std::env::var("ZENTINEL_CONFIG").ok());
@@ -894,6 +939,10 @@ fn run_server(
     }
 
     // Create Pingora server with our configuration
+    let pingora_opt = pingora_options(daemon, upgrade, &config.server);
+    if pingora_opt.daemon {
+        info!(from_cli = daemon, "Running as a daemon");
+    }
     let mut server = Server::new_with_opt_and_conf(Some(pingora_opt), pingora_conf);
     server.bootstrap();
 
@@ -1467,6 +1516,46 @@ async fn run_signal_handler(
                 error!("Signal handler task panicked: {}", e);
                 break;
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `zentinel test` reports what `lint` reports as ignored (#523).
+    #[test]
+    fn ignored_settings_reads_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("typo.kdl");
+        std::fs::write(
+            &path,
+            "listeners { listener \"l\" { adress \"127.0.0.1:1\"; } }\n",
+        )
+        .unwrap();
+        let ignored = ignored_settings(path.to_str());
+        assert_eq!(ignored.len(), 1, "{ignored:?}");
+        assert!(ignored[0].contains("'adress'") && ignored[0].contains("is being ignored"));
+
+        assert!(ignored_settings(None).is_empty());
+    }
+
+    #[test]
+    fn daemon_mode_comes_from_the_flag_or_the_config() {
+        let mut server = Config::default_for_testing().server;
+        for (flag, config, expected) in [
+            (false, false, false),
+            (true, false, true),
+            (false, true, true),
+            (true, true, true),
+        ] {
+            server.daemon = config;
+            assert_eq!(
+                pingora_options(flag, false, &server).daemon,
+                expected,
+                "flag {flag}, config {config}"
+            );
         }
     }
 }

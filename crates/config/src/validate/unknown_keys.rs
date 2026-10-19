@@ -533,8 +533,49 @@ pub fn check_unknown_keys(kdl_source: &str, result: &mut ValidationResult) {
         return;
     };
 
+    let context = Context::of(&document);
     for node in document.nodes() {
-        walk(node, None, result);
+        walk(node, None, &context, result);
+    }
+}
+
+/// What a check needs to know about the rest of the document.
+struct Context {
+    /// For each agent id, the agent filters that use it and set no failure
+    /// mode of their own (or one that is ignored).
+    filters_without_failure_mode: std::collections::HashMap<String, Vec<String>>,
+}
+
+impl Context {
+    fn of(document: &kdl::KdlDocument) -> Self {
+        let mut context = Context {
+            filters_without_failure_mode: Default::default(),
+        };
+        for node in document.nodes() {
+            context.collect(node);
+        }
+        context
+    }
+
+    fn collect(&mut self, node: &kdl::KdlNode) {
+        if node.name().value() == "filter" && child_value(node, "type") == Some("agent") {
+            if let (Some(filter_id), Some(agent_id)) = (first_arg(node), child_value(node, "agent"))
+            {
+                let (mode, _) =
+                    crate::kdl::filters::resolve_agent_filter_failure_mode(node, filter_id);
+                if mode.is_none() {
+                    self.filters_without_failure_mode
+                        .entry(agent_id.to_string())
+                        .or_default()
+                        .push(filter_id.to_string());
+                }
+            }
+        }
+        if let Some(children) = node.children() {
+            for child in children.nodes() {
+                self.collect(child);
+            }
+        }
     }
 }
 
@@ -543,18 +584,15 @@ pub fn check_unknown_keys(kdl_source: &str, result: &mut ValidationResult) {
 /// `parent` is the name of the block this node sits directly inside, or `None`
 /// at the top level. It is what lets two blocks share a name and keep separate
 /// key lists -- see [`Nesting`].
-fn walk(node: &kdl::KdlNode, parent: Option<&str>, result: &mut ValidationResult) {
+fn walk(
+    node: &kdl::KdlNode,
+    parent: Option<&str>,
+    context: &Context,
+    result: &mut ValidationResult,
+) {
     let name = node.name().value();
 
-    // `service-type` is a known key, so the check below passes it; whether
-    // its value is applied depends on the route's other blocks.
-    if name == "route" {
-        if let Some(route_id) = node.entries().first().and_then(|e| e.value().as_string()) {
-            if let (_, Some(problem)) = crate::kdl::routes::resolve_service_type(node, route_id) {
-                result.add_warning(ValidationWarning::new(problem));
-            }
-        }
-    }
+    check_values(node, parent, context, result);
 
     if let Some(block) = block_for(node, parent) {
         if let Some(children) = node.children() {
@@ -570,7 +608,139 @@ fn walk(node: &kdl::KdlNode, parent: Option<&str>, result: &mut ValidationResult
 
     if let Some(children) = node.children() {
         for child in children.nodes() {
-            walk(child, Some(name), result);
+            walk(child, Some(name), context, result);
+        }
+    }
+}
+
+/// Report known keys whose *value* is ignored.
+///
+/// The keys below pass the check for unknown keys, but each parser falls back
+/// to a default when the value names nothing it knows: `load-balancing
+/// "least-conections"` is round robin, `priority "urgent"` is normal. Those
+/// fallbacks are kept, since configs carrying such values have been loading
+/// and must keep doing so; what changes is that they are reported. Whether a
+/// value is known is decided by the parser's own function in each case, so
+/// this check and the parser cannot disagree.
+fn check_values(
+    node: &kdl::KdlNode,
+    parent: Option<&str>,
+    context: &Context,
+    result: &mut ValidationResult,
+) {
+    let id = first_arg(node);
+    let mut report = |problem: Option<String>| {
+        if let Some(problem) = problem {
+            result.add_warning(ValidationWarning::new(problem));
+        }
+    };
+
+    match (node.name().value(), id) {
+        ("route", Some(route_id)) => {
+            // `service-type` is applied or not depending on the route's
+            // other blocks.
+            report(crate::kdl::routes::resolve_service_type(node, route_id).1);
+            report(crate::kdl::routes::resolve_priority(node, route_id).1);
+            report(crate::kdl::routes::resolve_builtin_handler(node, route_id).1);
+        }
+        ("upstream", Some(upstream_id)) => {
+            report(crate::kdl::upstreams::resolve_load_balancing(node, upstream_id).1);
+            if let Some(check) = node.children().and_then(|c| c.get("health-check")) {
+                report(crate::kdl::upstreams::health_check_type_problem(
+                    check,
+                    upstream_id,
+                ));
+            }
+        }
+        ("filter", Some(filter_id)) if child_value(node, "type") == Some("agent") => {
+            report(crate::kdl::filters::resolve_agent_filter_failure_mode(node, filter_id).1);
+        }
+        ("agent", Some(agent_id)) if parent == Some("agents") => {
+            report(agent_failure_mode_problem(node, agent_id, context));
+        }
+        ("system" | "server", _) if parent.is_none() => {
+            for problem in crate::kdl::server::unapplied_system_settings(node, node.name().value())
+            {
+                report(Some(problem));
+            }
+        }
+        ("matches", _) if parent == Some("route") => check_run_together_matches(node, result),
+        _ => {}
+    }
+}
+
+/// Whether an agent block's `failure-mode` is being relied on where it does
+/// not apply.
+///
+/// The agent's own `failure-mode` decides what happens when the agent fails
+/// on a request body, a response or a WebSocket frame, and when a body is
+/// over its inspection limit (`AgentManager::process_event` and
+/// `apply_body_limits`). It does not decide the request-headers call, which
+/// is where most agents act: that uses the agent filter's `failure-mode`,
+/// then the route's `policies { failure-mode }`, then closed
+/// (`process_agents` in the proxy's handlers). An agent written with
+/// `failure-mode "open"` and a filter without one therefore blocks requests
+/// when the agent is down.
+///
+/// Honouring the agent's value there would turn setups that have been
+/// failing closed into ones that fail open, so the behaviour stays and this
+/// reports it instead -- only when some filter using the agent leaves the
+/// decision open, since a filter with its own value states the intent.
+fn agent_failure_mode_problem(
+    agent: &kdl::KdlNode,
+    agent_id: &str,
+    context: &Context,
+) -> Option<String> {
+    let value = child_value(agent, "failure-mode")?;
+    let filters = context.filters_without_failure_mode.get(agent_id)?;
+    let filters = filters
+        .iter()
+        .map(|f| format!("'{f}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "'failure-mode \"{value}\"' on agent '{agent_id}' is being ignored for request \
+         headers: that is decided by the agent filter's failure-mode, then the route's \
+         policies failure-mode, and is closed when neither is set. Set failure-mode on \
+         filter {filters} as well. The agent's own setting applies only to request bodies, \
+         responses, WebSocket frames and its body-size limits."
+    ))
+}
+
+/// The run-together check for a route's `matches` block.
+///
+/// `matches` is not a closed block — an unknown condition is already a hard
+/// error at load — but a condition written on the same line as another one,
+///
+/// ```kdl
+/// matches { path-prefix "/api" host "a.com" }
+/// ```
+///
+/// is read as `path-prefix` with three arguments, and `host` is dropped. The
+/// route then matches every host, which is the direction a silent match
+/// failure must never go. Unlike [`check_run_together`], each condition's own
+/// value arguments are exempt, since `header "x-kind" "path"` is a header
+/// value and not a swallowed condition.
+fn check_run_together_matches(matches: &kdl::KdlNode, result: &mut ValidationResult) {
+    let Some(children) = matches.children() else {
+        return;
+    };
+    for condition in children.nodes() {
+        let key = condition.name().value();
+        let own = crate::kdl::routes::match_condition_own_args(key);
+        for entry in condition
+            .entries()
+            .iter()
+            .filter(|e| e.name().is_none())
+            .skip(own)
+        {
+            if let Some(value) = entry.value().as_string() {
+                if crate::kdl::routes::is_match_condition(value) {
+                    result.add_warning(ValidationWarning::new(run_together_message(
+                        "matches", key, value,
+                    )));
+                }
+            }
         }
     }
 }
@@ -615,10 +785,14 @@ fn check_run_together(block: &ClosedBlock, child: &kdl::KdlNode, result: &mut Va
 }
 
 /// Build the run-together warning.
+///
+/// Every finding of this module says "is being ignored": `zentinel test`
+/// prints them under that heading, and docs CI and the playground filter on
+/// the phrase.
 fn run_together_message(block: &str, key: &str, swallowed: &str) -> String {
     format!(
-        "'{swallowed}' is being read as an argument to '{key}' rather than as a setting, \
-         so it is ignored. In the '{block}' block, put each setting on its own line \
+        "'{swallowed}' is read as an argument to '{key}' rather than as a setting, \
+         and is being ignored. In the '{block}' block, put each setting on its own line \
          (or separate them with ';')."
     )
 }
@@ -646,7 +820,7 @@ fn unknown_key_message(block: &ClosedBlock, key: &str) -> String {
     // edit-distance guess, which would otherwise suggest the key back to itself.
     if let Some(other) = sibling_block_defining(block, key) {
         return format!(
-            "'{key}' is a setting of {}, not of {}, so it is ignored here.",
+            "'{key}' is a setting of {}, not of {}, and is being ignored here.",
             describe(other),
             describe(block)
         );
@@ -870,12 +1044,13 @@ mod tests {
         assert!(warnings[0].contains("is being ignored"));
     }
 
+    /// `max-connections` is a known key and absent here: it is reported for
+    /// not being applied (#527), see `system_max_connections_is_reported`.
     #[test]
     fn a_valid_system_block_produces_no_warnings() {
         let kdl = r#"
             system {
                 worker-threads 4
-                max-connections 10000
                 graceful-shutdown-timeout-secs 30
                 daemon #false
                 pid-file "/var/run/zentinel.pid"
@@ -2013,6 +2188,183 @@ mod tests {
             "#,
         );
         assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// The values from #521 that each fell back to a default without a word.
+    #[test]
+    fn ignored_values_are_reported() {
+        let kdl = r#"
+            routes {
+                route "a" {
+                    priority "urgent"
+                    builtin-handler "helth"
+                }
+            }
+            upstreams {
+                upstream "b" {
+                    target "127.0.0.1:1"
+                    load-balancing "totally_bogus"
+                    health-check { type "htttp" }
+                }
+            }
+        "#;
+        let warnings = warnings_for(kdl);
+        assert_eq!(warnings.len(), 4, "{warnings:#?}");
+        for fragment in [
+            "'priority \"urgent\"'",
+            "'builtin-handler \"helth\"'",
+            "'load-balancing \"totally_bogus\"'",
+            "'type \"htttp\"'",
+        ] {
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| w.contains(fragment) && w.contains("is being ignored")),
+                "expected {fragment} to be reported, got {warnings:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepted_values_are_not_reported() {
+        let kdl = r#"
+            routes {
+                route "a" {
+                    priority "HIGH"
+                    builtin-handler "not_found"
+                    matches {
+                        method "GET" "POST"
+                        header "x-kind" "path"
+                        query-param "host" "method"
+                    }
+                }
+            }
+            upstreams {
+                upstream "b" {
+                    target "127.0.0.1:1"
+                    load-balancing "least-connections"
+                    health-check { type "grpc" }
+                }
+            }
+        "#;
+        assert_eq!(warnings_for(kdl), Vec::<String>::new());
+    }
+
+    /// The run-together check from #365 did not cover `matches`, where a
+    /// dropped condition makes the route match more than intended.
+    #[test]
+    fn a_run_together_match_condition_is_reported() {
+        let warnings = warnings_for(
+            r#"routes { route "a" { matches { path-prefix "/api" host "a.com"; } } }"#,
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert!(warnings[0].contains("'host' is read as an argument to 'path-prefix'"));
+        assert!(warnings[0].contains("'matches' block"));
+    }
+
+    #[test]
+    fn a_condition_run_into_a_header_match_is_reported_after_its_value() {
+        let warnings =
+            warnings_for(r#"routes { route "a" { matches { header "x-a" "1" method "GET"; } } }"#);
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert!(warnings[0].contains("'method' is read as an argument to 'header'"));
+    }
+
+    fn agent_config(agent_mode: &str, filter_mode: &str) -> String {
+        format!(
+            r#"
+            agents {{
+                agent "waf" {{
+                    unix-socket "/tmp/waf.sock"
+                    {agent_mode}
+                }}
+            }}
+            filters {{
+                filter "waf-filter" {{
+                    type "agent"
+                    agent "waf"
+                    {filter_mode}
+                }}
+            }}
+        "#
+        )
+    }
+
+    /// #529: the agent block's failure-mode does not decide the
+    /// request-headers call, which is where it is usually meant to.
+    #[test]
+    fn an_agent_failure_mode_without_a_filter_one_is_reported() {
+        let warnings = warnings_for(&agent_config(r#"failure-mode "open""#, ""));
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert!(warnings[0].contains("on agent 'waf' is being ignored for request headers"));
+        assert!(
+            warnings[0].contains("filter 'waf-filter'"),
+            "{}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn an_agent_failure_mode_is_not_reported_when_the_filter_sets_one() {
+        let kdl = agent_config(r#"failure-mode "open""#, r#"failure-mode "open""#);
+        assert_eq!(warnings_for(&kdl), Vec::<String>::new());
+        // Neither is an agent without a failure-mode of its own.
+        assert_eq!(warnings_for(&agent_config("", "")), Vec::<String>::new());
+    }
+
+    /// `fail-open` is accepted on the agent block, not on the filter, where
+    /// it has always meant "unset" and so, by default, closed.
+    #[test]
+    fn an_unknown_filter_failure_mode_is_reported() {
+        let warnings = warnings_for(&agent_config("", r#"failure-mode "fail-open""#));
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert!(warnings[0].contains("'failure-mode \"fail-open\"' on filter 'waf-filter'"));
+        assert!(warnings[0].contains("is being ignored"));
+    }
+
+    /// An ignored filter value leaves the decision open, so the agent's
+    /// value is reported as well.
+    #[test]
+    fn an_ignored_filter_value_counts_as_unset() {
+        let warnings = warnings_for(&agent_config(
+            r#"failure-mode "open""#,
+            r#"failure-mode "fail-open""#,
+        ));
+        assert_eq!(warnings.len(), 2, "{warnings:#?}");
+    }
+
+    /// Docs CI and the playground pick findings out by this phrase, so a
+    /// finding worded differently is a finding they never see.
+    #[test]
+    fn every_kind_of_finding_says_it_is_being_ignored() {
+        let kdl = r#"
+            listeners { listener "l" { adress "x"; address "y" namespace "n"; } }
+            routes {
+                route "a" {
+                    priority "urgent"
+                    matches { path-prefix "/api" host "a.com"; }
+                    cache { backend "disk"; }
+                }
+            }
+        "#;
+        let warnings = warnings_for(kdl);
+        assert_eq!(warnings.len(), 5, "{warnings:#?}");
+        for warning in &warnings {
+            assert!(warning.contains("is being ignored"), "{warning}");
+        }
+    }
+
+    /// #527: known, parsed, and never applied.
+    #[test]
+    fn system_max_connections_is_reported() {
+        let warnings = warnings_for("system { max-connections 10000; daemon #false; }");
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert!(warnings[0].contains("'max-connections' in the 'system' block"));
+        assert!(warnings[0].contains("is being ignored"));
+
+        // The upstream connection pool's setting of the same name is applied.
+        let pool = r#"upstreams { upstream "b" { connection-pool { max-connections 5; } } }"#;
+        assert_eq!(warnings_for(pool), Vec::<String>::new());
     }
 
     fn warning_texts(result: &ValidationResult) -> Vec<String> {
