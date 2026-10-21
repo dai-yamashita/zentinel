@@ -53,7 +53,9 @@ sudo systemctl enable --now zentinel
 # Reload config without dropping connections (SIGHUP)
 sudo systemctl reload zentinel
 
-# Restart (drops connections)
+# Restart (stops accepting, waits up to graceful-shutdown-timeout-secs for open
+# connections to finish, then starts again; keep systemd's TimeoutStopSec above
+# that timeout)
 sudo systemctl restart zentinel
 
 # Stop and disable

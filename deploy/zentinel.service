@@ -14,7 +14,9 @@ ExecStop=/bin/kill -TERM $MAINPID
 Restart=on-failure
 RestartSec=5s
 TimeoutStartSec=10
-TimeoutStopSec=30
+# Longer than graceful-shutdown-timeout-secs (default 30): the proxy waits that
+# long for open connections to finish, and systemd must not kill it first.
+TimeoutStopSec=35
 KillMode=mixed
 KillSignal=SIGTERM
 
