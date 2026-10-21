@@ -6,8 +6,8 @@
 //!
 //! Also covered: a signal during startup (nothing is serving, so it ends the
 //! process at once and no listener ever accepts), a second signal while
-//! draining (ends the process at once), and a TLS handshake that
-//! straddles the signal.
+//! draining (ends the process at once), a TLS handshake that straddles the
+//! signal, and the same drain in a daemon started with `-d`.
 //!
 //! Runs the real binary against a backend that answers slowly.
 
@@ -626,4 +626,149 @@ fn an_abandoned_tls_connection_does_not_delay_the_shutdown() {
 #[test]
 fn two_sigterms_0_2_s_apart_force_the_exit() {
     second_signal_forces_exit(libc::SIGTERM, libc::SIGTERM, Duration::from_millis(200));
+}
+
+/// A proxy started with `-d`: the launcher forks and exits, the daemon is
+/// found through its pid file, and its output goes to a file.
+struct DaemonProxy {
+    pid_file: std::path::PathBuf,
+    log: std::path::PathBuf,
+}
+
+impl DaemonProxy {
+    fn start(dir: &Path, proxy_port: u16, backend: u16, timeout_secs: u64) -> Self {
+        let pid_file = dir.join("zentinel.pid");
+        let config = write_config(dir, proxy_port, backend, timeout_secs);
+        let text = std::fs::read_to_string(&config).unwrap().replacen(
+            "worker-threads 1",
+            &format!("worker-threads 1\n    pid-file \"{}\"", pid_file.display()),
+            1,
+        );
+        std::fs::write(&config, text).unwrap();
+        let log = dir.join("daemon.log");
+        let out = std::fs::File::create(&log).unwrap();
+        let mut launcher = Command::new(env!("CARGO_BIN_EXE_zentinel"))
+            .arg("-d")
+            .arg("-c")
+            .arg(&config)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(out.try_clone().unwrap()))
+            .stderr(Stdio::from(out))
+            .spawn()
+            .unwrap();
+        let daemon = Self { pid_file, log };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while launcher.try_wait().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "the launcher never exited");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        while !(daemon.pid().is_some_and(alive)
+            && TcpStream::connect(("127.0.0.1", proxy_port)).is_ok())
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the daemon never listened; log:\n{}",
+                daemon.output()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        daemon
+    }
+
+    fn pid(&self) -> Option<libc::pid_t> {
+        std::fs::read_to_string(&self.pid_file)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+    }
+
+    fn output(&self) -> String {
+        std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    fn signal(&self, sig: libc::c_int) {
+        // SAFETY: plain kill(2) on the daemon's pid.
+        assert_eq!(unsafe { libc::kill(self.pid().unwrap(), sig) }, 0);
+    }
+
+    fn wait_gone(&self, within: Duration) -> Instant {
+        let pid = self.pid().unwrap();
+        let deadline = Instant::now() + within;
+        while alive(pid) {
+            assert!(
+                Instant::now() < deadline,
+                "the daemon was still running {within:?} after the signal; log:\n{}",
+                self.output()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Instant::now()
+    }
+}
+
+impl Drop for DaemonProxy {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid() {
+            // SAFETY: plain kill(2) on the daemon's pid.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    }
+}
+
+fn alive(pid: libc::pid_t) -> bool {
+    // SAFETY: signal 0 only checks that the process exists.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// A daemon drains like a proxy in the foreground (#573).
+#[test]
+fn a_daemon_lets_the_request_in_flight_finish() {
+    let backend = slow_backend(Duration::from_secs(2));
+    let proxy_port = free_port();
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = DaemonProxy::start(dir.path(), proxy_port, backend, 20);
+
+    let response = request_in_background(proxy_port);
+    std::thread::sleep(Duration::from_millis(700));
+    let signalled = Instant::now();
+    daemon.signal(libc::SIGTERM);
+    let gone = daemon.wait_gone(Duration::from_secs(15));
+    assert_eq!(
+        response.recv_timeout(Duration::from_secs(5)).unwrap(),
+        Some((200, "ok".to_string())),
+        "the request in flight was cut off; log:\n{}",
+        daemon.output()
+    );
+    assert!(
+        gone - signalled >= Duration::from_millis(1200),
+        "the daemon left {:?} after the signal, before the request was done",
+        gone - signalled
+    );
+    assert!(daemon.output().contains("All connections drained"));
+}
+
+#[test]
+fn a_second_sigterm_ends_a_draining_daemon_at_once() {
+    let backend = slow_backend(Duration::from_secs(30));
+    let proxy_port = free_port();
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = DaemonProxy::start(dir.path(), proxy_port, backend, 20);
+
+    let response = request_in_background(proxy_port);
+    std::thread::sleep(Duration::from_millis(500));
+    daemon.signal(libc::SIGTERM);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(
+        daemon.pid().is_some_and(alive),
+        "the first signal ended the daemon; log:\n{}",
+        daemon.output()
+    );
+
+    let signalled = Instant::now();
+    daemon.signal(libc::SIGTERM);
+    let gone = daemon.wait_gone(Duration::from_secs(10));
+    assert!(gone - signalled < Duration::from_secs(3));
+    assert_eq!(response.recv_timeout(Duration::from_secs(5)).unwrap(), None);
+    let log = daemon.output();
+    assert!(log.contains("while draining, exiting at once"), "{log}");
+    assert!(log.contains("open_connections"), "{log}");
 }

@@ -27,10 +27,10 @@
 //!
 //! # Not covered yet
 //!
-//! Daemon mode (#573: the signal thread and runtime are started before the
-//! fork, so the drain never runs in the daemon) and the SIGQUIT hand-over
-//! (#126: Pingora's grace period and `graceful-shutdown-timeout-secs` are
-//! still separate) do not go through [`drain`].
+//! The SIGQUIT hand-over (#126: Pingora's grace period and
+//! `graceful-shutdown-timeout-secs` are still separate) does not go through
+//! [`drain`]. Daemon mode does: the process forks before the signal thread and
+//! the runtime exist (#573), so a daemon drains like a foreground proxy.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
