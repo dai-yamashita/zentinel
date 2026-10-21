@@ -1414,14 +1414,6 @@ fn setup_signal_handlers(
                             spawn_shutdown_watchdog(graceful_shutdown_timeout_secs);
                             SignalType::Shutdown
                         }
-                        Requested::Repeated => {
-                            info!(
-                                "Received {} again right after the first shutdown signal, \
-                                 treating it as the same request",
-                                name
-                            );
-                            continue;
-                        }
                         Requested::Force => {
                             let (open_connections, handshakes_in_progress) =
                                 shutdown_request.open();

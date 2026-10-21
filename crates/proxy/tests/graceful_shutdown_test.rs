@@ -6,8 +6,7 @@
 //!
 //! Also covered: a signal during startup (nothing is serving, so it ends the
 //! process at once and no listener ever accepts), a second signal while
-//! draining (ends the process at once), a repeat so soon after the first that
-//! it is the same request (as systemd sends two), and a TLS handshake that
+//! draining (ends the process at once), and a TLS handshake that
 //! straddles the signal.
 //!
 //! Runs the real binary against a backend that answers slowly.
@@ -364,7 +363,7 @@ fn a_signal_during_startup_stops_at_once_and_never_accepts() {
 
 /// The first signal drains and the second ends the process at once, with a
 /// WARN that names how many connections were open.
-fn second_signal_forces_exit(first: libc::c_int, second: libc::c_int) {
+fn second_signal_forces_exit(first: libc::c_int, second: libc::c_int, gap: Duration) {
     let backend = slow_backend(Duration::from_secs(30));
     let proxy_port = free_port();
     let dir = tempfile::tempdir().unwrap();
@@ -378,7 +377,7 @@ fn second_signal_forces_exit(first: libc::c_int, second: libc::c_int) {
     proxy.signal(first);
 
     // Still draining: a request is open and the timeout is 20 s away.
-    std::thread::sleep(Duration::from_millis(1500));
+    std::thread::sleep(gap);
     assert!(
         proxy.child.try_wait().unwrap().is_none(),
         "the first signal ended the process; log:\n{}",
@@ -437,46 +436,17 @@ fn second_signal_forces_exit(first: libc::c_int, second: libc::c_int) {
 
 #[test]
 fn a_second_sigterm_while_draining_exits_at_once() {
-    second_signal_forces_exit(libc::SIGTERM, libc::SIGTERM);
+    second_signal_forces_exit(libc::SIGTERM, libc::SIGTERM, Duration::from_millis(1500));
 }
 
 #[test]
 fn ctrl_c_after_a_sigterm_exits_at_once() {
-    second_signal_forces_exit(libc::SIGTERM, libc::SIGINT);
+    second_signal_forces_exit(libc::SIGTERM, libc::SIGINT, Duration::from_millis(1500));
 }
 
 #[test]
 fn two_sigints_exit_at_once() {
-    second_signal_forces_exit(libc::SIGINT, libc::SIGINT);
-}
-
-/// systemd runs `ExecStop` (SIGTERM) and then sends `KillSignal` (SIGTERM) to
-/// what is left, about 0.2 s later. That is one request: the drain goes on and
-/// the request in flight finishes.
-#[test]
-fn two_sigterms_0_2_s_apart_are_one_request() {
-    let backend = slow_backend(Duration::from_secs(2));
-    let proxy_port = free_port();
-    let dir = tempfile::tempdir().unwrap();
-    let mut proxy = Proxy::start(
-        &write_config(dir.path(), proxy_port, backend, 20),
-        proxy_port,
-    );
-
-    let response = request_in_background(proxy_port);
-    std::thread::sleep(Duration::from_millis(700));
-    proxy.signal(libc::SIGTERM);
-    std::thread::sleep(Duration::from_millis(200));
-    proxy.signal(libc::SIGTERM);
-
-    let (status, _) = proxy.wait_exit(Duration::from_secs(15));
-    assert_eq!(
-        response.recv_timeout(Duration::from_secs(5)).unwrap(),
-        Some((200, "ok".to_string())),
-        "the repeat cut the request off; log:\n{}",
-        proxy.log.join("\n")
-    );
-    assert!(status.success(), "{status:?}");
+    second_signal_forces_exit(libc::SIGINT, libc::SIGINT, Duration::from_millis(1500));
 }
 
 /// A TLS listener, with the test CA's server certificate for `localhost`.
@@ -649,4 +619,11 @@ fn an_abandoned_tls_connection_does_not_delay_the_shutdown() {
         "an abandoned connection delayed the shutdown by {:?}",
         exited - signalled
     );
+}
+
+/// No grace window: a second SIGTERM 0.2 s after the first (what a unit with
+/// both `ExecStop=kill -TERM` and `KillSignal` produces) also forces the exit.
+#[test]
+fn two_sigterms_0_2_s_apart_force_the_exit() {
+    second_signal_forces_exit(libc::SIGTERM, libc::SIGTERM, Duration::from_millis(200));
 }

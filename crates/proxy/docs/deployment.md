@@ -58,7 +58,10 @@ sudo systemctl reload zentinel
 # that timeout). A second SIGTERM/SIGINT while it waits ends the process at once.
 sudo systemctl restart zentinel
 
-# Stop and disable
+# Stop and disable. The unit has no ExecStop: systemd sends KillSignal=SIGTERM
+# once and waits up to TimeoutStopSec. Do not add `ExecStop=/bin/kill -TERM
+# $MAINPID`; systemd then also sends KillSignal, SIGTERM arrives twice, and the
+# second one ends the drain.
 sudo systemctl disable --now zentinel
 
 # Inspect status

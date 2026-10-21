@@ -21,7 +21,9 @@
 //! [`ZentinelShutdownSignals`] waits on it instead of registering handlers of
 //! its own, so Pingora is told to stop whenever the signal arrived, including
 //! in the gap before Pingora's main loop starts. A second request while a
-//! drain is running ends the process at once.
+//! drain is running ends the process at once, with no grace window: a unit
+//! that sends SIGTERM twice (`ExecStop=kill -TERM` plus `KillSignal`) cuts its
+//! own drain short.
 //!
 //! # Not covered yet
 //!
@@ -44,13 +46,6 @@ use crate::connection_limit::HandshakeTracker;
 
 /// How often the open connections are counted while draining.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
-
-/// A second shutdown signal this soon after the first counts as the first.
-///
-/// systemd stops a unit by running `ExecStop` (which sends SIGTERM) and then
-/// sends `KillSignal` (SIGTERM) to what is left, about 0.2 s later in
-/// practice. That pair is one request to stop, not an operator insisting.
-const REPEAT_WINDOW: Duration = Duration::from_secs(1);
 
 /// How long a TLS handshake that has not finished is still waited for. A
 /// handshake takes a few round trips; one that has taken longer than this is
@@ -78,8 +73,6 @@ pub enum Drained {
 pub enum Requested {
     /// The first request: start draining.
     Drain,
-    /// A repeat within [`REPEAT_WINDOW`] of the first: the same request.
-    Repeated,
     /// A later request while draining: end the process now.
     Force,
 }
@@ -90,7 +83,7 @@ pub enum Requested {
 /// Pingora) and by `main` (to skip the drain when nothing is serving yet).
 pub struct ShutdownRequest {
     requested: watch::Sender<bool>,
-    first: parking_lot::Mutex<Option<Instant>>,
+    first: AtomicBool,
     serving: AtomicBool,
     open: OnceLock<Box<dyn Fn() -> (usize, usize) + Send + Sync>>,
 }
@@ -99,29 +92,20 @@ impl ShutdownRequest {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             requested: watch::channel(false).0,
-            first: parking_lot::Mutex::new(None),
+            first: AtomicBool::new(false),
             serving: AtomicBool::new(false),
             open: OnceLock::new(),
         })
     }
 
-    /// Record a shutdown signal received at `now`.
-    pub fn request_at(&self, now: Instant) -> Requested {
-        let mut first = self.first.lock();
-        match *first {
-            None => {
-                *first = Some(now);
-                self.requested.send_replace(true);
-                Requested::Drain
-            }
-            Some(at) if now.saturating_duration_since(at) < REPEAT_WINDOW => Requested::Repeated,
-            Some(_) => Requested::Force,
-        }
-    }
-
-    /// Record a shutdown signal received now.
+    /// Record a shutdown signal. The first drains, any later one forces.
     pub fn request(&self) -> Requested {
-        self.request_at(Instant::now())
+        if self.first.swap(true, Ordering::SeqCst) {
+            Requested::Force
+        } else {
+            self.requested.send_replace(true);
+            Requested::Drain
+        }
     }
 
     pub fn is_requested(&self) -> bool {
@@ -373,37 +357,13 @@ mod tests {
     }
 
     #[test]
-    fn the_first_request_drains_and_a_late_second_one_forces() {
+    fn the_first_request_drains_and_any_later_one_forces() {
         let request = ShutdownRequest::new();
-        let t0 = Instant::now();
         assert!(!request.is_requested());
-        assert_eq!(request.request_at(t0), Requested::Drain);
+        assert_eq!(request.request(), Requested::Drain);
         assert!(request.is_requested());
-        assert_eq!(
-            request.request_at(t0 + Duration::from_secs(2)),
-            Requested::Force
-        );
-    }
-
-    /// systemd sends SIGTERM from `ExecStop` and again as `KillSignal`,
-    /// about 0.2 s apart. That pair must stay one request.
-    #[test]
-    fn a_repeat_within_the_window_is_the_same_request() {
-        let request = ShutdownRequest::new();
-        let t0 = Instant::now();
-        assert_eq!(request.request_at(t0), Requested::Drain);
-        for ms in [0, 200, 900] {
-            assert_eq!(
-                request.request_at(t0 + Duration::from_millis(ms)),
-                Requested::Repeated,
-                "{ms} ms"
-            );
-        }
-        // The window runs from the first request, so repeats do not extend it.
-        assert_eq!(
-            request.request_at(t0 + Duration::from_millis(1100)),
-            Requested::Force
-        );
+        assert_eq!(request.request(), Requested::Force);
+        assert_eq!(request.request(), Requested::Force);
     }
 
     #[tokio::test]
