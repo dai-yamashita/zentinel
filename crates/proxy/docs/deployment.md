@@ -55,7 +55,7 @@ sudo systemctl reload zentinel
 
 # Restart (stops accepting, waits up to graceful-shutdown-timeout-secs for open
 # connections to finish, then starts again; keep systemd's TimeoutStopSec above
-# that timeout)
+# that timeout). A second SIGTERM/SIGINT while it waits ends the process at once.
 sudo systemctl restart zentinel
 
 # Stop and disable

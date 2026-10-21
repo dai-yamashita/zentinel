@@ -4,6 +4,12 @@
 //! The proxy used to log "draining connections" and call `exit(0)` at once,
 //! so a request in flight when `systemctl restart` ran was cut off.
 //!
+//! Also covered: a signal during startup (nothing is serving, so it ends the
+//! process at once and no listener ever accepts), a second signal while
+//! draining (ends the process at once), a repeat so soon after the first that
+//! it is the same request (as systemd sends two), and a TLS handshake that
+//! straddles the signal.
+//!
 //! Runs the real binary against a backend that answers slowly.
 
 #![cfg(unix)]
@@ -82,6 +88,19 @@ struct Proxy {
 
 impl Proxy {
     fn start(config: &Path, port: u16) -> Self {
+        let mut proxy = Self::spawn(config);
+        proxy.wait_for("Zentinel proxy started successfully");
+        // The line is logged before the listeners are bound.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(Instant::now() < deadline, "the proxy never listened");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        proxy
+    }
+
+    /// Start the process and return at once, while it is still starting.
+    fn spawn(config: &Path) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_zentinel"))
             .arg("-c")
             .arg(config)
@@ -99,19 +118,11 @@ impl Proxy {
                 }
             }
         });
-        let mut proxy = Self {
+        Self {
             child,
             lines,
             log: Vec::new(),
-        };
-        proxy.wait_for("Zentinel proxy started successfully");
-        // The line is logged before the listeners are bound.
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while TcpStream::connect(("127.0.0.1", port)).is_err() {
-            assert!(Instant::now() < deadline, "the proxy never listened");
-            std::thread::sleep(Duration::from_millis(50));
         }
-        proxy
     }
 
     fn wait_for(&mut self, needle: &str) {
@@ -306,5 +317,336 @@ fn a_request_that_outlasts_the_timeout_is_cut_off_at_the_timeout() {
         response.recv_timeout(Duration::from_secs(5)).unwrap(),
         None,
         "the request should have been cut off"
+    );
+}
+
+/// The signal comes while the proxy is still starting, after it has taken
+/// over SIGTERM but before Pingora's own handlers exist. Nothing is serving,
+/// so there is nothing to drain: the process ends at once with 0, and no
+/// listener ever accepts. The 30 s timeout must not matter.
+#[test]
+fn a_signal_during_startup_stops_at_once_and_never_accepts() {
+    let backend = slow_backend(Duration::ZERO);
+    let proxy_port = free_port();
+    let dir = tempfile::tempdir().unwrap();
+    let mut proxy = Proxy::spawn(&write_config(dir.path(), proxy_port, backend, 30));
+
+    proxy.wait_for("Bootstrap done");
+    let signalled = Instant::now();
+    proxy.signal(libc::SIGTERM);
+
+    let mut accepted = false;
+    let (status, exited) = loop {
+        accepted |= TcpStream::connect_timeout(
+            &([127, 0, 0, 1], proxy_port).into(),
+            Duration::from_millis(50),
+        )
+        .is_ok();
+        if let Some(status) = proxy.child.try_wait().unwrap() {
+            break (status, Instant::now());
+        }
+        assert!(
+            signalled.elapsed() < Duration::from_secs(10),
+            "still running {:?} after a signal during startup; log:\n{}",
+            signalled.elapsed(),
+            proxy.log.join("\n")
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(status.success(), "{status:?}");
+    assert!(
+        exited - signalled < Duration::from_secs(3),
+        "exited {:?} after the signal",
+        exited - signalled
+    );
+    assert!(!accepted, "a connection was accepted after the signal");
+}
+
+/// The first signal drains and the second ends the process at once, with a
+/// WARN that names how many connections were open.
+fn second_signal_forces_exit(first: libc::c_int, second: libc::c_int) {
+    let backend = slow_backend(Duration::from_secs(30));
+    let proxy_port = free_port();
+    let dir = tempfile::tempdir().unwrap();
+    let mut proxy = Proxy::start(
+        &write_config(dir.path(), proxy_port, backend, 20),
+        proxy_port,
+    );
+
+    let response = request_in_background(proxy_port);
+    std::thread::sleep(Duration::from_millis(500));
+    proxy.signal(first);
+
+    // Still draining: a request is open and the timeout is 20 s away.
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(
+        proxy.child.try_wait().unwrap().is_none(),
+        "the first signal ended the process; log:\n{}",
+        proxy.log.join("\n")
+    );
+
+    let signalled = Instant::now();
+    proxy.signal(second);
+    let (status, exited) = proxy.wait_exit(Duration::from_secs(10));
+    assert!(
+        exited - signalled < Duration::from_secs(3),
+        "exited {:?} after the second signal",
+        exited - signalled
+    );
+    assert_eq!(status.code(), Some(1), "{status:?}");
+    assert_eq!(
+        response.recv_timeout(Duration::from_secs(5)).unwrap(),
+        None,
+        "the request should have been cut off"
+    );
+
+    // Drain the rest of the output, then look for the WARN.
+    while let Ok(line) = proxy.lines.recv_timeout(Duration::from_millis(500)) {
+        proxy.log.push(line);
+    }
+    let warn = proxy
+        .log
+        .iter()
+        .find(|line| line.contains("while draining, exiting at once"))
+        .unwrap_or_else(|| {
+            panic!(
+                "no WARN for the second signal; log:\n{}",
+                proxy.log.join("\n")
+            )
+        });
+    // The log is coloured: drop the escape sequences before matching fields.
+    let plain: String = {
+        let mut out = String::new();
+        let mut chars = warn.chars();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                for c in chars.by_ref() {
+                    if c == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    };
+    assert!(plain.contains("WARN"), "{plain}");
+    assert!(plain.contains("open_connections=1"), "{plain}");
+}
+
+#[test]
+fn a_second_sigterm_while_draining_exits_at_once() {
+    second_signal_forces_exit(libc::SIGTERM, libc::SIGTERM);
+}
+
+#[test]
+fn ctrl_c_after_a_sigterm_exits_at_once() {
+    second_signal_forces_exit(libc::SIGTERM, libc::SIGINT);
+}
+
+#[test]
+fn two_sigints_exit_at_once() {
+    second_signal_forces_exit(libc::SIGINT, libc::SIGINT);
+}
+
+/// systemd runs `ExecStop` (SIGTERM) and then sends `KillSignal` (SIGTERM) to
+/// what is left, about 0.2 s later. That is one request: the drain goes on and
+/// the request in flight finishes.
+#[test]
+fn two_sigterms_0_2_s_apart_are_one_request() {
+    let backend = slow_backend(Duration::from_secs(2));
+    let proxy_port = free_port();
+    let dir = tempfile::tempdir().unwrap();
+    let mut proxy = Proxy::start(
+        &write_config(dir.path(), proxy_port, backend, 20),
+        proxy_port,
+    );
+
+    let response = request_in_background(proxy_port);
+    std::thread::sleep(Duration::from_millis(700));
+    proxy.signal(libc::SIGTERM);
+    std::thread::sleep(Duration::from_millis(200));
+    proxy.signal(libc::SIGTERM);
+
+    let (status, _) = proxy.wait_exit(Duration::from_secs(15));
+    assert_eq!(
+        response.recv_timeout(Duration::from_secs(5)).unwrap(),
+        Some((200, "ok".to_string())),
+        "the repeat cut the request off; log:\n{}",
+        proxy.log.join("\n")
+    );
+    assert!(status.success(), "{status:?}");
+}
+
+/// A TLS listener, with the test CA's server certificate for `localhost`.
+fn write_tls_config(dir: &Path, proxy: u16, backend: u16, timeout_secs: u64) -> std::path::PathBuf {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tls");
+    let config = dir.join("zentinel-tls.kdl");
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+system {{
+    worker-threads 1
+    graceful-shutdown-timeout-secs {timeout_secs}
+}}
+listeners {{
+    listener "https" {{
+        address "127.0.0.1:{proxy}"
+        protocol "https"
+        tls {{
+            cert-file "{cert}"
+            key-file "{key}"
+        }}
+    }}
+}}
+routes {{
+    route "default" {{
+        matches {{ path-prefix "/" }}
+        upstream "backend"
+    }}
+}}
+upstreams {{
+    upstream "backend" {{
+        target "127.0.0.1:{backend}"
+    }}
+}}
+observability {{
+    metrics {{ enabled #false }}
+}}
+"#,
+            cert = fixtures.join("server-default.crt").display(),
+            key = fixtures.join("server-default.key").display(),
+        ),
+    )
+    .unwrap();
+    config
+}
+
+fn tls_client() -> (rustls::ClientConnection, ()) {
+    let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut roots = rustls::RootCertStore::empty();
+    let ca = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tls/ca.crt");
+    let mut reader = BufReader::new(std::fs::File::open(ca).unwrap());
+    for cert in rustls_pemfile::certs(&mut reader) {
+        roots.add(cert.unwrap()).unwrap();
+    }
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    (
+        rustls::ClientConnection::new(std::sync::Arc::new(config), "localhost".try_into().unwrap())
+            .unwrap(),
+        (),
+    )
+}
+
+/// A client has connected to the TLS listener but has not started the
+/// handshake when the signal arrives. The handshake is not a connection yet,
+/// and used to be dropped with the process; now the drain waits for it, so it
+/// completes and its request is answered.
+#[test]
+fn a_tls_handshake_that_straddles_the_signal_is_not_reset() {
+    let backend = slow_backend(Duration::ZERO);
+    let proxy_port = free_port();
+    let dir = tempfile::tempdir().unwrap();
+    let mut proxy = Proxy::start(
+        &write_tls_config(dir.path(), proxy_port, backend, 20),
+        proxy_port,
+    );
+
+    let tcp = TcpStream::connect(("127.0.0.1", proxy_port)).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let signalled = Instant::now();
+    proxy.signal(libc::SIGTERM);
+    std::thread::sleep(Duration::from_millis(1000));
+    assert!(
+        proxy.child.try_wait().unwrap().is_none(),
+        "the process ended with a handshake pending; log:\n{}",
+        proxy.log.join("\n")
+    );
+
+    // The request goes out in the same flight as the client's Finished, as a
+    // TLS 1.3 client's does: the proxy finds it already waiting once the
+    // handshake is over. (A connection with nothing to say yet is closed
+    // by Pingora once the shutdown has started.)
+    let (mut conn, ()) = tls_client();
+    let mut tcp = tcp;
+    tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    conn.writer()
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut response = String::new();
+    let read = (|| -> std::io::Result<()> {
+        while conn.is_handshaking() || conn.wants_write() {
+            conn.complete_io(&mut tcp)?;
+        }
+        rustls::Stream::new(&mut conn, &mut tcp).read_to_string(&mut response)?;
+        Ok(())
+    })();
+    while let Ok(line) = proxy.lines.recv_timeout(Duration::from_millis(300)) {
+        proxy.log.push(line);
+    }
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "the handshake was reset or the request refused: {response:?} {read:?}\nlog:\n{}",
+        proxy.log.join("\n")
+    );
+
+    let (status, exited) = proxy.wait_exit(Duration::from_secs(15));
+    assert!(status.success(), "{status:?}");
+    assert!(exited - signalled < Duration::from_secs(8));
+}
+
+/// A connection that never starts its handshake does not hold the shutdown
+/// for long: the wait for handshakes is capped.
+#[test]
+fn a_stalled_tls_connection_does_not_hold_the_shutdown_for_long() {
+    let backend = slow_backend(Duration::ZERO);
+    let proxy_port = free_port();
+    let dir = tempfile::tempdir().unwrap();
+    let mut proxy = Proxy::start(
+        &write_tls_config(dir.path(), proxy_port, backend, 20),
+        proxy_port,
+    );
+
+    let _stalled = TcpStream::connect(("127.0.0.1", proxy_port)).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let signalled = Instant::now();
+    proxy.signal(libc::SIGTERM);
+    let (status, exited) = proxy.wait_exit(Duration::from_secs(15));
+    assert!(status.success(), "{status:?}");
+    let took = exited - signalled;
+    assert!(
+        took < Duration::from_secs(8),
+        "a stalled handshake held the shutdown for {took:?} of a 20 s timeout"
+    );
+}
+
+/// A client that connects and goes away (a TCP health check) leaves nothing
+/// to wait for: the shutdown is as quick as on an idle proxy.
+#[test]
+fn an_abandoned_tls_connection_does_not_delay_the_shutdown() {
+    let backend = slow_backend(Duration::ZERO);
+    let proxy_port = free_port();
+    let dir = tempfile::tempdir().unwrap();
+    let mut proxy = Proxy::start(
+        &write_tls_config(dir.path(), proxy_port, backend, 20),
+        proxy_port,
+    );
+
+    drop(TcpStream::connect(("127.0.0.1", proxy_port)).unwrap());
+    std::thread::sleep(Duration::from_millis(300));
+    let signalled = Instant::now();
+    proxy.signal(libc::SIGTERM);
+    let (status, exited) = proxy.wait_exit(Duration::from_secs(15));
+    assert!(status.success(), "{status:?}");
+    assert!(
+        exited - signalled < Duration::from_secs(2),
+        "an abandoned connection delayed the shutdown by {:?}",
+        exited - signalled
     );
 }
