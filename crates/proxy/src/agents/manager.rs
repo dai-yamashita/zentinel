@@ -18,7 +18,7 @@ use zentinel_common::{
     types::CircuitBreakerConfig,
     CircuitBreaker,
 };
-use zentinel_config::{AgentConfig, FailureMode};
+use zentinel_config::{AgentConfig, BodyStreamingMode, FailureMode};
 
 use super::agent_v2::AgentV2;
 use super::context::AgentCallContext;
@@ -290,6 +290,18 @@ impl AgentManager {
             .any(|resolved| matches!(resolved, Resolved::Loaded(..)))
     }
 
+    /// Whether any of a route's body agents subscribes to the request body
+    /// (`events "request_body"`); the request-side counterpart of
+    /// [`Self::any_agent_handles_event`]. An agent that is not loaded counts:
+    /// whether it subscribes is unknown, and the body path answers its
+    /// failure by its filter's failure mode, as it always has.
+    pub async fn any_body_agent_handles_request_body(&self, body_agents: &[BodyAgent]) -> bool {
+        !self
+            .resolve_agents(body_agents, Some(EventType::RequestBodyChunk))
+            .await
+            .is_empty()
+    }
+
     /// The largest response body any of the route's agents inspects: their
     /// `max-response-body-bytes`. A response body is buffered for them up
     /// to this size; one larger is over every agent's limit, and answered by
@@ -305,6 +317,23 @@ impl AgentManager {
             })
             .max()
             .unwrap_or(0)
+    }
+
+    /// How the request body is sent to the route's body agents: their
+    /// `request-body-mode`s, combined by `most_conservative_body_mode`.
+    /// Agents that are not loaded have no say (their call fails on
+    /// dispatch, by their filter's failure mode).
+    pub async fn request_body_mode(&self, body_agents: &[BodyAgent]) -> BodyStreamingMode {
+        let modes: Vec<BodyStreamingMode> = self
+            .resolve_agents(body_agents, Some(EventType::RequestBodyChunk))
+            .await
+            .iter()
+            .filter_map(|resolved| match resolved {
+                Resolved::Loaded(_, agent) => Some(agent.request_body_mode()),
+                Resolved::NotLoaded(_) => None,
+            })
+            .collect();
+        most_conservative_body_mode(&modes)
     }
 
     /// Process request headers through agents.
@@ -1515,6 +1544,88 @@ fn evaluate_body_limits(
     }
 
     outcome
+}
+
+/// The body mode for a route whose body agents asked for `modes` (#602).
+///
+/// One body is sent to all of a route's agents in one way, so when they
+/// disagree the mode that gives every agent at least the view it asked
+/// for wins: `buffer` (the whole body, up to the inspection limit) over
+/// `hybrid` (the largest threshold) over `stream`. An agent written for a
+/// buffered body may decide on a fragment it was never meant to see; one
+/// written for chunks still works on a single buffered chunk. No agents:
+/// `buffer`, the default.
+pub fn most_conservative_body_mode(modes: &[BodyStreamingMode]) -> BodyStreamingMode {
+    let mut result: Option<BodyStreamingMode> = None;
+    for mode in modes {
+        result = Some(match (result, *mode) {
+            (None, mode) => mode,
+            (Some(BodyStreamingMode::Buffer), _) | (_, BodyStreamingMode::Buffer) => {
+                BodyStreamingMode::Buffer
+            }
+            (
+                Some(BodyStreamingMode::Hybrid {
+                    buffer_threshold: a,
+                }),
+                BodyStreamingMode::Hybrid {
+                    buffer_threshold: b,
+                },
+            ) => BodyStreamingMode::Hybrid {
+                buffer_threshold: a.max(b),
+            },
+            (Some(hybrid @ BodyStreamingMode::Hybrid { .. }), BodyStreamingMode::Stream)
+            | (Some(BodyStreamingMode::Stream), hybrid @ BodyStreamingMode::Hybrid { .. }) => {
+                hybrid
+            }
+            (Some(BodyStreamingMode::Stream), BodyStreamingMode::Stream) => {
+                BodyStreamingMode::Stream
+            }
+        });
+    }
+    result.unwrap_or(BodyStreamingMode::Buffer)
+}
+
+#[cfg(test)]
+mod body_mode_tests {
+    use super::most_conservative_body_mode;
+    use zentinel_config::BodyStreamingMode::{self, Buffer, Hybrid, Stream};
+
+    fn hybrid(buffer_threshold: usize) -> BodyStreamingMode {
+        Hybrid { buffer_threshold }
+    }
+
+    #[test]
+    fn no_agents_buffer() {
+        assert_eq!(most_conservative_body_mode(&[]), Buffer);
+    }
+
+    #[test]
+    fn a_single_agent_gets_its_mode() {
+        assert_eq!(most_conservative_body_mode(&[Stream]), Stream);
+        assert_eq!(most_conservative_body_mode(&[hybrid(8)]), hybrid(8));
+        assert_eq!(most_conservative_body_mode(&[Buffer]), Buffer);
+    }
+
+    #[test]
+    fn buffer_wins_over_everything() {
+        assert_eq!(most_conservative_body_mode(&[Stream, Buffer]), Buffer);
+        assert_eq!(most_conservative_body_mode(&[Buffer, hybrid(8)]), Buffer);
+        assert_eq!(
+            most_conservative_body_mode(&[Stream, hybrid(8), Buffer, Stream]),
+            Buffer
+        );
+    }
+
+    #[test]
+    fn hybrid_wins_over_stream_with_the_largest_threshold() {
+        assert_eq!(most_conservative_body_mode(&[Stream, hybrid(8)]), hybrid(8));
+        assert_eq!(most_conservative_body_mode(&[hybrid(8), Stream]), hybrid(8));
+        assert_eq!(
+            most_conservative_body_mode(&[hybrid(8), hybrid(64), Stream]),
+            hybrid(64)
+        );
+        assert_eq!(most_conservative_body_mode(&[Stream, Stream]), Stream);
+    }
 }
 
 #[cfg(test)]

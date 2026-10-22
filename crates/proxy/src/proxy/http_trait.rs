@@ -2230,8 +2230,12 @@ impl ProxyHttp for ZentinelProxy {
                 BodyStreamingMode::Hybrid { buffer_threshold } => {
                     // Hybrid mode: buffer up to threshold, then stream
                     if ctx.body_bytes_inspected < buffer_threshold as u64 {
-                        // Still in buffering phase
-                        if let Some(ref chunk) = body {
+                        // Still in buffering phase. What is buffered is
+                        // held back from the upstream until the agents
+                        // have decided on it.
+                        // Held as an empty chunk, not `None`: Pingora
+                        // takes `None` for the end of the upstream body.
+                        if let Some(chunk) = body.replace(Bytes::new()) {
                             let bytes_to_buffer = std::cmp::min(
                                 chunk.len(),
                                 (buffer_threshold as u64 - ctx.body_bytes_inspected) as usize,
@@ -2248,7 +2252,7 @@ impl ProxyHttp for ZentinelProxy {
                                     ctx,
                                 )
                                 .await?;
-                                ctx.body_buffer.clear();
+                                let mut forward = std::mem::take(&mut ctx.body_buffer);
 
                                 // If there's remaining data in this chunk, stream it
                                 if bytes_to_buffer < chunk.len() {
@@ -2260,8 +2264,18 @@ impl ProxyHttp for ZentinelProxy {
                                         ctx,
                                     )
                                     .await?;
+                                    if let Some(rest) = remaining_body {
+                                        forward.extend_from_slice(&rest);
+                                    }
+                                }
+                                if !forward.is_empty() {
+                                    *body = Some(Bytes::from(forward));
                                 }
                             }
+                        } else if end_of_stream && !ctx.body_buffer.is_empty() {
+                            // The end arrived on its own, under the threshold.
+                            self.send_buffered_body_to_agents(true, ctx).await?;
+                            *body = Some(Bytes::from(std::mem::take(&mut ctx.body_buffer)));
                         }
                     } else {
                         // Past threshold, stream directly
@@ -2270,6 +2284,10 @@ impl ProxyHttp for ZentinelProxy {
                     }
                 }
                 BodyStreamingMode::Buffer => {
+                    // Until the agents have decided, nothing is passed on:
+                    // a refused body must not have reached the upstream.
+                    let undecided = !ctx.request_body_decided;
+
                     // Buffer mode: collect chunks until ready to send
                     if let Some(ref chunk) = body {
                         if ctx.body_bytes_inspected < max_inspection_bytes {
@@ -2292,6 +2310,14 @@ impl ProxyHttp for ZentinelProxy {
                         }
                     }
 
+                    if undecided {
+                        // Held as an empty chunk, not `None`: Pingora takes
+                        // `None` for the end of the upstream body.
+                        if let Some(chunk) = body.replace(Bytes::new()) {
+                            ctx.request_body_held.extend_from_slice(&chunk);
+                        }
+                    }
+
                     // Send when complete or limit reached
                     let should_send =
                         end_of_stream || ctx.body_bytes_inspected >= max_inspection_bytes;
@@ -2299,6 +2325,15 @@ impl ProxyHttp for ZentinelProxy {
                         self.send_buffered_body_to_agents(end_of_stream, ctx)
                             .await?;
                         ctx.body_buffer.clear();
+                    }
+                    if undecided && should_send {
+                        // Allowed (a refusal returned above): pass on what
+                        // was held, and from now on the rest as it comes.
+                        ctx.request_body_decided = true;
+                        let held = std::mem::take(&mut ctx.request_body_held);
+                        if !held.is_empty() {
+                            *body = Some(Bytes::from(held));
+                        }
                     }
                 }
             }
@@ -2597,6 +2632,15 @@ impl ProxyHttp for ZentinelProxy {
             }
         }
 
+        // Response-header changes agents asked for in the request phases,
+        // on a request they allowed (#596). Applied before the response
+        // phase's own below, so an agent consulted on the response has the
+        // last word on a header.
+        if !ctx.agent_response_headers.is_empty() {
+            let ops = std::mem::take(&mut ctx.agent_response_headers);
+            handlers::apply_agent_response_header_ops(upstream_response, &ops);
+        }
+
         // Process response headers through agents (for agents that subscribe to ResponseHeaders events)
         if !ctx.route_agents.is_empty() {
             let agent_ids = ctx.route_agents.clone();
@@ -2669,23 +2713,10 @@ impl ProxyHttp for ZentinelProxy {
                     }
 
                     // Apply response header modifications from agent
-                    for op in &decision.response_headers {
-                        match op {
-                            zentinel_agent_protocol::HeaderOp::Set { name, value } => {
-                                upstream_response
-                                    .insert_header(name.clone(), value.as_str())
-                                    .ok();
-                            }
-                            zentinel_agent_protocol::HeaderOp::Add { name, value } => {
-                                upstream_response
-                                    .append_header(name.clone(), value.as_str())
-                                    .ok();
-                            }
-                            zentinel_agent_protocol::HeaderOp::Remove { name } => {
-                                upstream_response.remove_header(name);
-                            }
-                        }
-                    }
+                    handlers::apply_agent_response_header_ops(
+                        upstream_response,
+                        &decision.response_headers,
+                    );
 
                     // Check if any agent subscribes to response body events
                     let has_body_agents = self
@@ -5545,7 +5576,7 @@ impl ZentinelProxy {
             )
             .await
         {
-            Ok(decision) => {
+            Ok(mut decision) => {
                 // Track if agent needs more data
                 ctx.agent_needs_more = decision.needs_more;
 
@@ -5553,8 +5584,10 @@ impl ZentinelProxy {
                 if let Some(ref mutation) = decision.request_body_mutation {
                     if !mutation.is_pass_through() {
                         if mutation.is_drop() {
-                            // Drop the chunk
-                            *body = None;
+                            // Drop the chunk. An empty chunk, not `None`:
+                            // Pingora takes `None` for the end of the
+                            // upstream body, which cut the body off here.
+                            *body = Some(Bytes::new());
                             trace!(
                                 correlation_id = %ctx.trace_id,
                                 chunk_index = chunk_index,
@@ -5585,6 +5618,9 @@ impl ZentinelProxy {
                         "agent_body_inspection",
                     )?;
                 }
+                // Not refused: keep its header changes (#596). Those for the
+                // response apply if the upstream has not answered yet.
+                Self::keep_body_phase_header_ops(ctx, &mut decision);
 
                 trace!(
                     correlation_id = %ctx.trace_id,
@@ -5593,11 +5629,13 @@ impl ZentinelProxy {
                 );
             }
             Err(e) => {
-                let fail_closed = ctx
-                    .route_config
-                    .as_ref()
-                    .map(|r| r.policies.failure_mode == zentinel_config::FailureMode::Closed)
-                    .unwrap_or(false);
+                // Every failure of an agent itself (not loaded, circuit
+                // open, call error, timeout) arrives above as a decision,
+                // decided by its filter's failure mode. This is only the
+                // call that could not be dispatched (the agent's call
+                // permit could not be had), and follows the same rule
+                // (#597).
+                let fail_closed = ctx.request_body_agents_fail_closed();
 
                 if fail_closed {
                     error!(
@@ -5696,14 +5734,11 @@ impl ZentinelProxy {
                         self.metrics
                             .record_decompression_failure(encoding, failure_reason);
 
-                        // Decompression failed - decide based on failure mode
-                        let fail_closed = ctx
-                            .route_config
-                            .as_ref()
-                            .map(|r| {
-                                r.policies.failure_mode == zentinel_config::FailureMode::Closed
-                            })
-                            .unwrap_or(false);
+                        // The body cannot be inspected as sent. Decided by
+                        // the body agents' filters, else the route, as any
+                        // failure on the body is (#597); it used to be the
+                        // route's policy alone.
+                        let fail_closed = ctx.request_body_agents_fail_closed();
 
                         if fail_closed {
                             error!(
@@ -5762,7 +5797,7 @@ impl ZentinelProxy {
             .process_request_body(&agent_ctx, &body_for_inspection, end_of_stream, &agent_ids)
             .await
         {
-            Ok(decision) => {
+            Ok(mut decision) => {
                 // Anything but Allow is answered by `fail_to_proxy` (#557,
                 // #595).
                 self.refuse_on_agent_request_decision(
@@ -5771,6 +5806,8 @@ impl ZentinelProxy {
                     "request_body",
                     "agent_body_inspection",
                 )?;
+                // Allowed: keep its header changes (#596).
+                Self::keep_body_phase_header_ops(ctx, &mut decision);
 
                 trace!(
                     correlation_id = %ctx.trace_id,
@@ -5778,11 +5815,9 @@ impl ZentinelProxy {
                 );
             }
             Err(e) => {
-                let fail_closed = ctx
-                    .route_config
-                    .as_ref()
-                    .map(|r| r.policies.failure_mode == zentinel_config::FailureMode::Closed)
-                    .unwrap_or(false);
+                // Only a call that could not be dispatched; see the
+                // streaming path above (#597).
+                let fail_closed = ctx.request_body_agents_fail_closed();
 
                 if fail_closed {
                     error!(

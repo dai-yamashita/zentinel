@@ -365,6 +365,21 @@ pub struct RequestContext {
     /// Agents whose filter sets `inspect-body #false` are left out, and each
     /// carries its filter's `max-body-bytes`.
     pub(crate) body_inspection_agents: Vec<crate::agents::BodyAgent>,
+    /// Response-header changes agents asked for in the request phases
+    /// (request headers, request body), applied to the client's response
+    /// in `response_filter` before the response phases' own (#596).
+    pub(crate) agent_response_headers: Vec<zentinel_agent_protocol::HeaderOp>,
+    /// Request body held back from the upstream until the body agents
+    /// have decided on it (buffer mode, and hybrid mode's buffered part).
+    ///
+    /// Without it the body went upstream chunk by chunk while it was being
+    /// buffered for inspection, so a body the agents refused had already
+    /// been delivered -- whole, when its end arrived apart from its last
+    /// bytes, as with every chunked body.
+    pub(crate) request_body_held: Vec<u8>,
+    /// Whether the body agents have been sent the (buffered) request body,
+    /// after which the rest of the body is passed on as it comes.
+    pub(crate) request_body_decided: bool,
 
     // === Agentic protocol policy (MCP / A2A) ===
     /// Request body accumulated for MCP/A2A policy evaluation.
@@ -647,6 +662,9 @@ impl RequestContext {
             response_blocked: false,
             a2a_method: None,
             body_inspection_agents: Vec::new(),
+            agent_response_headers: Vec::new(),
+            request_body_held: Vec::new(),
+            request_body_decided: false,
             decompression_enabled: false,
             body_content_encoding: None,
             max_decompression_ratio: 100.0,
@@ -1003,6 +1021,21 @@ impl RequestContext {
         self.inference_provider_override = provider_override;
     }
 
+    /// Whether a failure on the request body, other than an agent's
+    /// decision, refuses the request: whether any agent the body goes to
+    /// has a filter (else its route) set to `failure-mode "closed"`.
+    ///
+    /// The same rule as for every failed agent call (#584) and for the
+    /// response body: a failure that is no single agent's -- the body could
+    /// not be decompressed for inspection, or the call could not be
+    /// dispatched at all -- concerns all of them, so one closed filter is
+    /// enough (#597).
+    pub(crate) fn request_body_agents_fail_closed(&self) -> bool {
+        self.body_inspection_agents
+            .iter()
+            .any(|agent| agent.failure_mode == zentinel_config::FailureMode::Closed)
+    }
+
     /// The request body limit that applies to this request, given the
     /// global `limits` one.
     ///
@@ -1088,6 +1121,25 @@ impl Default for RequestContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_body_failures_follow_the_body_agents_filters() {
+        use zentinel_config::FailureMode;
+        let agent = |id: &str, failure_mode| crate::agents::BodyAgent {
+            id: id.to_string(),
+            max_body_bytes: None,
+            failure_mode,
+        };
+        let mut ctx = RequestContext::new();
+        // No body agents: nothing to fail closed for.
+        assert!(!ctx.request_body_agents_fail_closed());
+        ctx.body_inspection_agents = vec![agent("a", FailureMode::Open)];
+        assert!(!ctx.request_body_agents_fail_closed());
+        // One closed filter is enough.
+        ctx.body_inspection_agents
+            .push(agent("b", FailureMode::Closed));
+        assert!(ctx.request_body_agents_fail_closed());
+    }
 
     mod agent_block {
         use super::super::AgentBlock;

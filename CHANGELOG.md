@@ -112,6 +112,46 @@ for details.
   not used: its filters follow their `failure-mode` (`open` forwards
   uninspected, `closed` answers 503) and the pool keeps reconnecting in the
   background, so the agent is used as soon as it answers.
+- **Agent response-header changes made in the request phases never reached
+  the client** (#596). An allowed request's `response_headers` from the
+  request-headers or request-body phase were discarded, so e.g. the
+  api-deprecation agent's `Deprecation` / `Sunset` headers were never sent.
+  They are now applied to the client's response, before the response-headers
+  phase's own changes. Request-header changes made on the request body cannot
+  be applied (the upstream request's header is already sent by then); they
+  are dropped with a warning logged once per agent, and documented.
+- **A request body that could not be decompressed for agent inspection was
+  decided by the route's `failure-mode` alone** (#597), ignoring the agent
+  filters'. It now follows the same rule as every other failure on the body:
+  any body agent whose filter (else route) is `closed` refuses it with 400;
+  otherwise it is inspected as sent. The unreachable route-policy fallbacks
+  on agent dispatch errors use the same rule (the request-headers one now
+  answers 503 instead of 500).
+- **`request-body-mode "stream"` / `"hybrid:N"` were parsed and then ignored**
+  (#602): every request body was buffered whole before any agent saw it. The
+  mode is now taken from the route's body agents. When they disagree, the
+  most conservative applies: `buffer` over `hybrid` (largest threshold) over
+  `stream`, so no agent gets less of the body at once than it asked for.
+  Decisions on streamed chunks (Block, Challenge, Redirect) are answered as on
+  a buffered body.
+- **A request body the agents refused could still reach the upstream whole**
+  (found while fixing #602). In buffer mode the body was forwarded chunk by
+  chunk while it was being buffered for inspection, and the agents were asked
+  only at its end; a chunked body's end arrives apart from its last bytes, so
+  the client got the agent's 403 / 429 and the upstream got the complete
+  request. The body is now held back until the agents have decided, in buffer
+  mode and for hybrid mode's buffered part. The upstream still sees the
+  request's headers (they are sent before the body is read); see the agent
+  protocol docs. Also fixed: a hybrid-mode body under the threshold whose end
+  arrived on its own was never inspected, and a streamed chunk an agent
+  dropped ended the upstream body instead of being left out.
+- **Agents subscribed to `request_body` never got a body without a `waf`
+  block.** Request-body inspection was enabled only by `waf { body-inspection
+  { inspect-request-body } }`, so with no `waf` block such an agent could not
+  see or block any body, while response bodies went to their agents
+  regardless. Request bodies now go to every route agent that subscribes to
+  them unless `inspect-request-body #false` is set. Without a `waf` block,
+  every content type is sent.
 
 ### Changed
 

@@ -480,7 +480,7 @@ External processing agent configuration.
 | `circuit-breaker` | `CircuitBreakerConfig` | - | Circuit breaker |
 | `max-request-body-bytes` | `u64` | `1048576` (1 MiB) | Max request body inspected by this agent. Larger bodies follow the filter's `failure-mode`: `closed` blocks with 413, `open` skips this agent with a warning and metric |
 | `max-response-body-bytes` | `u64` | `1048576` (1 MiB) | Max response body inspected by this agent (same failure-mode semantics) |
-| `request-body-mode` | `string` | `"buffer"` | Body mode: `buffer`, `stream`, `hybrid` |
+| `request-body-mode` | `string` | `"buffer"` | How the request body is sent: `buffer` (whole, up to `max-inspection-bytes`), `stream` (each chunk as it arrives), `hybrid` / `hybrid:<bytes>` (buffer up to the threshold, default 64 KiB, then stream). One body goes to all of a route's body agents in one mode; when they disagree, `buffer` wins over `hybrid` (largest threshold) over `stream` |
 | `max-concurrent-calls` | `u32` | `100` | Max concurrent calls |
 
 ### AgentTransport
@@ -549,7 +549,7 @@ Web Application Firewall configuration.
 
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
-| `inspect-request-body` | `bool` | `true` | Inspect request bodies |
+| `inspect-request-body` | `bool` | `true` | Send request bodies to the route's agents that subscribe to `request_body`. `#false` keeps them from every agent. Without a `waf` block, request bodies go to those agents too, with the defaults below except `content-types` (every content type is sent) |
 | `inspect-response-body` | `bool` | `false` | Inspect response bodies |
 | `max-inspection-bytes` | `u64` | `1048576` | Max bytes to inspect |
 | `content-types` | `[string]` | *form/json/xml* | Content types to inspect |
