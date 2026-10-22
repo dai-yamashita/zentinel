@@ -6,8 +6,9 @@
 //!
 //! Also covered: a signal during startup (nothing is serving, so it ends the
 //! process at once and no listener ever accepts), a second signal while
-//! draining (ends the process at once), a TLS handshake that straddles the
-//! signal, and the same drain in a daemon started with `-d`.
+//! draining (ends the process at once), a signal while startup waits on a
+//! silent agent, a TLS handshake that straddles the signal, and the same
+//! drain in a daemon started with `-d`.
 //!
 //! Runs the real binary against a backend that answers slowly.
 
@@ -15,6 +16,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
@@ -359,6 +361,128 @@ fn a_signal_during_startup_stops_at_once_and_never_accepts() {
         exited - signalled
     );
     assert!(!accepted, "a connection was accepted after the signal");
+}
+
+/// An agent that accepts the connection and never answers the handshake keeps
+/// the proxy in startup for up to its connect timeout plus 5 s (#606). A
+/// signal in that wait stops the proxy at once, long before the wait is over,
+/// and nothing listens or accepts. The agents are connected while the proxy is
+/// built, before the signal thread exists, so the signal takes its default
+/// action and ends the process (the status is the signal itself, which
+/// systemd counts as a clean stop for SIGTERM).
+fn startup_waiting_on_a_silent_agent_stops_at_once(sig: libc::c_int) {
+    let backend = slow_backend(Duration::ZERO);
+    let proxy_port = free_port();
+    let dir = tempfile::tempdir().unwrap();
+
+    // A mute agent: it holds every connection it accepts and says nothing.
+    let socket = dir.path().join("mute.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let (accepted_tx, accepted) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in listener.incoming().flatten() {
+            held.push(stream);
+            let _ = accepted_tx.send(());
+        }
+    });
+
+    let config = dir.path().join("zentinel.kdl");
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+system {{
+    worker-threads 1
+    graceful-shutdown-timeout-secs 30
+}}
+listeners {{
+    listener "http" {{
+        address "127.0.0.1:{proxy_port}"
+        protocol "http"
+    }}
+}}
+upstreams {{
+    upstream "backend" {{
+        target "127.0.0.1:{backend}"
+    }}
+}}
+agents {{
+    agent "mute" type="custom" {{
+        unix-socket "{}"
+        events "request_headers"
+        timeout-ms 500
+        connect-timeout-ms 25000
+    }}
+}}
+filters {{
+    filter "mute" {{
+        type "agent"
+        agent "mute"
+        failure-mode "open"
+    }}
+}}
+routes {{
+    route "default" {{
+        matches {{ path-prefix "/" }}
+        upstream "backend"
+        filters "mute"
+    }}
+}}
+observability {{
+    metrics {{ enabled #false }}
+}}
+"#,
+            socket.display()
+        ),
+    )
+    .unwrap();
+
+    let mut proxy = Proxy::spawn(&config);
+    // The proxy is now inside the agent's handshake, which would last 25 s.
+    accepted
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the proxy never connected to the agent");
+    let signalled = Instant::now();
+    proxy.signal(sig);
+
+    let mut accepted_any = false;
+    let status = loop {
+        accepted_any |= TcpStream::connect_timeout(
+            &([127, 0, 0, 1], proxy_port).into(),
+            Duration::from_millis(50),
+        )
+        .is_ok();
+        if let Some(status) = proxy.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            signalled.elapsed() < Duration::from_secs(5),
+            "still running {:?} after a signal while startup waited on a silent agent",
+            signalled.elapsed()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        status.success() || status.signal() == Some(sig),
+        "{status:?}"
+    );
+    assert!(
+        signalled.elapsed() < Duration::from_secs(3),
+        "exited {:?} after the signal",
+        signalled.elapsed()
+    );
+    assert!(!accepted_any, "a connection was accepted after the signal");
+}
+
+#[test]
+fn sigterm_while_startup_waits_on_a_silent_agent_stops_at_once() {
+    startup_waiting_on_a_silent_agent_stops_at_once(libc::SIGTERM);
+}
+
+#[test]
+fn sigint_while_startup_waits_on_a_silent_agent_stops_at_once() {
+    startup_waiting_on_a_silent_agent_stops_at_once(libc::SIGINT);
 }
 
 /// The first signal drains and the second ends the process at once, with a
