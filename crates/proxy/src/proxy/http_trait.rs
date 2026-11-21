@@ -41,6 +41,7 @@ use super::model_routing;
 use super::model_routing_metrics::get_model_routing_metrics;
 use super::ZentinelProxy;
 use zentinel_common::observability::RequestMetrics;
+use zentinel_common::types::is_idempotent_method;
 
 /// The IP socket address behind a Pingora endpoint, if it has one.
 ///
@@ -4263,32 +4264,87 @@ impl ProxyHttp for ZentinelProxy {
             ctx.upstream_attempts
         ));
 
-        // Determine if retry should be attempted:
-        // - Only retry if error is retryable type
-        // - Only retry reused connections if buffer isn't truncated
-        // - Track retry metrics
-        if is_retryable {
-            let can_retry = if client_reused {
-                // For reused connections, check if retry buffer is intact
-                !session.as_ref().retry_buffer_truncated()
-            } else {
-                // Fresh connections can always retry
-                true
-            };
+        // An error reaches this hook in one of three states:
+        //
+        // - `Decided(true)`: something before this hook already decided to
+        //   retry. Pingora's HTTP/2 client does so for a stream the upstream
+        //   reset with REFUSED_STREAM, for a remote GOAWAY with NO_ERROR, for
+        //   HTTP_1_1_REQUIRED (`H2Downgrade`: the upstream asked for
+        //   HTTP/1.1), and for the GOAWAY the `h2` library sends itself after
+        //   an invalid frame (`InvalidH2`). So does a response status that
+        //   `should_retry_response` approved, after it checked the method
+        //   itself.
+        // - `ReusedOnly`: the error type alone does not say. The error type
+        //   decides here (`is_retryable`), whether or not the connection was
+        //   reused.
+        // - `Decided(false)`: left as it is.
+        let origin = RetryOrigin::of(enhanced_error.retry, &error_type);
+        enhanced_error.retry.decide_reuse(is_retryable);
 
-            enhanced_error.retry.decide_reuse(can_retry);
-
-            if can_retry {
-                debug!(
+        // This hook replaces Pingora's default `error_while_proxy`. Since
+        // Pingora 0.9 (`zentinel-pingora-proxy` 0.9.1) the default sets
+        // `retry` to false, whatever state it arrives in, when the method is
+        // not idempotent or the retry buffer was truncated. Here the two
+        // checks apply as follows:
+        //
+        // - A retry decided here (`ReusedOnly` made `Decided(true)`) is
+        //   refused when the method is not idempotent, unless the route sets
+        //   `retry-non-idempotent`: the connection failed after the request
+        //   may have been sent, so the upstream may have acted on it. It is
+        //   also refused when the body no longer fits the retry buffer.
+        // - A retry marked on arrival is refused only when the body no longer
+        //   fits the retry buffer, because the body cannot be sent again. The
+        //   method is not looked at. RFC 9113 section 8.7 says a stream reset
+        //   with REFUSED_STREAM, and a stream above the last stream id of a
+        //   GOAWAY, were not processed, so the upstream has not acted on them
+        //   and any method may be sent again. (`h2` hands the error of a
+        //   received GOAWAY only to the streams it opened above the last
+        //   stream id, and to requests it has not sent yet.) The default
+        //   refuses these for a POST; here a gRPC call survives the graceful
+        //   shutdown of an HTTP/2 upstream. HTTP_1_1_REQUIRED is not covered
+        //   by section 8.7: the upstream asked for HTTP/1.1, and the request
+        //   is treated as Pingora marks it.
+        // - `InvalidH2` is the exception among Pingora's marks, and is treated
+        //   as decided here. It is the GOAWAY(PROTOCOL_ERROR) the `h2` library
+        //   sends itself, which reaches every stream of the connection,
+        //   including one the upstream may have processed; the reason of
+        //   section 8.7 does not hold for it.
+        if enhanced_error.retry == RetryType::Decided(true) {
+            let route_allows_non_idempotent = ctx
+                .route_config()
+                .and_then(|route| route.retry_policy.as_ref())
+                .is_some_and(|policy| policy.retry_non_idempotent);
+            let method = session.req_header().method.as_str();
+            let refusal = ReplayCheck {
+                origin,
+                method,
+                route_allows_non_idempotent,
+                retry_buffer_truncated: session.as_ref().retry_buffer_truncated(),
+            }
+            .refusal();
+            match refusal {
+                Some(refusal) => {
+                    enhanced_error.set_retry(false);
+                    self.metrics.record_retry_refused(refusal.as_str());
+                    info!(
+                        correlation_id = %ctx.trace_id,
+                        route_id = ctx.route_id.as_deref().unwrap_or("unknown"),
+                        upstream = %upstream_id,
+                        peer_address = %peer.address(),
+                        method = method,
+                        error_type = ?error_type,
+                        client_reused = client_reused,
+                        reason = refusal.as_str(),
+                        "Not retrying a request that may have been sent to the upstream"
+                    );
+                }
+                None => debug!(
                     correlation_id = %ctx.trace_id,
                     upstream = %upstream_id,
                     error_type = ?error_type,
                     "Error is retryable, will attempt retry"
-                );
+                ),
             }
-        } else {
-            // Non-retryable error - don't retry
-            enhanced_error.retry.decide_reuse(false);
         }
 
         enhanced_error
@@ -4742,6 +4798,95 @@ enum TargetOutcome {
     /// the target: the client went away or sent a body over its limit, a
     /// filter or an agent refused the request or its response.
     NoResult,
+}
+
+/// Why a request that failed after it may have been sent to the upstream is
+/// not sent again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplayRefusal {
+    /// The method is not idempotent, and the route's `retry-policy` does not
+    /// set `retry-non-idempotent`.
+    NonIdempotentMethod,
+    /// The request body was larger than the retry buffer, so it cannot be
+    /// sent a second time.
+    RetryBufferTruncated,
+}
+
+impl ReplayRefusal {
+    /// The fixed value logged, and used as the `reason` label of
+    /// `zentinel_upstream_retries_refused_total`.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NonIdempotentMethod => "non_idempotent_method",
+            Self::RetryBufferTruncated => "retry_buffer_truncated",
+        }
+    }
+}
+
+/// Who decided that a request may be sent again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryOrigin {
+    /// `error_while_proxy` did: the error arrived as `ReusedOnly` and
+    /// `decide_reuse` made it `Decided(true)`. The connection failed after the
+    /// request may have been sent, so the upstream may have acted on it. An
+    /// `InvalidH2` error is treated the same although it arrives marked: the
+    /// GOAWAY the `h2` library sends after an invalid frame reaches every
+    /// stream of the connection, so the request may have been processed.
+    DecidedHere,
+    /// The error arrived already `Decided(true)`: Pingora's HTTP/2 client
+    /// marked it (REFUSED_STREAM, a remote GOAWAY with NO_ERROR,
+    /// HTTP_1_1_REQUIRED), or it carries a status that `should_retry_response`
+    /// approved after it checked the method. The method is not checked again.
+    MarkedOnArrival,
+}
+
+impl RetryOrigin {
+    /// Who decided a retry, from the state `error_while_proxy` received the
+    /// error in and its type.
+    fn of(arrived: RetryType, error_type: &ErrorType) -> Self {
+        if arrived == RetryType::Decided(true) && !matches!(error_type, ErrorType::InvalidH2) {
+            Self::MarkedOnArrival
+        } else {
+            Self::DecidedHere
+        }
+    }
+}
+
+/// What decides whether a request that failed after it may have been sent to
+/// the upstream can be sent again.
+struct ReplayCheck<'a> {
+    /// Who decided to send the request again.
+    origin: RetryOrigin,
+    /// The request method, as received.
+    method: &'a str,
+    /// The route's `retry-policy` sets `retry-non-idempotent`.
+    route_allows_non_idempotent: bool,
+    /// The request body was larger than the retry buffer.
+    retry_buffer_truncated: bool,
+}
+
+impl ReplayCheck<'_> {
+    /// Why the request may not be sent again, if it may not.
+    ///
+    /// When the retry was [decided here](RetryOrigin::DecidedHere), a method
+    /// that is not idempotent ([`zentinel_common::types::is_idempotent_method`])
+    /// is replayed only where the route's `retry-policy` says
+    /// `retry-non-idempotent`. When it was
+    /// [marked on arrival](RetryOrigin::MarkedOnArrival), the method is not
+    /// looked at. A request whose body was larger than the retry buffer is
+    /// never replayed, whatever its method or who decided.
+    fn refusal(&self) -> Option<ReplayRefusal> {
+        if self.origin == RetryOrigin::DecidedHere
+            && !is_idempotent_method(self.method)
+            && !self.route_allows_non_idempotent
+        {
+            Some(ReplayRefusal::NonIdempotentMethod)
+        } else if self.retry_buffer_truncated {
+            Some(ReplayRefusal::RetryBufferTruncated)
+        } else {
+            None
+        }
+    }
 }
 
 /// Whether an error is the upstream's own: its connection, a timeout, a read
@@ -6598,6 +6743,213 @@ mod target_outcome_tests {
         );
         assert_eq!(target_outcome(None, 403, true), TargetOutcome::NoResult);
         assert_eq!(target_outcome(None, 503, true), TargetOutcome::NoResult);
+    }
+}
+
+#[cfg(test)]
+mod replay_refusal_tests {
+    use super::{ReplayCheck, ReplayRefusal, RetryOrigin};
+    use pingora::prelude::{ErrorType, RetryType};
+
+    /// The check for a retry decided in `error_while_proxy`.
+    fn refusal(
+        method: &str,
+        route_allows_non_idempotent: bool,
+        retry_buffer_truncated: bool,
+    ) -> Option<ReplayRefusal> {
+        refusal_for(
+            RetryOrigin::DecidedHere,
+            method,
+            route_allows_non_idempotent,
+            retry_buffer_truncated,
+        )
+    }
+
+    /// The check for an error that arrived already marked retryable.
+    fn marked_refusal(
+        method: &str,
+        route_allows_non_idempotent: bool,
+        retry_buffer_truncated: bool,
+    ) -> Option<ReplayRefusal> {
+        refusal_for(
+            RetryOrigin::MarkedOnArrival,
+            method,
+            route_allows_non_idempotent,
+            retry_buffer_truncated,
+        )
+    }
+
+    fn refusal_for(
+        origin: RetryOrigin,
+        method: &str,
+        route_allows_non_idempotent: bool,
+        retry_buffer_truncated: bool,
+    ) -> Option<ReplayRefusal> {
+        ReplayCheck {
+            origin,
+            method,
+            route_allows_non_idempotent,
+            retry_buffer_truncated,
+        }
+        .refusal()
+    }
+
+    const IDEMPOTENT: [&str; 6] = ["GET", "HEAD", "OPTIONS", "TRACE", "PUT", "DELETE"];
+
+    #[test]
+    fn an_idempotent_request_may_be_sent_again() {
+        for method in IDEMPOTENT {
+            assert_eq!(refusal(method, false, false), None, "{method}");
+        }
+    }
+
+    #[test]
+    fn a_request_that_is_not_idempotent_is_not_sent_again() {
+        for method in ["POST", "PATCH", "CONNECT"] {
+            assert_eq!(
+                refusal(method, false, false),
+                Some(ReplayRefusal::NonIdempotentMethod),
+                "{method}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_extension_method_is_not_idempotent() {
+        assert_eq!(
+            refusal("PURGE", false, false),
+            Some(ReplayRefusal::NonIdempotentMethod)
+        );
+    }
+
+    /// QUERY is not in RFC 9110, although `http::Method::is_idempotent` says
+    /// it is.
+    #[test]
+    fn query_is_not_idempotent() {
+        let method = http::Method::from_bytes(b"QUERY").unwrap();
+        assert_eq!(
+            refusal(method.as_str(), false, false),
+            Some(ReplayRefusal::NonIdempotentMethod)
+        );
+    }
+
+    /// Method names are case-sensitive (RFC 9110 section 9.1).
+    #[test]
+    fn a_method_in_another_case_is_not_idempotent() {
+        for method in ["get", "Get", "put", "delete"] {
+            assert_eq!(
+                refusal(method, false, false),
+                Some(ReplayRefusal::NonIdempotentMethod),
+                "{method}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_route_may_allow_a_request_that_is_not_idempotent_to_be_sent_again() {
+        assert_eq!(refusal("POST", true, false), None);
+    }
+
+    #[test]
+    fn a_request_whose_body_was_truncated_is_not_sent_again_whatever_its_method() {
+        for method in IDEMPOTENT {
+            assert_eq!(
+                refusal(method, false, true),
+                Some(ReplayRefusal::RetryBufferTruncated),
+                "{method}"
+            );
+        }
+        assert_eq!(
+            refusal("POST", true, true),
+            Some(ReplayRefusal::RetryBufferTruncated)
+        );
+    }
+
+    /// An error Pingora's HTTP/2 client marked retryable (REFUSED_STREAM,
+    /// GOAWAY with NO_ERROR): the upstream did not process the request, so
+    /// the method does not matter.
+    #[test]
+    fn the_method_is_not_checked_for_an_error_marked_on_arrival() {
+        for method in ["POST", "PATCH", "QUERY", "PURGE", "get"]
+            .into_iter()
+            .chain(IDEMPOTENT)
+        {
+            assert_eq!(marked_refusal(method, false, false), None, "{method}");
+        }
+    }
+
+    /// Pingora's HTTP/2 client marks an `InvalidH2` error too, but it is the
+    /// GOAWAY(PROTOCOL_ERROR) the `h2` library sends itself, which reaches
+    /// every stream of the connection, the ones the upstream processed
+    /// included. It is checked like a retry decided here.
+    #[test]
+    fn an_invalid_h2_error_is_checked_for_its_method_although_it_arrives_marked() {
+        let origin = RetryOrigin::of(RetryType::Decided(true), &ErrorType::InvalidH2);
+        assert_eq!(origin, RetryOrigin::DecidedHere);
+        assert_eq!(
+            refusal_for(origin, "POST", false, false),
+            Some(ReplayRefusal::NonIdempotentMethod)
+        );
+        assert_eq!(refusal_for(origin, "POST", true, false), None);
+        assert_eq!(refusal_for(origin, "GET", false, false), None);
+        assert_eq!(
+            refusal_for(origin, "GET", false, true),
+            Some(ReplayRefusal::RetryBufferTruncated)
+        );
+    }
+
+    #[test]
+    fn the_origin_of_a_retry_follows_the_state_the_error_arrived_in() {
+        for error_type in [
+            ErrorType::H2Error,
+            ErrorType::H2Downgrade,
+            ErrorType::HTTPStatus(503),
+        ] {
+            assert_eq!(
+                RetryOrigin::of(RetryType::Decided(true), &error_type),
+                RetryOrigin::MarkedOnArrival,
+                "{error_type:?}"
+            );
+        }
+        assert_eq!(
+            RetryOrigin::of(RetryType::ReusedOnly, &ErrorType::ConnectionClosed),
+            RetryOrigin::DecidedHere
+        );
+    }
+
+    #[test]
+    fn a_truncated_body_is_not_sent_again_even_when_marked_on_arrival() {
+        for method in ["POST", "PATCH"].into_iter().chain(IDEMPOTENT) {
+            assert_eq!(
+                marked_refusal(method, false, true),
+                Some(ReplayRefusal::RetryBufferTruncated),
+                "{method}"
+            );
+        }
+        assert_eq!(
+            marked_refusal("POST", true, true),
+            Some(ReplayRefusal::RetryBufferTruncated)
+        );
+    }
+
+    #[test]
+    fn the_method_is_named_first_when_both_apply() {
+        assert_eq!(
+            refusal("POST", false, true),
+            Some(ReplayRefusal::NonIdempotentMethod)
+        );
+    }
+
+    #[test]
+    fn the_reasons_are_fixed_values() {
+        assert_eq!(
+            ReplayRefusal::NonIdempotentMethod.as_str(),
+            "non_idempotent_method"
+        );
+        assert_eq!(
+            ReplayRefusal::RetryBufferTruncated.as_str(),
+            "retry_buffer_truncated"
+        );
     }
 }
 

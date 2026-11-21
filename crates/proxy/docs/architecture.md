@@ -374,6 +374,70 @@ expected while the interval lasts.
                Send Request
 ```
 
+### Retrying After an Upstream Error
+
+An error after the connection to the upstream was established, a connection
+dropped before the response header for example, can be followed by another
+attempt at the same request. The proxy does not send the request again when
+the upstream may already have acted on it:
+
+| Request | Sent again after such an error |
+|---------|--------------------------------|
+| Method GET, HEAD, OPTIONS, TRACE, PUT or DELETE | Yes, as the error type allows |
+| Any other method, such as POST, PATCH or QUERY | No, unless the route's `retry-policy` sets `retry-non-idempotent #true` |
+| Body larger than the retry buffer | No, whatever the method: the body cannot be replayed |
+
+The methods in the first row are the idempotent methods of RFC 9110 section
+9.2.2. Method names are case-sensitive, so `get` is not one of them. The same
+rule decides whether a request is sent again on a status code listed in
+`retryable-status-codes`.
+
+When the proxy does not send the request again, the client gets the error, a
+502 for a dropped connection. The log says `Not retrying a request that may
+have been sent to the upstream`, with a `reason` of `non_idempotent_method` or
+`retry_buffer_truncated`, and
+`zentinel_upstream_retries_refused_total{reason}` counts it.
+
+The table does not cover a request that an HTTP/2 upstream says it did not
+process: it reset the stream with REFUSED_STREAM, or sent a GOAWAY whose last
+stream id is lower than the request's stream (RFC 9113 section 8.7). Pingora's
+HTTP/2 client marks both errors retryable; for a GOAWAY that is the error of a
+received GOAWAY with NO_ERROR, which the `h2` library gives only to the streams
+above the last stream id and to requests it has not sent yet. The proxy sends
+such a request again whatever its method, so a POST, a gRPC call included, is
+not answered with a 502 by a graceful shutdown of an HTTP/2 upstream. The
+method is not looked at, and neither is `retry-non-idempotent`, because the
+upstream has not acted on the request. The retry buffer still is, since the
+body must be sent again: a body larger than the buffer is not sent again, as in
+the table.
+
+Pingora marks HTTP_1_1_REQUIRED, with which the upstream asks for HTTP/1.1, in
+the same way, and the proxy treats it the same; section 8.7 does not cover it.
+An invalid HTTP/2 frame is different: the GOAWAY with PROTOCOL_ERROR that the
+`h2` library sends then reaches every stream of the connection, including
+ones the upstream may have processed. Pingora marks it retryable too, but the
+proxy checks the request like any other error after it may have been sent: its
+method, then the retry buffer.
+
+Pingora's default `error_while_proxy` (since Pingora 0.9) refuses a POST in
+every one of these cases; the proxy differs from it for REFUSED_STREAM, GOAWAY
+and HTTP_1_1_REQUIRED, on purpose.
+
+The case likely to come up first is a connection the proxy kept for reuse,
+which the upstream closed while it was idle. A POST sent on it, and a gRPC
+call is a POST, used to be sent again silently on a new connection. It now
+gets a 502, and the client decides whether to send it again. To restore the
+earlier behavior for a route, set `retry-non-idempotent #true` in its
+`retry-policy`.
+
+The retry buffer holds 64 KiB of the request body by default. On a route that
+reads the whole body (API schema validation, body inspection, the prompt
+check of an inference route, MCP) it is sized to that route's limit instead:
+the route's body size limit, never above the global one, or the MCP envelope
+limit.
+
+A failure to connect happens before the request is sent and is not affected.
+
 ## Rate Limiting Architecture
 
 ```
