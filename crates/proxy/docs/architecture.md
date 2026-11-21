@@ -605,7 +605,8 @@ as a new trial. No setting controls this; it reuses `timeout_secs`.
   Decompression Protection:
   ┌─────────────────────────────────────────────────────────────────┐
   │  max_ratio: 100x       │  Prevents zip bombs                    │
-  │  max_output: 10MB      │  Absolute size limit                   │
+  │  max_output: 10MB      │  Absolute size limit; for a            │
+  │                        │  request body: `max-inspection-bytes`  │
   │  incremental check     │  Stop early if ratio exceeded          │
   └─────────────────────────────────────────────────────────────────┘
 ```

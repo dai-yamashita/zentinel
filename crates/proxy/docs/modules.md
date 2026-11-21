@@ -627,9 +627,24 @@ filter "geo-block" {
 Safe decompression with zip bomb protection.
 
 **Supported Encodings:**
-- gzip
-- deflate
-- brotli
+- gzip (`gzip`, `x-gzip`)
+- deflate (the zlib format of RFC 9110, or a raw deflate stream)
+- brotli (`br`; `brotli` is accepted for it too)
+
+**Request `Content-Encoding`:** `content_codings` reads every
+`Content-Encoding` header of a request as a comma-separated list, without
+regard to case or to spaces around a name, leaving out `identity`, and
+`BodyCoding::classify` decides what is done with the body. One supported
+coding is decoded for the body agents (`body-inspection { decompress }`),
+within `max-decompression-ratio` and `max-inspection-bytes` of
+`waf { body-inspection }`. A body that decodes to more than
+`max-inspection-bytes` is handled as one longer than it as received (413
+for `closed`, the agent skipped for `open`); one that reaches
+`max-decompression-ratio` first fails to decode (400 for `closed`).
+Anything else, several codings included, is not decoded, and the agents'
+`failure-mode` decides (415 for `closed`). `is_supported_encoding` and
+`parse_content_encoding` are not used for this. See
+[Content-coded request bodies](../../config/docs/schema.md#content-coded-request-bodies).
 
 **Key Function:**
 
@@ -646,7 +661,8 @@ pub fn decompress_body(
 ```rust
 DecompressionConfig {
     max_ratio: 100.0,    // Max expansion ratio
-    max_output_bytes: 10 * 1024 * 1024,  // 10MB limit
+    max_output_bytes: 10 * 1024 * 1024,  // 10MB limit (a request body: the
+                                         // `waf` `max-inspection-bytes`)
 }
 ```
 
