@@ -231,6 +231,8 @@ Scope-aware circuit breakers for failure isolation.
 impl ScopedCircuitBreakerManager {
     pub fn set_scope_config(&self, scope: &Scope, config: &CircuitBreakerConfig);
     pub fn get_breaker(&self, scope: &Scope, upstream: &str) -> CircuitBreaker;
+    pub fn admit(&self, scope: &Scope, upstream: &str) -> Admission;
+    pub fn release_half_open_slot(&self, scope: &Scope, upstream: &str, slot: TrialSlot);
     pub fn record_success(&self, scope: &Scope, upstream: &str);
     pub fn record_failure(&self, scope: &Scope, upstream: &str);
 }
