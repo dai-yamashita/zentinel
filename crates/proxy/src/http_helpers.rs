@@ -81,6 +81,22 @@ pub(crate) fn header_value_to_string(value: &HeaderValue) -> Cow<'_, str> {
     }
 }
 
+/// The protocol label an access log entry carries for a request's HTTP version.
+///
+/// Matches the form `http::Version` prints (`HTTP/1.1`, `HTTP/2.0`), which is
+/// also what the Combined Log Format's request line uses. A version this crate
+/// does not know is labelled `HTTP/unknown` rather than guessed.
+pub(crate) fn protocol_label(version: http::Version) -> &'static str {
+    match version {
+        http::Version::HTTP_09 => "HTTP/0.9",
+        http::Version::HTTP_10 => "HTTP/1.0",
+        http::Version::HTTP_11 => "HTTP/1.1",
+        http::Version::HTTP_2 => "HTTP/2.0",
+        http::Version::HTTP_3 => "HTTP/3.0",
+        _ => "HTTP/unknown",
+    }
+}
+
 /// Extract request info from a Pingora session
 ///
 /// Builds an `OwnedRequestInfo` struct from the session's request headers.
@@ -441,6 +457,28 @@ mod tests {
             header_value_to_string(&value(b"caf\xc3\xa9\xff")),
             "caf\u{c3}\u{a9}\u{ff}"
         );
+    }
+
+    #[test]
+    fn protocol_label_names_each_http_version() {
+        assert_eq!(protocol_label(http::Version::HTTP_09), "HTTP/0.9");
+        assert_eq!(protocol_label(http::Version::HTTP_10), "HTTP/1.0");
+        assert_eq!(protocol_label(http::Version::HTTP_11), "HTTP/1.1");
+        assert_eq!(protocol_label(http::Version::HTTP_2), "HTTP/2.0");
+        assert_eq!(protocol_label(http::Version::HTTP_3), "HTTP/3.0");
+    }
+
+    #[test]
+    fn protocol_label_matches_the_debug_form_of_the_version() {
+        for version in [
+            http::Version::HTTP_09,
+            http::Version::HTTP_10,
+            http::Version::HTTP_11,
+            http::Version::HTTP_2,
+            http::Version::HTTP_3,
+        ] {
+            assert_eq!(protocol_label(version), format!("{version:?}"));
+        }
     }
 
     // Trace ID generation tests are in crate::trace_id module.

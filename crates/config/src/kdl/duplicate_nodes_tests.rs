@@ -957,6 +957,36 @@ fn a_logging_block_with_two_access_logs_is_an_error() {
 }
 
 #[test]
+fn an_access_log_with_two_fields_blocks_is_an_error() {
+    assert_duplicate_within(
+        Ctx::Observability,
+        "logging {\naccess-log {\nfields {\nquery #false\n}\nfields {\nlatency-ms #false\n}\n}\n}",
+        "logging {\naccess-log {\nfields {\nquery #false\n}\n}\n}",
+        "fields",
+    );
+}
+
+#[test]
+fn an_access_log_field_written_twice_is_an_error() {
+    assert_duplicate_within(
+        Ctx::Observability,
+        "logging {\naccess-log {\nfields {\nquery #true\nquery #false\n}\n}\n}",
+        "logging {\naccess-log {\nfields {\nquery #false\n}\n}\n}",
+        "query",
+    );
+}
+
+#[test]
+fn an_access_log_with_include_trace_id_written_twice_is_an_error() {
+    assert_duplicate_within(
+        Ctx::Observability,
+        "logging {\naccess-log {\ninclude-trace-id #true\ninclude-trace-id #false\n}\n}",
+        "logging {\naccess-log {\ninclude-trace-id #true\n}\n}",
+        "include-trace-id",
+    );
+}
+
+#[test]
 fn a_service_with_two_listeners_is_an_error() {
     assert_duplicate_within(
         Ctx::Namespace,
