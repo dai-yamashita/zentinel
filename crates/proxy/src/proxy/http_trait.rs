@@ -1917,6 +1917,9 @@ impl ProxyHttp for ZentinelProxy {
                 // are sent: the route serves GET and HEAD, and its body is
                 // never read. A route without filters pays nothing.
                 if !route_config.filters.is_empty() {
+                    // Agents see the trace ID in `X-Correlation-Id`, as on a
+                    // proxied route.
+                    set_correlation_header(session.req_header_mut(), &ctx.trace_id);
                     let (client_addr, client_port) = Self::agent_client(session, ctx);
                     if let Err(e) = self
                         .process_agents(session, ctx, &client_addr, client_port)
@@ -1982,9 +1985,7 @@ impl ProxyHttp for ZentinelProxy {
         let req_header = session.req_header_mut();
 
         // Add correlation ID header
-        req_header
-            .insert_header("X-Correlation-Id", &ctx.trace_id)
-            .ok();
+        set_correlation_header(req_header, &ctx.trace_id);
         req_header.insert_header("X-Forwarded-By", "Zentinel").ok();
 
         // Use cached config (set in upstream_peer, or fetch now if needed)
@@ -6287,9 +6288,10 @@ impl ZentinelProxy {
         ctx: &mut RequestContext,
         max_inspection_bytes: u64,
     ) -> Result<(), Box<Error>> {
-        // No agent is called, so the request's id, for the logs, is all that
-        // is needed.
-        let correlation_id = zentinel_common::CorrelationId::from_string(&ctx.trace_id);
+        // No agent is called; the id is for the logs, and is the one the
+        // agent calls and refusals of this request are logged with.
+        let correlation_id =
+            zentinel_common::CorrelationId::from_string(ctx.agent_correlation_id());
         let decision = self
             .agent_manager
             .process_request_body_over_inspection_limit(
@@ -6491,6 +6493,41 @@ impl ZentinelProxy {
         }
 
         Ok(())
+    }
+}
+
+/// Put the request's trace ID in its `X-Correlation-Id` header, replacing
+/// every value the client sent, so agents (and the upstream) see the ID the
+/// proxy logs the request with.
+fn set_correlation_header(req_header: &mut pingora::http::RequestHeader, trace_id: &str) {
+    req_header.insert_header("X-Correlation-Id", trace_id).ok();
+}
+
+#[cfg(test)]
+mod correlation_header_tests {
+    use super::set_correlation_header;
+    use pingora::http::RequestHeader;
+
+    fn values(req: &RequestHeader) -> Vec<&str> {
+        req.headers
+            .get_all("x-correlation-id")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn the_trace_id_is_the_only_correlation_header() {
+        let mut req = RequestHeader::build("GET", b"/index.html", None).unwrap();
+        set_correlation_header(&mut req, "trace-1");
+        assert_eq!(values(&req), ["trace-1"]);
+
+        // Lines the client sent are replaced, not added to.
+        let mut req = RequestHeader::build("GET", b"/index.html", None).unwrap();
+        req.append_header("X-Correlation-Id", "client-a").unwrap();
+        req.append_header("x-correlation-id", "client-b").unwrap();
+        set_correlation_header(&mut req, "trace-2");
+        assert_eq!(values(&req), ["trace-2"]);
     }
 }
 
