@@ -223,15 +223,36 @@ one:
 | `waf`, `limits` | Reconciled: read from the current configuration per request / connection |
 | `listeners`, `system`, `observability`, `cache` | **Restart required.** A reload that changes one logs a warning naming the block |
 
+The reload handler applies a new configuration in three steps around the swap
+of the route matchers:
+
+1. What the new routes refer to goes in first: agents are loaded and replaced,
+   route components are rebuilt, and rate limiters, active health checks and
+   upstream pools are added or replaced. Limiters and health checks whose
+   configuration did not change keep their state.
+2. The route matchers are swapped.
+3. What the new configuration no longer lists comes out last: agents, rate
+   limiters, health checks and upstream pools.
+
+A route added by a reload, or whose rate limit or upstream it changed, is
+therefore never served without its new limiter or pool, and the routes of the
+previous configuration keep theirs until the swap. The upstream pools are built
+before the swap, bounded by 10 seconds (the time service discovery lookups may
+take). If that runs out, no new pool is installed: the new routes still go
+live, the previous pools stay, and a route that names a new upstream fails with
+"Upstream pool not found" until the next reload.
+
 #### Requests that arrive during a reload
 
 A reload (or a rollback) stores the configuration first and swaps in the route
-matcher afterwards, once the routes' agents and components are ready. A request
-that arrives in between is matched by the previous matcher, so its route may
-list a filter id that the stored configuration no longer defines (a filter that
-was renamed or removed). Each configuration is valid on its own (validation
-rejects a route that lists an undefined filter), so the mismatch exists only in
-that interval.
+matcher afterwards, once what the routes refer to is ready: their agents and
+components, rate limiters, health checks and upstream pools. The upstream pools
+are built first, and an upstream that uses service discovery can make that wait
+up to 10 seconds, which the interval then includes. A request that arrives in
+between is matched by the previous matcher, so its route may list a filter id
+that the stored configuration no longer defines (a filter that was renamed or
+removed). Each configuration is valid on its own (validation rejects a route
+that lists an undefined filter), so the mismatch exists only in that interval.
 
 Where a request's route is decided, the proxy takes the configuration
 snapshot the request is served under, and checks that every filter id the
