@@ -242,16 +242,17 @@ impl CertificateStorage {
         let key_path = domain_path.join("key.pem");
         let meta_path = domain_path.join("meta.json");
 
-        // Write certificate
-        fs::write(&cert_path, cert_pem)?;
-
-        // Write private key with restrictive permissions
-        fs::write(&key_path, key_pem)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))?;
-        }
+        // Each file is replaced whole (written next to it, then renamed over
+        // it), so a reader sees the old file or the new one, never a partly
+        // written one. The two files cannot change together: a reload that
+        // reads them between the two renames finds a key that does not match
+        // the certificate, and the TLS loader refuses that pair and keeps the
+        // one it serves. The key goes first, created with mode 0600, so it is
+        // never readable by others even for a moment. The metadata goes last:
+        // if the process stops in between, it still carries the old expiry,
+        // and the next check renews again.
+        write_atomically(&key_path, key_pem.as_bytes(), Some(0o600))?;
+        write_atomically(&cert_path, cert_pem.as_bytes(), None)?;
 
         // Write metadata
         let meta = CertificateMeta {
@@ -261,7 +262,7 @@ impl CertificateStorage {
             issuer: Some("Let's Encrypt".to_string()),
         };
         let meta_content = serde_json::to_string_pretty(&meta)?;
-        fs::write(&meta_path, meta_content)?;
+        write_atomically(&meta_path, meta_content.as_bytes(), None)?;
 
         info!(
             domain = %domain,
@@ -359,6 +360,58 @@ impl CertificateStorage {
     }
 }
 
+/// Replace the file at `path` with `contents` in one step.
+///
+/// The contents are written to a temporary file in the same directory,
+/// flushed to disk, and renamed over `path`, so a reader opens either the old
+/// file or the complete new one. With `mode` (Unix), the temporary file is
+/// created with those permissions, so the new file is never readable more
+/// widely, even before the rename.
+fn write_atomically(path: &Path, contents: &[u8], mode: Option<u32>) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp_path = dir.join(format!(".{file_name}.tmp"));
+    // A temporary file left by an interrupted write is replaced, not reused:
+    // it may have other permissions.
+    match fs::remove_file(&tmp_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+
+    let written = (|| {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        if let Some(mode) = mode {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(mode);
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        let mut file = options.open(&tmp_path)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        fs::rename(&tmp_path, path)
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    written?;
+
+    // Make the rename itself durable. Best effort: not every platform lets a
+    // directory be opened and synced.
+    if let Ok(dir) = fs::File::open(dir) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,6 +428,64 @@ mod tests {
         let (_temp_dir, storage) = setup_storage();
         assert!(storage.base_path().exists());
         assert!(storage.base_path().join("domains").exists());
+    }
+
+    /// A save replaces each file whole and leaves no temporary file behind;
+    /// the key is readable by its owner only.
+    #[test]
+    fn saving_a_certificate_replaces_the_files_and_leaves_no_temporary_files() {
+        let (_temp_dir, storage) = setup_storage();
+        let expires = Utc::now() + chrono::Duration::days(90);
+        let domains = vec!["example.com".to_string()];
+        storage
+            .save_certificate("example.com", "cert-1", "key-1", expires, &domains)
+            .unwrap();
+        storage
+            .save_certificate("example.com", "cert-2", "key-2", expires, &domains)
+            .unwrap();
+
+        let loaded = storage.load_certificate("example.com").unwrap().unwrap();
+        assert_eq!(loaded.cert_pem, "cert-2");
+        assert_eq!(loaded.key_pem, "key-2");
+
+        let dir = storage.base_path().join("domains").join("example.com");
+        let mut names: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["cert.pem", "key.pem", "meta.json"]);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(dir.join("key.pem"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    /// A temporary file left by an interrupted write, with wider permissions,
+    /// is not reused for the key.
+    #[cfg(unix)]
+    #[test]
+    fn a_leftover_temporary_file_is_replaced() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let key_path = dir.path().join("key.pem");
+        let leftover = dir.path().join(".key.pem.tmp");
+        fs::write(&leftover, "stale").unwrap();
+        fs::set_permissions(&leftover, fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_atomically(&key_path, b"secret", Some(0o600)).unwrap();
+
+        assert_eq!(fs::read_to_string(&key_path).unwrap(), "secret");
+        let mode = fs::metadata(&key_path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert!(!leftover.exists());
     }
 
     #[test]

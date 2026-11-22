@@ -215,6 +215,15 @@ storage/
         └── meta.json    # Expiry, issued date, domains
 ```
 
+`save_certificate()` replaces each file whole: it writes a temporary file in
+the same directory, flushes it and renames it over the old one, so a reader
+never sees a partly written file. The key is written first (created with mode
+0600), then the certificate, then `meta.json`. The key and the certificate
+cannot change in one step; a reload that reads them between the two renames
+finds a key that does not match the certificate and keeps the pair it serves
+(see below). If the process stops before `meta.json` is written, the metadata
+still carries the old expiry, so the next check renews again.
+
 Key methods:
 - `load_certificate()` / `save_certificate()` - Certificate persistence
 - `load_credentials_json()` / `save_credentials_json()` - Account credentials
@@ -316,7 +325,13 @@ ACME `sni` certificate that the listener was serving cannot be loaded. An ACME
 the listener starts and when it reloads. This also applies to a `SIGHUP`
 reload.
 
-If a listener cannot load the renewed files, it keeps serving the certificates it
+Every certificate load checks that the private key belongs to the
+certificate, and a reload refuses an ACME certificate that has expired. (At
+startup an expired ACME certificate is still loaded, so the listener starts
+and the renewal replaces it.)
+
+If a listener cannot load the renewed files (unreadable, a key that does not
+match, expired), it keeps serving the certificates it
 had. The scheduler logs an error naming the listener and the domain, and
 `zentinel_tls_reload_total{listener,result="failure"}` is incremented. The reload
 is not retried: the next check finds a valid certificate and does not renew
