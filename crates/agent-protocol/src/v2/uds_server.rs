@@ -70,6 +70,35 @@ use crate::{
 /// - Permission issues creating/accessing the socket file
 /// - Invalid socket paths or filesystem issues
 /// - Handler implementation errors
+///
+/// # Events the server cannot decode
+///
+/// For most events the proxy acts on the decision in the reply, whichever one
+/// it is given, so an event that cannot be decoded is not answered with a
+/// decision: it would be taken for the agent's own, and the agent's
+/// `failure-mode` could not apply. The failure is logged at `error` with the
+/// agent id, the event, the event's correlation id and the size of its payload,
+/// and the connection is closed, so that the proxy sees a failed call. The
+/// calls of other requests waiting on that connection fail with it. What the
+/// proxy does with the failure depends on the event:
+///
+/// - Request headers, request body chunk, response headers, response body
+///   chunk: with `failure-mode "closed"` the proxy blocks (503, or 504 for a
+///   timeout); with `"open"` it carries on without that agent's decision.
+/// - WebSocket frame: with `"closed"` the proxy closes the WebSocket with
+///   code 1011 ("Agent error"); with `"open"` the frame is passed on.
+/// - Configure: the connection is not used, as for a configuration the agent
+///   rejects.
+///
+/// Request complete is the exception. The proxy does not use the reply, so the
+/// failure is logged at `error` in the same form and the connection is kept
+/// open. When the payload holds a correlation id the proxy's call is answered
+/// with an `Allow` at once. That `Allow` is not a decision: it only ends the
+/// call, and the proxy discards it. Otherwise there is nothing to address a
+/// reply to, and the call ends at the proxy's own time limit.
+///
+/// Calls to a closed connection keep failing until the pool marks it
+/// unhealthy. A handler that panics ends its connection the same way.
 pub struct UdsAgentServerV2 {
     id: String,
     socket_path: PathBuf,
@@ -235,36 +264,47 @@ async fn handle_connection(
             }
             MessageType::RequestHeaders => {
                 let response =
-                    handle_request_headers(&handler, &negotiated_encoding, &payload).await;
+                    handle_request_headers(&handler, &agent_id, &negotiated_encoding, &payload)
+                        .await?;
                 write_response(&mut writer, &negotiated_encoding, response).await?;
             }
             MessageType::RequestBodyChunk => {
                 let response =
-                    handle_request_body_chunk(&handler, &negotiated_encoding, &payload).await;
+                    handle_request_body_chunk(&handler, &agent_id, &negotiated_encoding, &payload)
+                        .await?;
                 write_response(&mut writer, &negotiated_encoding, response).await?;
             }
             MessageType::ResponseHeaders => {
                 let response =
-                    handle_response_headers(&handler, &negotiated_encoding, &payload).await;
+                    handle_response_headers(&handler, &agent_id, &negotiated_encoding, &payload)
+                        .await?;
                 write_response(&mut writer, &negotiated_encoding, response).await?;
             }
             MessageType::ResponseBodyChunk => {
                 let response =
-                    handle_response_body_chunk(&handler, &negotiated_encoding, &payload).await;
+                    handle_response_body_chunk(&handler, &agent_id, &negotiated_encoding, &payload)
+                        .await?;
                 write_response(&mut writer, &negotiated_encoding, response).await?;
             }
             MessageType::RequestComplete => {
-                let response =
-                    handle_request_complete(&handler, &negotiated_encoding, &payload).await;
-                write_response(&mut writer, &negotiated_encoding, response).await?;
+                // `None`: it could not be decoded, and there is no id to
+                // address a reply to. The connection stays open.
+                if let Some(response) =
+                    handle_request_complete(&handler, &agent_id, &negotiated_encoding, &payload)
+                        .await
+                {
+                    write_response(&mut writer, &negotiated_encoding, response).await?;
+                }
             }
             MessageType::WebSocketFrame => {
                 let response =
-                    handle_websocket_frame(&handler, &negotiated_encoding, &payload).await;
+                    handle_websocket_frame(&handler, &agent_id, &negotiated_encoding, &payload)
+                        .await?;
                 write_response(&mut writer, &negotiated_encoding, response).await?;
             }
             MessageType::Configure => {
-                let response = handle_configure(&handler, &negotiated_encoding, &payload).await;
+                let response =
+                    handle_configure(&handler, &agent_id, &negotiated_encoding, &payload).await?;
                 write_response(&mut writer, &negotiated_encoding, response).await?;
             }
             _ => {
@@ -296,125 +336,201 @@ fn negotiate_encoding(proxy_encodings: &[UdsEncoding]) -> UdsEncoding {
 
 // ─── Event handlers ──────────────────────────────────────────────────────────
 
-async fn handle_request_headers(
-    handler: &Arc<dyn AgentHandlerV2>,
+/// What a handled event yields: the correlation id the reply is addressed to,
+/// the agent's response, and how long the handler took in milliseconds.
+type Reply = (String, AgentResponse, u64);
+
+/// What the server does with the connection after an event it cannot decode.
+#[derive(Clone, Copy)]
+enum AfterDecodeFailure {
+    CloseConnection,
+    KeepConnection,
+}
+
+/// Log that `payload` could not be decoded as `event`, and return the
+/// correlation id found in it (empty when there is none).
+///
+/// The decoder's message can quote a value from the payload, a header's say,
+/// so it is logged at `debug` only. The error line has the same fields for
+/// every event: the agent id, the event, the correlation id and the size of the
+/// payload.
+fn log_decode_failure(
+    agent_id: &str,
+    event: &'static str,
     encoding: &UdsEncoding,
     payload: &[u8],
-) -> (String, AgentResponse, u64) {
-    let event: RequestHeadersEvent = match encoding.deserialize(payload) {
-        Ok(e) => e,
-        Err(e) => {
-            warn!(error = %e, "Failed to deserialize RequestHeaders");
-            let cid = extract_correlation_id(encoding, payload);
-            return (cid, AgentResponse::default_allow(), 0);
-        }
-    };
+    decode_error: &AgentProtocolError,
+    after: AfterDecodeFailure,
+) -> String {
+    let correlation_id = extract_correlation_id(encoding, payload);
+    match after {
+        AfterDecodeFailure::CloseConnection => error!(
+            agent_id = %agent_id,
+            correlation_id = %correlation_id,
+            event = event,
+            payload_bytes = payload.len(),
+            "Could not decode an event from the proxy; closing the connection"
+        ),
+        AfterDecodeFailure::KeepConnection => error!(
+            agent_id = %agent_id,
+            correlation_id = %correlation_id,
+            event = event,
+            payload_bytes = payload.len(),
+            "Could not decode an event from the proxy; keeping the connection"
+        ),
+    }
+    debug!(
+        agent_id = %agent_id,
+        correlation_id = %correlation_id,
+        event = event,
+        error = %decode_error,
+        "Why the event could not be decoded"
+    );
+    correlation_id
+}
+
+/// Decode an event whose reply the proxy acts on.
+///
+/// An `AgentResponse` is a decision, and the proxy acts on whichever one it is
+/// given, so there is no response that means "this event could not be read".
+/// Answering with `Allow` made an event the agent never saw look like one it
+/// had inspected and cleared, and the agent's `failure-mode` could not apply to
+/// it. An error is returned instead and ends the connection, as
+/// [`GrpcAgentServerV2`](super::server::GrpcAgentServerV2) ends its stream for
+/// a configuration it cannot accept. The proxy then fails the calls waiting on
+/// the connection and applies the filter's `failure-mode`.
+///
+/// `RequestComplete` is the exception, because the proxy does not use its
+/// reply: see [`handle_request_complete`].
+fn decode_event<T: serde::de::DeserializeOwned>(
+    agent_id: &str,
+    event: &'static str,
+    encoding: &UdsEncoding,
+    payload: &[u8],
+) -> Result<T, AgentProtocolError> {
+    encoding.deserialize(payload).map_err(|decode_error| {
+        log_decode_failure(
+            agent_id,
+            event,
+            encoding,
+            payload,
+            &decode_error,
+            AfterDecodeFailure::CloseConnection,
+        );
+        AgentProtocolError::InvalidMessage(format!("could not decode a {event} event"))
+    })
+}
+
+async fn handle_request_headers(
+    handler: &Arc<dyn AgentHandlerV2>,
+    agent_id: &str,
+    encoding: &UdsEncoding,
+    payload: &[u8],
+) -> Result<Reply, AgentProtocolError> {
+    let event: RequestHeadersEvent = decode_event(agent_id, "RequestHeaders", encoding, payload)?;
     let cid = event.metadata.correlation_id.clone();
     let start = Instant::now();
     let resp = handler.on_request_headers(event).await;
-    (cid, resp, start.elapsed().as_millis() as u64)
+    Ok((cid, resp, start.elapsed().as_millis() as u64))
 }
 
 async fn handle_request_body_chunk(
     handler: &Arc<dyn AgentHandlerV2>,
+    agent_id: &str,
     encoding: &UdsEncoding,
     payload: &[u8],
-) -> (String, AgentResponse, u64) {
-    let event: RequestBodyChunkEvent = match encoding.deserialize(payload) {
-        Ok(e) => e,
-        Err(e) => {
-            warn!(error = %e, "Failed to deserialize RequestBodyChunk");
-            let cid = extract_correlation_id(encoding, payload);
-            return (cid, AgentResponse::default_allow(), 0);
-        }
-    };
+) -> Result<Reply, AgentProtocolError> {
+    let event: RequestBodyChunkEvent =
+        decode_event(agent_id, "RequestBodyChunk", encoding, payload)?;
     let cid = event.correlation_id.clone();
     let start = Instant::now();
     let resp = handler.on_request_body_chunk(event).await;
-    (cid, resp, start.elapsed().as_millis() as u64)
+    Ok((cid, resp, start.elapsed().as_millis() as u64))
 }
 
 async fn handle_response_headers(
     handler: &Arc<dyn AgentHandlerV2>,
+    agent_id: &str,
     encoding: &UdsEncoding,
     payload: &[u8],
-) -> (String, AgentResponse, u64) {
-    let event: ResponseHeadersEvent = match encoding.deserialize(payload) {
-        Ok(e) => e,
-        Err(e) => {
-            warn!(error = %e, "Failed to deserialize ResponseHeaders");
-            let cid = extract_correlation_id(encoding, payload);
-            return (cid, AgentResponse::default_allow(), 0);
-        }
-    };
+) -> Result<Reply, AgentProtocolError> {
+    let event: ResponseHeadersEvent = decode_event(agent_id, "ResponseHeaders", encoding, payload)?;
     let cid = event.correlation_id.clone();
     let start = Instant::now();
     let resp = handler.on_response_headers(event).await;
-    (cid, resp, start.elapsed().as_millis() as u64)
+    Ok((cid, resp, start.elapsed().as_millis() as u64))
 }
 
 async fn handle_response_body_chunk(
     handler: &Arc<dyn AgentHandlerV2>,
+    agent_id: &str,
     encoding: &UdsEncoding,
     payload: &[u8],
-) -> (String, AgentResponse, u64) {
-    let event: ResponseBodyChunkEvent = match encoding.deserialize(payload) {
-        Ok(e) => e,
-        Err(e) => {
-            warn!(error = %e, "Failed to deserialize ResponseBodyChunk");
-            let cid = extract_correlation_id(encoding, payload);
-            return (cid, AgentResponse::default_allow(), 0);
-        }
-    };
+) -> Result<Reply, AgentProtocolError> {
+    let event: ResponseBodyChunkEvent =
+        decode_event(agent_id, "ResponseBodyChunk", encoding, payload)?;
     let cid = event.correlation_id.clone();
     let start = Instant::now();
     let resp = handler.on_response_body_chunk(event).await;
-    (cid, resp, start.elapsed().as_millis() as u64)
+    Ok((cid, resp, start.elapsed().as_millis() as u64))
 }
 
+/// Handle a `RequestComplete`.
+///
+/// The proxy waits for the reply to this event, up to a limit of its own, but
+/// does not read it. The connection also carries the calls of other requests,
+/// and closing it fails all of them, so an event that cannot be decoded is
+/// logged at `error` and the connection is kept. When the payload holds a
+/// correlation id, the call is still answered, with an `Allow` the proxy does
+/// not read, so that it ends at once and not at its own time limit. Without an
+/// id no reply could be matched to the call, so there is none, and the call
+/// ends at that limit.
 async fn handle_request_complete(
     handler: &Arc<dyn AgentHandlerV2>,
+    agent_id: &str,
     encoding: &UdsEncoding,
     payload: &[u8],
-) -> (String, AgentResponse, u64) {
+) -> Option<Reply> {
     let event: RequestCompleteEvent = match encoding.deserialize(payload) {
-        Ok(e) => e,
-        Err(e) => {
-            warn!(error = %e, "Failed to deserialize RequestComplete");
-            let cid = extract_correlation_id(encoding, payload);
-            return (cid, AgentResponse::default_allow(), 0);
+        Ok(event) => event,
+        Err(decode_error) => {
+            let correlation_id = log_decode_failure(
+                agent_id,
+                "RequestComplete",
+                encoding,
+                payload,
+                &decode_error,
+                AfterDecodeFailure::KeepConnection,
+            );
+            return (!correlation_id.is_empty())
+                .then(|| (correlation_id, AgentResponse::default_allow(), 0));
         }
     };
     let cid = event.correlation_id.clone();
     let start = Instant::now();
     let resp = handler.on_request_complete(event).await;
-    (cid, resp, start.elapsed().as_millis() as u64)
+    Some((cid, resp, start.elapsed().as_millis() as u64))
 }
 
 async fn handle_websocket_frame(
     handler: &Arc<dyn AgentHandlerV2>,
+    agent_id: &str,
     encoding: &UdsEncoding,
     payload: &[u8],
-) -> (String, AgentResponse, u64) {
-    let event: WebSocketFrameEvent = match encoding.deserialize(payload) {
-        Ok(e) => e,
-        Err(e) => {
-            warn!(error = %e, "Failed to deserialize WebSocketFrame");
-            let cid = extract_correlation_id(encoding, payload);
-            return (cid, AgentResponse::websocket_allow(), 0);
-        }
-    };
+) -> Result<Reply, AgentProtocolError> {
+    let event: WebSocketFrameEvent = decode_event(agent_id, "WebSocketFrame", encoding, payload)?;
     let cid = event.correlation_id.clone();
     let start = Instant::now();
     let resp = handler.on_websocket_frame(event).await;
-    (cid, resp, start.elapsed().as_millis() as u64)
+    Ok((cid, resp, start.elapsed().as_millis() as u64))
 }
 
 async fn handle_configure(
     handler: &Arc<dyn AgentHandlerV2>,
+    agent_id: &str,
     encoding: &UdsEncoding,
     payload: &[u8],
-) -> (String, AgentResponse, u64) {
+) -> Result<Reply, AgentProtocolError> {
     // Configure payloads carry config + optional version
     #[derive(serde::Deserialize)]
     struct ConfigurePayload {
@@ -426,14 +542,9 @@ async fn handle_configure(
         config_version: Option<String>,
     }
 
-    let parsed: ConfigurePayload = match encoding.deserialize(payload) {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(error = %e, "Failed to deserialize Configure");
-            let cid = extract_correlation_id(encoding, payload);
-            return (cid, AgentResponse::default_allow(), 0);
-        }
-    };
+    // The proxy takes `Allow` here to mean the configuration was accepted, so a
+    // payload that could not be read must not be answered at all.
+    let parsed: ConfigurePayload = decode_event(agent_id, "Configure", encoding, payload)?;
 
     let cid = parsed.correlation_id;
     let start = Instant::now();
@@ -445,7 +556,7 @@ async fn handle_configure(
     } else {
         AgentResponse::block(500, Some("Configuration rejected".to_string()))
     };
-    (cid, resp, start.elapsed().as_millis() as u64)
+    Ok((cid, resp, start.elapsed().as_millis() as u64))
 }
 
 // ─── Response serialization ──────────────────────────────────────────────────
@@ -471,10 +582,10 @@ async fn write_response<W: tokio::io::AsyncWriteExt + Unpin>(
 
 /// Best-effort extraction of `correlation_id` from a payload (for error paths).
 ///
-/// Returns an empty string only when the payload holds no usable id at all.
-/// That outcome is expensive: a response carrying an empty correlation id can
-/// never be matched to the request waiting for it, so the client blocks until
-/// its timeout expires. Every reasonable effort to find an id is worth making.
+/// Used to tie a log line to the request it concerns when the payload could
+/// not be decoded. Returns an empty string only when the payload holds no
+/// usable id at all, so every reasonable effort to find one is worth making:
+/// without it the failure cannot be traced to a request.
 fn extract_correlation_id(encoding: &UdsEncoding, payload: &[u8]) -> String {
     if let Ok(parsed) = encoding.deserialize::<CidOnly>(payload) {
         return parsed.0;
@@ -595,10 +706,10 @@ mod tests {
     /// MessagePack, and were rejected by the server as a duplicate field —
     /// every call hanging until it timed out.
     ///
-    /// Asserting `Ok` is not enough on its own: the server answers malformed
-    /// payloads too, and a good enough correlation-id fallback would make a
-    /// broken client look healthy. So the handler records what it was actually
-    /// handed, and the test checks that every event arrived decoded.
+    /// Asserting `Ok` is not enough on its own: a server that could not decode
+    /// an event used to answer it with `Allow`, which looks healthy. So the
+    /// handler records what it was actually handed, and the test checks that
+    /// every event arrived decoded.
     mod every_event_type {
         use super::*;
         use crate::v2::uds::AgentClientV2Uds;
@@ -1108,5 +1219,316 @@ mod tests {
         stop.send(()).unwrap();
         agent.join().unwrap();
         let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// What an agent server does with an event it cannot use.
+    ///
+    /// The protocol has no frame for "the agent could not read this": an
+    /// `AgentResponse` is a decision, and the proxy acts on whichever one it
+    /// is given. A server that answered an undecodable event with `Allow` was
+    /// therefore indistinguishable from an agent that had inspected the
+    /// request and cleared it, and the agent's `failure-mode` never applied.
+    /// The server now closes the connection instead, which the proxy sees as
+    /// a failed call. The exception is `RequestComplete`, whose reply the
+    /// proxy does not read: the connection stays open.
+    mod events_the_server_cannot_use {
+        use super::*;
+        use crate::v2::uds::AgentClientV2Uds;
+        use std::time::Duration;
+        use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+
+        /// A payload that parses as JSON and carries a correlation id, but is
+        /// not any of the typed events.
+        const NOT_AN_EVENT: &[u8] = br#"{"correlation_id":"cid-undecodable"}"#;
+
+        /// A `Configure` payload whose fields are all optional, so it needs a
+        /// field of the wrong type to be undecodable.
+        const NOT_A_CONFIGURE: &[u8] =
+            br#"{"correlation_id":"cid-undecodable","config_version":5}"#;
+
+        struct PanickingHandler;
+
+        #[async_trait]
+        impl AgentHandlerV2 for PanickingHandler {
+            fn capabilities(&self) -> AgentCapabilities {
+                AgentCapabilities::new("panicking", "Panicking Agent", "1.0.0")
+                    .with_event(crate::EventType::RequestHeaders)
+            }
+
+            async fn on_request_headers(&self, _event: RequestHeadersEvent) -> AgentResponse {
+                panic!("the handler failed");
+            }
+        }
+
+        /// Run `handler` on a server in a fresh directory.
+        async fn start_server(
+            handler: Box<dyn AgentHandlerV2>,
+        ) -> (tempfile::TempDir, String, tokio::task::JoinHandle<()>) {
+            let dir = tempfile::tempdir().expect("temporary directory");
+            let socket_path = dir
+                .path()
+                .join("agent.sock")
+                .to_str()
+                .expect("socket path is UTF-8")
+                .to_string();
+            let server = UdsAgentServerV2::new("cannot-use", &socket_path, handler);
+            let handle = tokio::spawn(async move {
+                let _ = server.run().await;
+            });
+            wait_for_socket(&socket_path).await;
+            (dir, socket_path, handle)
+        }
+
+        /// Connect the way the proxy does and complete the handshake, leaving
+        /// the caller to write events by hand.
+        async fn connect_by_hand(
+            socket_path: &str,
+        ) -> (BufReader<OwnedReadHalf>, BufWriter<OwnedWriteHalf>) {
+            let stream = UnixStream::connect(socket_path)
+                .await
+                .expect("connect to the agent");
+            let (read_half, write_half) = stream.into_split();
+            let mut reader = BufReader::new(read_half);
+            let mut writer = BufWriter::new(write_half);
+
+            let handshake = UdsHandshakeRequest {
+                supported_versions: vec![2],
+                proxy_id: "test-proxy".to_string(),
+                proxy_version: "0.0.0".to_string(),
+                config: None,
+                supported_encodings: vec![],
+            };
+            write_message(
+                &mut writer,
+                MessageType::HandshakeRequest,
+                &serde_json::to_vec(&handshake).expect("handshake serializes"),
+            )
+            .await
+            .expect("send the handshake");
+            let (msg_type, _) = read_message(&mut reader).await.expect("handshake reply");
+            assert_eq!(msg_type, MessageType::HandshakeResponse);
+            (reader, writer)
+        }
+
+        /// What came back for one event: the decision of the response, or
+        /// `None` when the server closed the connection without answering.
+        async fn decision_for(
+            socket_path: &str,
+            msg_type: MessageType,
+            payload: &[u8],
+        ) -> Option<crate::Decision> {
+            let (mut reader, mut writer) = connect_by_hand(socket_path).await;
+            write_message(&mut writer, msg_type, payload)
+                .await
+                .expect("send the event");
+
+            let reply = tokio::time::timeout(Duration::from_secs(5), read_message(&mut reader))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("{msg_type:?}: the server neither answered nor closed the connection")
+                });
+            match reply {
+                Ok((MessageType::AgentResponse, bytes)) => {
+                    let response: AgentResponse =
+                        serde_json::from_slice(&bytes).expect("the response decodes");
+                    Some(response.decision)
+                }
+                Ok((other, _)) => panic!("{msg_type:?}: unexpected reply {other:?}"),
+                Err(AgentProtocolError::ConnectionClosed) => None,
+                Err(e) => panic!("{msg_type:?}: unexpected error {e}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn an_event_that_cannot_be_decoded_is_not_answered_with_allow() {
+            let (_dir, socket_path, server) = start_server(Box::new(TestHandler)).await;
+
+            let cases: [(MessageType, &[u8]); 6] = [
+                (MessageType::RequestHeaders, NOT_AN_EVENT),
+                (MessageType::RequestBodyChunk, NOT_AN_EVENT),
+                (MessageType::ResponseHeaders, NOT_AN_EVENT),
+                (MessageType::ResponseBodyChunk, NOT_AN_EVENT),
+                (MessageType::WebSocketFrame, NOT_AN_EVENT),
+                (MessageType::Configure, NOT_A_CONFIGURE),
+            ];
+            let mut answered = Vec::new();
+            for (msg_type, payload) in cases {
+                if let Some(decision) = decision_for(&socket_path, msg_type, payload).await {
+                    answered.push(format!("{msg_type:?} -> {decision:?}"));
+                }
+            }
+            assert!(
+                answered.is_empty(),
+                "events the server could not decode were answered: {answered:?}"
+            );
+
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn a_connection_that_failed_to_decode_does_not_stop_the_server() {
+            let (_dir, socket_path, server) = start_server(Box::new(TestHandler)).await;
+
+            assert_eq!(
+                decision_for(&socket_path, MessageType::RequestHeaders, NOT_AN_EVENT).await,
+                None
+            );
+
+            // A good event on a new connection is answered as before.
+            let good = serde_json::to_vec(&test_request("cid-good")).expect("event serializes");
+            assert_eq!(
+                decision_for(&socket_path, MessageType::RequestHeaders, &good).await,
+                Some(crate::Decision::Allow)
+            );
+
+            server.abort();
+        }
+
+        /// The next reply on a connection: the correlation id it is addressed
+        /// to and its decision, or `None` when the server closed the
+        /// connection instead.
+        async fn read_reply(
+            reader: &mut BufReader<OwnedReadHalf>,
+        ) -> Option<(String, crate::Decision)> {
+            let reply = tokio::time::timeout(Duration::from_secs(5), read_message(reader))
+                .await
+                .expect("the server neither answered nor closed the connection");
+            match reply {
+                Ok((MessageType::AgentResponse, bytes)) => {
+                    let response: AgentResponse =
+                        serde_json::from_slice(&bytes).expect("the response decodes");
+                    let correlation_id = response
+                        .audit
+                        .custom
+                        .get("correlation_id")
+                        .and_then(|id| id.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    Some((correlation_id, response.decision))
+                }
+                Ok((other, _)) => panic!("unexpected reply {other:?}"),
+                Err(AgentProtocolError::ConnectionClosed) => None,
+                Err(e) => panic!("unexpected error {e}"),
+            }
+        }
+
+        /// A `RequestComplete` the server cannot decode is a notification the
+        /// proxy never reads the reply to, so it must not take the connection
+        /// down with it: the proxy keeps one connection per agent busy with
+        /// many requests' calls, and closing it fails all of them.
+        #[tokio::test]
+        async fn an_undecodable_request_complete_is_answered_and_the_connection_is_kept() {
+            let (_dir, socket_path, server) = start_server(Box::new(TestHandler)).await;
+            let (mut reader, mut writer) = connect_by_hand(&socket_path).await;
+
+            // Three calls on the one connection, written before any is read:
+            // the middle one is the `RequestComplete`.
+            let before = serde_json::to_vec(&test_request("cid-before")).expect("event serializes");
+            let after = serde_json::to_vec(&test_request("cid-after")).expect("event serializes");
+            write_message(&mut writer, MessageType::RequestHeaders, &before)
+                .await
+                .expect("send the first event");
+            write_message(&mut writer, MessageType::RequestComplete, NOT_AN_EVENT)
+                .await
+                .expect("send the undecodable event");
+            write_message(&mut writer, MessageType::RequestHeaders, &after)
+                .await
+                .expect("send the last event");
+
+            let mut replies = Vec::new();
+            while replies.len() < 3 {
+                let Some(reply) = read_reply(&mut reader).await else {
+                    break;
+                };
+                replies.push(reply);
+            }
+            assert_eq!(
+                replies,
+                vec![
+                    ("cid-before".to_string(), crate::Decision::Allow),
+                    ("cid-undecodable".to_string(), crate::Decision::Allow),
+                    ("cid-after".to_string(), crate::Decision::Allow),
+                ],
+                "the connection ended before every call on it was answered"
+            );
+
+            server.abort();
+        }
+
+        /// With no correlation id to address a reply to there is nothing to
+        /// send: the client matches replies to calls by that id. The
+        /// connection is kept all the same.
+        #[tokio::test]
+        async fn an_undecodable_request_complete_with_no_correlation_id_keeps_the_connection() {
+            let (_dir, socket_path, server) = start_server(Box::new(TestHandler)).await;
+            let (mut reader, mut writer) = connect_by_hand(&socket_path).await;
+
+            write_message(
+                &mut writer,
+                MessageType::RequestComplete,
+                br#"{"status":"not a number"}"#,
+            )
+            .await
+            .expect("send the undecodable event");
+            let after = serde_json::to_vec(&test_request("cid-after")).expect("event serializes");
+            write_message(&mut writer, MessageType::RequestHeaders, &after)
+                .await
+                .expect("send the next event");
+
+            // The first reply is the next event's: nothing answered the other.
+            assert_eq!(
+                read_reply(&mut reader).await,
+                Some(("cid-after".to_string(), crate::Decision::Allow)),
+                "the connection was closed, or the undecodable event was answered"
+            );
+
+            server.abort();
+        }
+
+        /// A `Configure` the agent could not read must not be taken for one
+        /// it accepted: the proxy uses that reply to decide whether to send
+        /// requests to a connection at all.
+        #[tokio::test]
+        async fn a_configure_that_cannot_be_decoded_is_not_accepted() {
+            let (_dir, socket_path, server) = start_server(Box::new(TestHandler)).await;
+
+            let client = AgentClientV2Uds::new("configure", &socket_path, Duration::from_secs(5))
+                .await
+                .expect("client");
+            client.connect().await.expect("handshake succeeds");
+
+            let result = client
+                .send_configure("cid-configure", &serde_json::json!({ "config_version": 5 }))
+                .await;
+            assert!(
+                matches!(result, Err(AgentProtocolError::ConnectionClosed)),
+                "expected the call to fail, got {result:?}"
+            );
+
+            server.abort();
+        }
+
+        /// A handler that panics must reach the proxy as a failed call. It
+        /// does so because the connection's task ends and the socket closes;
+        /// this keeps it from ever becoming a reply.
+        #[tokio::test]
+        async fn a_handler_that_panics_is_a_failed_call_not_an_allow() {
+            let (_dir, socket_path, server) = start_server(Box::new(PanickingHandler)).await;
+
+            let client = AgentClientV2Uds::new("panicking", &socket_path, Duration::from_secs(5))
+                .await
+                .expect("client");
+            client.connect().await.expect("handshake succeeds");
+
+            let result = client
+                .send_request_headers("cid-panic", &test_request("cid-panic"))
+                .await;
+            assert!(
+                matches!(result, Err(AgentProtocolError::ConnectionClosed)),
+                "expected the call to fail, got {result:?}"
+            );
+
+            server.abort();
+        }
     }
 }

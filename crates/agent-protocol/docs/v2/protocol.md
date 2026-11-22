@@ -140,6 +140,48 @@ keyed by it. It is not derived from the client's `X-Trace-Id`,
 trace ID (the client's value, when present) is in the `X-Correlation-Id`
 header of the request headers an agent receives.
 
+### Events the agent cannot decode
+
+For most events the proxy acts on the decision in the `AgentResponse` it gets
+back, whichever one it is, so none of them can mean "this event could not be
+read". A server that cannot decode such an event therefore does not answer it
+with a decision. For every event, `UdsAgentServerV2` logs the
+failure at ERROR, with the agent id, the event, the event's `correlation_id` and
+the size of its payload. The payload is not logged, and the decoder's own
+message, which can quote a value from it, goes only to the DEBUG log. What
+happens to the connection depends on whether the proxy uses the reply.
+
+**An event the proxy acts on closes the connection.** This covers
+`RequestHeaders`, `RequestBodyChunk`, `ResponseHeaders`, `ResponseBodyChunk`,
+`WebSocketFrame` and `Configure`. The proxy sees the connection end and fails
+the calls waiting on it, and the filter's `failure-mode` applies as for any
+failed call:
+
+- **`RequestHeaders`, `RequestBodyChunk`, `ResponseHeaders`,
+  `ResponseBodyChunk`:** `closed` blocks, with a 503 (504 for a timeout);
+  `open` carries on without that agent's decision.
+- **`WebSocketFrame`:** `closed` closes the WebSocket with code 1011 and the
+  reason "Agent error"; `open` passes the frame on.
+- **`Configure`:** the connection counts as failed rather than as having
+  accepted its configuration.
+
+The proxy multiplexes the calls of many requests over each connection, so
+closing it fails the other calls in flight on it too, not only the one whose
+event could not be decoded. A closed connection keeps being chosen until the
+pool marks it unhealthy (after three consecutive failures on it, or at the next
+health check, every 10 s by default), and the calls sent to it in the meantime
+fail too. The pool's maintenance then opens a replacement. A handler that
+panics ends the connection's task and has the same effect.
+
+**`RequestComplete` keeps the connection.** The proxy does not use the reply to
+this event, and it never affects the client, so the server logs the failure at
+ERROR and carries on with the next event on the connection; calls for other
+requests are not affected. When the payload holds a `correlation_id`, the
+server replies to the call with an `Allow`. This `Allow` is not a decision: it
+only ends the call, and the proxy discards it. When the payload holds no
+`correlation_id`, no reply could be matched to the call, so there is none, and
+the call ends when the proxy stops waiting for it (300 ms per agent).
+
 ### Example Frame
 
 ```
