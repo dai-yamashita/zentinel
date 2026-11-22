@@ -199,6 +199,18 @@ Unicode code point of the same value (U+0000 to U+00FF), so no value reaches an
 agent as an empty string because of its bytes. The upstream and the client keep
 the original bytes. See the [protocol reference](../../agent-protocol/docs/v2/protocol.md).
 
+The mapping is not reversible: `caf\xE9` and `caf\xC3\xA9` both reach an agent
+as `café`, so an agent cannot tell which bytes the client or the upstream sent,
+or detect a value that is not valid UTF-8.
+
+A value an agent writes in a header change (`HeaderOp::Set` or `HeaderOp::Add`)
+is written as the UTF-8 encoding of its string, not as the original bytes. An
+agent that sets a request header to the `café` it received for `caf\xE9` makes
+the upstream receive `caf\xC3\xA9`. With `Add`, the original header stays and
+the string is appended next to it, so the upstream receives both. The same holds
+for a response header, which the client receives. A header the agent does not
+change keeps its original bytes.
+
 ## Decision Model
 
 ### Decision Types
