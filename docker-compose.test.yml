@@ -11,12 +11,8 @@ services:
     environment:
       RUST_LOG: debug,zentinel_proxy=trace
       ZENTINEL_CONFIG: /etc/zentinel/zentinel.kdl
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9090/health"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-      start_period: 10s
+    # No healthcheck: see docker-compose.yml (distroless image, no HTTP
+    # client; /health is on :8080, not on the metrics port).
 
   # Add auth agent for testing
   auth:

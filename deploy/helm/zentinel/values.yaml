@@ -46,8 +46,14 @@ proxy:
     httpsTargetPort: 8443
     httpsNodePort: ""
 
-    # Metrics port
+    # Metrics port (the metrics server, `observability.metrics.address` in
+    # proxy.config.kdl). It serves /metrics only.
     metricsPort: 9090
+
+    # Health port (the "probes" listener in proxy.config.kdl, which serves
+    # /health, /healthz and /ready). Used by the pod's probes; not part of the
+    # Service. Must match the listener's address in proxy.config.kdl.
+    healthPort: 9091
 
     # Load balancer configuration
     loadBalancerIP: ""
@@ -80,38 +86,86 @@ proxy:
   config:
     # KDL configuration (multiline string)
     kdl: |
-      listener "http" {
-          address "0.0.0.0:8080"
-          protocol "http"
+      // Minimal configuration: everything on :8080 goes to one backend
+      // Service. Replace the upstream target with your own.
+      //
+      // `deploy/helm/zentinel/values.yaml` is parsed by the config crate's
+      // tests (crates/config/tests/shipped_examples.rs), so this must stay a
+      // configuration `zentinel test` accepts.
+      //
+      // HTTPS: mount a certificate (security.tls.enabled) and add a listener
+      // with `protocol "https"` and a `tls { cert-file ...; key-file ... }`
+      // block on proxy.service.httpsTargetPort.
+
+      schema-version "1.0"
+
+      system {
+          worker-threads 0  // one per CPU
+          // Below the pod's default terminationGracePeriodSeconds (30 s), so
+          // open connections drain before the kubelet kills the container.
+          graceful-shutdown-timeout-secs 25
       }
 
-      listener "https" {
-          address "0.0.0.0:8443"
-          protocol "https"
-          tls {
-              cert "/etc/zentinel/tls/tls.crt"
-              key "/etc/zentinel/tls/tls.key"
+      listeners {
+          listener "http" {
+              address "0.0.0.0:8080"
+              protocol "http"
+              request-timeout-secs 60
           }
       }
 
-      upstream "default" {
-          endpoint "backend.default.svc.cluster.local:80"
-          health-check {
-              path "/health"
-              interval 10
-              timeout 3
+      routes {
+          route "default" {
+              priority "low"
+              matches { path-prefix "/" }
+              upstream "default"
           }
       }
 
-      route "default" {
-          matches { all true }
-          upstream "default"
+      upstreams {
+          upstream "default" {
+              target "backend.default.svc.cluster.local:80" weight=1
+              load-balancing "round_robin"
+              health-check {
+                  type "tcp"
+                  interval-secs 10
+                  timeout-secs 3
+                  healthy-threshold 2
+                  unhealthy-threshold 3
+              }
+          }
+      }
+
+      // Probe surface for the kubelet's liveness and readiness probes. A
+      // namespace with a listener of its own is served only on that listener,
+      // and that listener serves only the namespace's routes, so the probes
+      // never reach the backend and the backend paths never reach this.
+      // The kubelet probes the pod IP, so the listener is not loopback; it
+      // serves the health handler only. Its port is proxy.service.healthPort.
+      namespace "probes" {
+          listeners {
+              listener "health" {
+                  address "0.0.0.0:9091"
+                  protocol "http"
+                  request-timeout-secs 5
+              }
+          }
+
+          routes {
+              route "health" {
+                  priority "high"
+                  matches { path-regex "^/(health|healthz|ready)$" }
+                  service-type "builtin"
+                  builtin-handler "health"
+              }
+          }
       }
 
       observability {
           metrics {
               enabled #true
-              // Prometheus scrapes the pod IP, so not loopback.
+              // Prometheus scrapes the pod IP, so not loopback. The port is
+              // proxy.service.metricsPort.
               address "0.0.0.0:9090"
               path "/metrics"
           }
@@ -177,10 +231,13 @@ proxy:
     runAsUser: 1000
 
   # Probes
+  # Both probes answer on the "probes" listener of proxy.config.kdl
+  # (container port "health", proxy.service.healthPort). The metrics port
+  # serves /metrics only and answers 404 to these paths.
   livenessProbe:
     httpGet:
       path: /health
-      port: metrics
+      port: health
     initialDelaySeconds: 30
     periodSeconds: 10
     timeoutSeconds: 3
@@ -189,7 +246,7 @@ proxy:
   readinessProbe:
     httpGet:
       path: /ready
-      port: metrics
+      port: health
     initialDelaySeconds: 10
     periodSeconds: 5
     timeoutSeconds: 3
