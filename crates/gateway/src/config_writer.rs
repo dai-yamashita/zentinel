@@ -94,6 +94,12 @@ impl ConfigWriter {
         if config.server.auto_reload {
             out.push_str("    auto-reload #true\n");
         }
+        // Written always, so the file says how IPv6 clients are counted for
+        // the per-client limits rather than leaving it to the default.
+        out.push_str(&format!(
+            "    client-ipv6-prefix-length {}\n",
+            config.server.client_ipv6_prefix_length.get()
+        ));
         out.push_str("}\n\n");
 
         // Listeners
@@ -1918,5 +1924,34 @@ mod tests {
             HashMap::new(),
         );
         render_and_parse(&config);
+    }
+
+    /// #760: the writer used to drop the prefix length, so a Gateway
+    /// deployment always counted IPv6 clients per /64.
+    #[test]
+    fn client_ipv6_prefix_length_is_written_and_read_back() {
+        for bits in [48u8, 64, 128] {
+            let mut config = test_config(
+                vec![test_listener("http", "0.0.0.0:8080", None)],
+                vec![],
+                HashMap::new(),
+                HashMap::new(),
+            );
+            config.server.client_ipv6_prefix_length =
+                zentinel_common::limits::Ipv6PrefixLen::new(bits).unwrap();
+
+            let kdl = ConfigWriter::new(PathBuf::from("/tmp/test.kdl")).render_kdl(&config);
+            assert!(
+                kdl.contains(&format!("    client-ipv6-prefix-length {bits}\n")),
+                "{kdl}"
+            );
+            assert_eq!(
+                render_and_parse(&config)
+                    .server
+                    .client_ipv6_prefix_length
+                    .get(),
+                bits
+            );
+        }
     }
 }

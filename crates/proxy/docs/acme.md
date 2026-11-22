@@ -330,6 +330,16 @@ certificate, and a reload refuses an ACME certificate that has expired. (At
 startup an expired ACME certificate is still loaded, so the listener starts
 and the renewal replaces it.)
 
+A listener's certificates are reloaded together, all or none. One ACME `sni`
+certificate that the listener was serving and that can no longer be read (its
+files deleted, unreadable, or truncated) therefore fails the reload of the
+whole listener: every other certificate of that listener, including one that
+was just renewed, stays at the version loaded before, and each later renewal
+or `SIGHUP` fails the same way until the unreadable files are fixed or the
+`sni` entry is removed. The error names the listener and the primary domain of
+the certificate that could not be loaded. Listeners that do not serve it
+are not affected.
+
 If a listener cannot load the renewed files (unreadable, a key that does not
 match, expired), it keeps serving the certificates it
 had. The scheduler logs an error naming the listener and the domain, and
