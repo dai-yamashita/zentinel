@@ -650,6 +650,9 @@ the request's value are ignored. An entry matches as a prefix. A request that
 carries several `Content-Type` headers is inspected when **any** of them matches.
 A request with no `Content-Type` is inspected only when the list has an empty
 entry (`content-types "" "application/json"`); an empty list inspects every body.
+Values are compared as bytes, so a byte outside visible ASCII in a parameter
+(`application/json; x=\xff`) does not hide the media type, and a `Content-Type`
+with such a byte that matches no entry is inspected anyway.
 
 ### Observability Block
 
