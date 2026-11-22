@@ -165,6 +165,7 @@ fn builtin_route(
         websocket_inspection: false,
         shadow: None,
         fallback: None,
+        websocket_max_frame_size: crate::routes::DEFAULT_WEBSOCKET_MAX_FRAME_SIZE,
     }
 }
 

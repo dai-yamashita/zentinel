@@ -916,6 +916,7 @@ mod tests {
                 error_pages: None,
                 websocket: false,
                 websocket_inspection: false,
+                websocket_max_frame_size: zentinel_config::DEFAULT_WEBSOCKET_MAX_FRAME_SIZE,
                 shadow: None,
                 fallback: None,
             }],
@@ -1144,6 +1145,7 @@ mod tests {
             websocket_inspection: false,
             shadow: None,
             fallback: None,
+            websocket_max_frame_size: zentinel_config::DEFAULT_WEBSOCKET_MAX_FRAME_SIZE,
         }
     }
 
