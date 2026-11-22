@@ -4899,17 +4899,21 @@ fn client_session(session: &Session) -> Option<String> {
 ///
 /// Compared exactly rather than by prefix, because `application/jsonl` and
 /// `application/json-rpc` both start with `application/json` and are not it.
+///
+/// Read from the header's bytes: a parameter with a byte outside visible
+/// ASCII must not make the media type unreadable, or a listing would be
+/// forwarded unfiltered.
 fn response_mime(resp: &ResponseHeader) -> Option<String> {
     resp.headers
         .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| {
-            v.split(';')
-                .next()
-                .unwrap_or_default()
-                .trim()
-                .to_ascii_lowercase()
-        })
+        .map(|v| media_type_essence(v.as_bytes()))
+}
+
+/// The media type of a `Content-Type` value: before any `;`, trimmed and
+/// lowercased.
+fn media_type_essence(value: &[u8]) -> String {
+    let essence = value.split(|&b| b == b';').next().unwrap_or_default();
+    String::from_utf8_lossy(essence.trim_ascii()).to_ascii_lowercase()
 }
 
 impl ZentinelProxy {
@@ -6497,5 +6501,36 @@ mod selection_context_tests {
         );
         assert_eq!(sel.headers.get("x-tenant").map(String::as_str), Some("t1"));
         assert_eq!(sel.path, "/x");
+    }
+}
+
+#[cfg(test)]
+mod media_type_essence_tests {
+    use super::media_type_essence;
+
+    #[test]
+    fn readable_values_are_read_as_before() {
+        for (value, essence) in [
+            ("application/json", "application/json"),
+            ("Application/JSON; charset=utf-8", "application/json"),
+            (" text/event-stream ;x=y", "text/event-stream"),
+            ("", ""),
+        ] {
+            let before = value.split(';').next().unwrap().trim().to_ascii_lowercase();
+            assert_eq!(before, essence);
+            assert_eq!(media_type_essence(value.as_bytes()), essence, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn a_non_ascii_parameter_does_not_hide_the_media_type() {
+        assert_eq!(
+            media_type_essence(b"application/json; x=\xff"),
+            "application/json"
+        );
+        assert_eq!(
+            media_type_essence(b"TEXT/EVENT-STREAM;charset=caf\xc3\xa9"),
+            "text/event-stream"
+        );
     }
 }

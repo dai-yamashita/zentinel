@@ -18,6 +18,7 @@ for details.
 
 | CalVer | Crate Version | Date | Highlights |
 |--------|---------------|------|------------|
+| [26.11_4](#26114---2026-11-22) | 0.6.58 | 2026-11-22 | **Security: request bodies whose `Content-Type` has a byte outside visible ASCII are inspected** (they bypassed body agents with the default `waf` allowlist); **duplicate config nodes, wrong-typed values and repeated ids are errors** (**read the upgrade notes**); metrics and health only on the admin listener; bodies over `max-inspection-bytes` hit the filter's failure-mode; IPv6 clients grouped by /64; caching honours `Authorization`, `Set-Cookie` and `Vary`; forwarding headers from untrusted peers stripped; `query-param` route matches work; agents get a proxy-generated correlation id |
 | [26.11_3](#26113---2026-11-14) | 0.6.57 | 2026-11-14 | **Agent gRPC TLS options are applied** (`ca-cert`, `client-cert`/`client-key`; TLS options on a non-`https://` agent and `tls-insecure` are now configuration errors, **read the upgrade notes**); agents receive `RequestComplete` at the end of every request; **Hetzner DNS-01 works again** on the Hetzner Cloud API (**needs a new token**); WAF body-inspection content types matched case-insensitively; release binaries no longer report `-dirty`; Gateway API controller on kube 5 / gateway-api 0.23 |
 | [26.11_2](#26112---2026-11-12) | 0.6.56 | 2026-11-12 | Pingora fork rebased on upstream **Pingora 0.9.1** (`zentinel-pingora-core` 0.9.3); no behaviour or configuration change |
 | [26.11_1](#26111---2026-11-07) | 0.6.55 | 2026-11-07 | Security: `rustls-webpki` 0.103.16 (distrusted intermediates), `zstd` 0.13.4; building from source needs **Rust 1.99** (**read the upgrade notes**); `wasmtime` 50.0.1 in the unshipped WASM runtime crate (five advisories); `sysinfo` 0.40, rust-minor batch (10 updates) |
@@ -98,6 +99,97 @@ for details.
 ## [Unreleased]
 
 ---
+
+## [26.11_4] - 2026-11-22
+
+**Crate version:** 0.6.58
+
+Security and correctness release. Request bodies whose `Content-Type` contained
+a byte outside visible ASCII skipped the body agents when a `waf` block was
+configured, so attack payloads in such bodies reached the upstream uninspected;
+they are now inspected. Most of the other changes come from a review of the
+proxy by a contributor and fix settings that were accepted and then ignored or
+misread. Several of them reject configurations that used to load: **read the
+upgrade notes before upgrading**, and run `zentinel test --strict` against your
+configuration.
+
+### Security
+- **Request bodies are inspected when the `Content-Type` is not visible ASCII.**
+  The body-inspection allowlist read the header as text, so a value with any
+  byte outside visible ASCII (`application/json; x=\xff`) counted as no
+  Content-Type and the body was not sent to `request_body` agents, while the
+  upstream still parsed it by its media type. The allowlist is now matched on
+  the header's bytes, and an unreadable value is always inspected. Affected:
+  every release with request-body inspection since 26.01_1, with a `waf` block
+  (including the default allowlist). Workaround for older releases:
+  `content-types ""`. (#789)
+- **Forwarding headers from untrusted peers are removed** before routing, rate
+  limiting and agents: about 28 client-IP, scheme, port and original-URL
+  headers (`True-Client-IP`, `CF-Connecting-IP`, `X-Forwarded-Port`,
+  `X-Original-URL`, ...), including spellings with `_`. From trusted peers,
+  `X-Forwarded-For` is cut to start at the chosen client and `X-Real-IP` is
+  rewritten to it. (#719, #727)
+- **Release signatures are verified against the exact signer identity** in the
+  documented cosign commands. (#744)
+- **`bundle install` and `install.sh` refuse an archive whose checksum cannot
+  be fetched or read.** (#746)
+
+### Upgrade notes
+- **Duplicate configuration is an error (#703).** A single-valued child written
+  twice (`filters`, `matches`, `policies`, `timeouts`, `tls`, `retry-policy`,
+  `health-check`, scalar settings, ...), a duplicate `upstream`/`filter` id, a
+  repeated block in a `namespace`/`service`, or a duplicate key in an agent's
+  `config { }` now fails at load and on reload instead of silently using one
+  copy. Header names repeated in `set`/`add`/`rename` are compared without
+  regard to case.
+- **The proxy refuses to start when `--config` names a file that does not
+  exist** instead of writing and using a default configuration (#705).
+- **Metrics and health endpoints (#717).** Without an `address`, the metrics
+  server binds `127.0.0.1:9090` instead of `0.0.0.0:9090`; set it explicitly
+  for a remote Prometheus. The embedded default configuration no longer serves
+  `/metrics` or `/health` on `:8080`; `/metrics`, `/health`, `/healthz` and
+  `/ready` are on the admin listener only.
+- **Bodies over `max-inspection-bytes` (#693).** In `request-body-mode
+  "buffer"`, a body larger than `max-inspection-bytes` (1 MiB by default) is no
+  longer sent to agents in part: with `failure-mode "closed"` (the default) the
+  request gets 413, with `"open"` the agent is skipped with a warning.
+- **IPv6 clients are grouped by prefix (#760).** New
+  `system { client-ipv6-prefix-length }` (default 64, 1-128). Clients in the
+  same /64 share per-client connection limits, rate-limit buckets and token
+  budgets; set 128 for the old behaviour.
+- **Caching (#699).** Responses to requests with `Authorization` are cached
+  only with `public`, `s-maxage` or `must-revalidate`; responses with
+  `Set-Cookie` or `Vary: *` are not cached; other `Vary` headers keep one entry
+  per value.
+- **systemd units restart without a start limit (#721).** The shipped units
+  restart every 5 s indefinitely instead of entering `failed` after three
+  failures; alert on `NRestarts`. Installed units change only after reinstall.
+
+### Fixed
+- Health probes and the token-budget lookup no longer panic (#735).
+- Route cache keys are unambiguous, so a request can no longer get the route
+  cached for a different request (#685).
+- `query-param` route conditions, including Gateway API query matches, match
+  (#711).
+- Static routes run their agent filters before serving the file (#701).
+- Agents receive header values with non-ASCII bytes (UTF-8, otherwise Latin-1
+  per byte) instead of an empty string (#689).
+- Agents receive a proxy-generated correlation id instead of the client's
+  trace header; the trace id moves to the `X-Correlation-Id` header (#691).
+- Dropped or timed-out agent calls no longer leak pending or in-flight counts
+  (#731).
+- Circuit breakers count only upstream errors and 5xx responses and give
+  half-open slots back (#709).
+- ACME renewals are applied to the listeners without a reload (#707).
+- During a reload, a route whose filter is missing returns 503 with
+  `failure-mode "closed"` (#758).
+- The Gateway API controller escapes values it writes into the generated KDL
+  and leaves out a resource with a control character (#725).
+- Metrics no longer allocate a label string per uncommon status code (#697).
+
+### Dependencies
+- maxminddb 0.33, jsonschema 0.61, async-memcached 0.10, and a rust-minor
+  batch (#678-#681).
 
 ## [26.11_3] - 2026-11-14
 

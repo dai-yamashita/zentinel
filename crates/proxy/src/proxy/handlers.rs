@@ -465,15 +465,19 @@ impl ZentinelProxy {
                 .unwrap_or_default();
 
             // Every Content-Type header counts: with two of them, the one that
-            // is not allowlisted must not hide the one that is.
-            let content_types: Vec<&str> = session
+            // is not allowlisted must not hide the one that is. The values are
+            // read as bytes: a value with a byte outside visible ASCII is
+            // still a Content-Type the upstream may act on, and must not be
+            // dropped as if the request had none.
+            let content_types: Vec<&[u8]> = session
                 .req_header()
                 .headers
                 .get_all("content-type")
                 .iter()
-                .filter_map(|v| v.to_str().ok())
+                .map(|v| v.as_bytes())
                 .collect();
-            let content_type = content_types.first().copied().unwrap_or("");
+            let content_type =
+                String::from_utf8_lossy(content_types.first().copied().unwrap_or(b""));
 
             let is_allowed_type =
                 content_type_is_inspected(content_types.iter().copied(), &allowed_types);
@@ -1348,12 +1352,21 @@ pub(super) fn apply_agent_response_header_ops(
 /// also covers `application/json; charset=utf-8`. A request without a
 /// `Content-Type` is matched as the empty string. The request is inspected if
 /// any of its `Content-Type` values matches.
-fn content_type_is_inspected<'a>(
-    content_types: impl IntoIterator<Item = &'a str>,
+///
+/// Values are compared as bytes, so a byte outside visible ASCII (which
+/// `HeaderValue::to_str` refuses) does not make a value disappear: an entry
+/// still matches the value's ASCII prefix. A value that has such a byte and
+/// matches no entry is inspected anyway (fail closed): the proxy cannot tell
+/// which media type the upstream will read from it.
+fn content_type_is_inspected<'a, T>(
+    content_types: impl IntoIterator<Item = &'a T>,
     allowed: &[String],
-) -> bool {
-    let matches = |content_type: &str| {
-        let content_type = content_type.trim_start().as_bytes();
+) -> bool
+where
+    T: AsRef<[u8]> + ?Sized + 'a,
+{
+    let matches = |content_type: &[u8]| {
+        let content_type = content_type.trim_ascii_start();
         allowed.iter().any(|allowed| {
             let allowed = allowed.as_bytes();
             content_type.len() >= allowed.len()
@@ -1362,12 +1375,21 @@ fn content_type_is_inspected<'a>(
     };
     let mut seen = false;
     for content_type in content_types {
+        let content_type = content_type.as_ref();
         seen = true;
-        if matches(content_type) {
+        if matches(content_type) || !is_visible_header_text(content_type) {
             return true;
         }
     }
-    !seen && matches("")
+    !seen && matches(b"")
+}
+
+/// Whether `value` is what `HeaderValue::to_str` accepts: visible ASCII and
+/// horizontal tab.
+fn is_visible_header_text(value: &[u8]) -> bool {
+    value
+        .iter()
+        .all(|&b| b == b'\t' || (0x20..0x7f).contains(&b))
 }
 
 #[cfg(test)]
@@ -1449,11 +1471,12 @@ mod tests {
 
     #[test]
     fn no_content_type_header_is_matched_as_the_empty_string() {
+        let none: [&str; 0] = [];
         assert!(!content_type_is_inspected(
-            [],
+            none,
             &allowlist(&["application/json"])
         ));
-        assert!(content_type_is_inspected([], &allowlist(&[""])));
+        assert!(content_type_is_inspected(none, &allowlist(&[""])));
     }
 
     #[test]
@@ -1461,6 +1484,95 @@ mod tests {
         let allowed = allowlist(&[""]);
         for content_type in ["", "text/plain", "APPLICATION/JSON", "image/png"] {
             assert!(content_type_is_inspected([content_type], &allowed));
+        }
+    }
+
+    /// The values the gate is given are the request's header bytes, as
+    /// `handlers.rs` collects them.
+    fn header_bytes(value: &[u8]) -> http::HeaderValue {
+        let value = http::HeaderValue::from_bytes(value).unwrap();
+        assert!(
+            value.to_str().is_err(),
+            "{value:?} must be one `to_str` refuses"
+        );
+        value
+    }
+
+    #[test]
+    fn listed_media_type_with_a_non_ascii_parameter_is_inspected() {
+        let allowed = allowlist(&["application/json", "multipart/form-data"]);
+        for value in [
+            &b"application/json; x=\xff"[..],
+            b"application/json;charset=\xe9",
+            b"APPLICATION/JSON; name=\"caf\xc3\xa9\"",
+            b"multipart/form-data; boundary=\xff\xfe",
+        ] {
+            let value = header_bytes(value);
+            assert!(
+                content_type_is_inspected([value.as_bytes()], &allowed),
+                "{value:?} must be inspected"
+            );
+        }
+    }
+
+    #[test]
+    fn unreadable_content_type_is_inspected_even_if_it_matches_no_entry() {
+        let allowed = allowlist(&["application/json"]);
+        for value in [
+            &b"\xa0application/json"[..],
+            b"application/\xffjson",
+            b"text/plain; name=caf\xc3\xa9",
+            b"\xff\xfe",
+        ] {
+            let value = header_bytes(value);
+            assert!(
+                content_type_is_inspected([value.as_bytes()], &allowed),
+                "{value:?} must be inspected"
+            );
+        }
+    }
+
+    #[test]
+    fn unreadable_content_type_is_not_hidden_by_a_readable_one() {
+        let allowed = allowlist(&["application/json"]);
+        let unreadable = header_bytes(b"application/json; x=\xff");
+        for values in [
+            [&b"text/plain"[..], unreadable.as_bytes()],
+            [unreadable.as_bytes(), b"text/plain"],
+        ] {
+            assert!(
+                content_type_is_inspected(values, &allowed),
+                "{values:?} must be inspected"
+            );
+        }
+    }
+
+    #[test]
+    fn readable_content_types_are_matched_as_before_when_read_as_bytes() {
+        let allowed = allowlist(&["application/json"]);
+        assert!(content_type_is_inspected(
+            [&b"\tapplication/json"[..]],
+            &allowed
+        ));
+        for value in [&b"text/plain;\tcharset=utf-8"[..], b"", b"  ", b"\t"] {
+            assert!(
+                !content_type_is_inspected([value], &allowed),
+                "{value:?} is not on the allowlist"
+            );
+        }
+    }
+
+    #[test]
+    fn visible_header_text_is_what_to_str_accepts() {
+        for byte in 0..=u8::MAX {
+            let Ok(value) = http::HeaderValue::from_bytes(&[b'a', byte]) else {
+                continue;
+            };
+            assert_eq!(
+                is_visible_header_text(value.as_bytes()),
+                value.to_str().is_ok(),
+                "byte {byte:#04x}"
+            );
         }
     }
 
