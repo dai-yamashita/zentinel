@@ -597,6 +597,52 @@ filters { filter "f" { type "rate-limit"; max-rps 10; burst 20 } }
     assert!(e.contains("'max-rps'") && e.contains("Duplicate"), "{e}");
 }
 
+#[test]
+fn a_geo_filter_with_a_setting_written_twice_is_an_error() {
+    let single = r#"
+system { worker-threads 1 }
+listeners { listener "l" { address "127.0.0.1:8080" } }
+filters {
+    filter "f" {
+        type "geo"
+        database-path "/g.mmdb"
+        database-type "maxmind"
+        action "block"
+        countries "RU"
+        on-failure "open"
+    }
+}
+"#;
+    load(single).expect("control loads");
+
+    for (node, first, second) in [
+        (
+            "database-path",
+            r#"database-path "/g.mmdb""#,
+            r#"database-path "/h.mmdb""#,
+        ),
+        (
+            "database-type",
+            r#"database-type "maxmind""#,
+            r#"database-type "ip2location""#,
+        ),
+        ("action", r#"action "block""#, r#"action "log-only""#),
+        ("countries", r#"countries "RU""#, r#"countries "CN""#),
+        (
+            "on-failure",
+            r#"on-failure "open""#,
+            r#"on-failure "closed""#,
+        ),
+    ] {
+        let doubled = single.replace(first, &format!("{first}\n{second}"));
+        let e = load(&doubled).expect_err(&format!("`{node}` written twice was accepted"));
+        assert!(
+            e.contains(&format!("'{node}'")) && e.contains("Duplicate"),
+            "the error should name '{node}', got: {e}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Listeners, agents, system, other top-level blocks
 // ---------------------------------------------------------------------------
