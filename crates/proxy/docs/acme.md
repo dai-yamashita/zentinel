@@ -302,8 +302,8 @@ certificate from ACME is built, and startup stops if one cannot be (for
 example a `cert-file` that does not exist). That check makes no request to the
 CA.
 
-ACME is then initialized, for listeners with protocol `https` only. A
-listener's certificate is read from
+ACME is then initialized, for listeners with protocol `https` or `h2` (the
+two are built the same way). A listener's certificate is read from
 `<storage>/domains/<first domain>/cert.pem` and `key.pem`.
 
 - When the first certificate cannot be issued, startup stops there with the
@@ -313,13 +313,12 @@ listener's certificate is read from
 - A start that stops during ACME initialization runs it again on the next
   start, at the pace the service manager restarts the process.
 - If the files are still missing when the listener is built, startup fails
-  with an error naming the listener, its address and the missing file. An `h2`
-  listener with an `acme` block ends up here, since ACME is not initialized
-  for it. The proxy does not skip the listener and keep running.
+  with an error naming the listener, its address and the missing file. The
+  proxy does not skip the listener and keep running.
 
-`zentinel test` does not check the default certificate of an `https` listener
-that ACME manages: it is issued while the proxy starts, so it need not exist
-yet.
+`zentinel test` does not check the default certificate of an `https` or `h2`
+listener that ACME manages: it is issued while the proxy starts, so it need
+not exist yet.
 
 ### TLS Hot-Reload
 
@@ -328,9 +327,9 @@ running listeners; no `SIGHUP` is needed.
 
 The renewal schedulers are created while ACME is initialized, before any
 listener has built its certificate resolver. They are therefore given the
-`CertificateReloader`, the registry that each HTTPS listener adds its
-`HotReloadableSniResolver` to as it starts (the registry `SIGHUP` also uses),
-rather than a resolver:
+`CertificateReloader`, the registry that each `https` and `h2` listener adds
+its `HotReloadableSniResolver` to as it starts (the registry `SIGHUP` also
+uses), rather than a resolver:
 
 ```rust
 // RenewalScheduler::apply_renewed_certificate()
