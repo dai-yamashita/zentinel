@@ -18,6 +18,7 @@ for details.
 
 | CalVer | Crate Version | Date | Highlights |
 |--------|---------------|------|------------|
+| [26.11_7](#26117---2026-11-23) | 0.6.61 | 2026-11-23 | **A busy agent can hold a request for at most its `timeout-ms`**; **a geo database cut short or failing its trial lookups stops startup** (read the upgrade notes); replaced geo databases are re-read every time |
 | [26.11_6](#26116---2026-11-23) | 0.6.60 | 2026-11-23 | Geo filter lookup cache and inference rate limit buckets are bounded; stale `cargo audit` ignores removed |
 | [26.11_5](#26115---2026-11-23) | 0.6.59 | 2026-11-23 | **Wrong-typed values, `tls` on an `http` listener, unknown TLS versions, out-of-range integers and unresolvable upstream/agent references are configuration errors** (**read the upgrade notes**); **a TLS listener or geo database that cannot be loaded stops startup**; **non-idempotent requests are not retried after an upstream error, and `max-attempts` bounds every retry**; **compressed request bodies are decoded for agents by default**; **filters on builtin routes apply**; **the inference prompt check runs**; geo filters read every country and follow reloads; ACME issues for `h2` listeners; **an undecodable WebSocket frame on an inspected route closes the connection**; the response cache key includes route and host (the cache starts cold); the access log records the query string and HTTP version; a certificate whose key does not match is refused; the Helm charts pull a published image, their config parses and the probes reach a health listener; systemd restarts back off to 120 s |
 | [26.11_4](#26114---2026-11-22) | 0.6.58 | 2026-11-22 | **Security: request bodies whose `Content-Type` has a byte outside visible ASCII are inspected** (they bypassed body agents with the default `waf` allowlist); **duplicate config nodes, wrong-typed values and repeated ids are errors** (**read the upgrade notes**); metrics and health only on the admin listener; bodies over `max-inspection-bytes` hit the filter's failure-mode; IPv6 clients grouped by /64; caching honours `Authorization`, `Set-Cookie` and `Vary`; forwarding headers from untrusted peers stripped; `query-param` route matches work; agents get a proxy-generated correlation id |
@@ -99,6 +100,41 @@ for details.
 ---
 
 ## [Unreleased]
+
+---
+
+## [26.11_7] - 2026-11-23
+
+**Crate version:** 0.6.61
+
+### Upgrade notes
+- **Agent call slots (#825).** A call to an agent waited for one of the
+  agent's `max-concurrent-calls` slots without a limit, and its `timeout-ms`
+  started only once it had one. The call's `timeout-ms` (the filter's, else the
+  agent's) now covers the wait and the call together. A call that gets no slot
+  in time is not made and follows the filter's `failure-mode`: `closed`
+  answers 504, `open` continues without the agent. It is logged as `No free
+  agent call slot within the timeout; agent not called` and does not count
+  against the agent's circuit breaker. Under load, a busy agent now produces
+  504s (or skipped inspection) where requests used to queue; raise
+  `max-concurrent-calls` or the agent's capacity if they appear.
+- **Geo databases are checked when they open (#826).** At startup, in
+  `zentinel test` and `zentinel validate`, and on a reload, an IP2Location file
+  shorter than the size its header records, and any geo database that fails
+  its trial lookups, is treated like a file that does not open: startup and
+  the two commands fail naming the file, and a reload naming it is rejected.
+  Such a file used to open, and the lookups that read its missing part applied
+  `on-failure`. When the file of a filter in use is replaced by one that fails,
+  the database in use stays and an error is logged.
+
+### Fixed
+- A geo database replaced by renaming a new file over it is read again every
+  time, not only the first time (on Linux the watch ended with the replaced
+  file). The watcher watches each database's directory, and a file changed
+  without an event (a symlink into another directory, a ConfigMap swap) is
+  found by a check every 5 seconds (#826).
+- Two geo databases that change within the 500 ms batching window are both
+  read again; the second used to be dropped (#826).
 
 ---
 
