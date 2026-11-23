@@ -1188,37 +1188,56 @@ impl ZentinelProxy {
     fn spawn_geo_database_watcher(
         geo_filter_manager: Arc<GeoFilterManager>,
     ) -> Arc<GeoDatabaseWatcher> {
+        // How long the watcher waits, after the last change it was told of,
+        // before it reads the databases that changed. A tool that updates a
+        // database writes a temporary file and renames it, or writes the file
+        // in steps; the change is read once, when it is done.
+        const SETTLE: Duration = Duration::from_millis(500);
+        // How often the database files are looked at as well, in case a
+        // change was not reported. Only the size, time and identity of each
+        // file are read, and a change is read once it has stayed as it is for
+        // one interval, so a change the watch misses is read within two
+        // intervals. Databases change daily at most, so seconds are soon
+        // enough.
+        const POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+        Self::spawn_geo_database_watcher_with(geo_filter_manager, SETTLE, POLL_INTERVAL)
+    }
+
+    /// [`Self::spawn_geo_database_watcher`], with the time the changes are
+    /// given to settle and the interval of the periodic check of the files.
+    fn spawn_geo_database_watcher_with(
+        geo_filter_manager: Arc<GeoFilterManager>,
+        settle: Duration,
+        poll_interval: Duration,
+    ) -> Arc<GeoDatabaseWatcher> {
         let watcher = Arc::new(GeoDatabaseWatcher::new(geo_filter_manager));
 
         // Try to start watching
-        match watcher.start_watching() {
-            Ok(mut rx) => {
-                let watcher_clone = watcher.clone();
-                tokio::spawn(async move {
-                    // Debounce interval
-                    const DEBOUNCE_MS: u64 = 500;
-
-                    while let Some(path) = rx.recv().await {
-                        // Debounce rapid changes (e.g., temp file then rename)
-                        tokio::time::sleep(Duration::from_millis(DEBOUNCE_MS)).await;
-
-                        // Drain any additional events for the same path during debounce
-                        while rx.try_recv().is_ok() {}
-
-                        // Handle the change
-                        watcher_clone.handle_change(&path);
-                    }
-                });
-
+        let (events, keep_open) = match watcher.start_watching() {
+            Ok(events) => {
                 info!("Started geo database file watcher");
+                (events, None)
             }
             Err(e) => {
                 warn!(
                     error = %e,
-                    "Failed to start geo database file watcher, auto-reload disabled"
+                    poll_interval_secs = poll_interval.as_secs(),
+                    "Failed to start geo database file watcher; the database files are only \
+                     checked at the poll interval"
                 );
+                // No event will come, and the task below ends when its
+                // events end: keep them open.
+                let (sender, events) = tokio::sync::mpsc::channel(1);
+                (events, Some(sender))
             }
-        }
+        };
+
+        let task = watcher.clone();
+        tokio::spawn(async move {
+            let _keep_open = keep_open;
+            task.run(events, settle, poll_interval).await;
+        });
         watcher
     }
 }
@@ -2724,6 +2743,131 @@ mod reload_rollback_tests {
         assert!(
             eventually(|| h.geo_watcher.watched_paths().is_empty()).await,
             "the database of the removed filter is still watched"
+        );
+    }
+
+    /// A top-level `filters` block with one geo filter for each of
+    /// `databases`, named by the id it comes with, that blocks `XX`.
+    fn geo_filters(databases: &[(&str, &std::path::Path)]) -> String {
+        let filters: Vec<String> = databases
+            .iter()
+            .map(|(id, database)| {
+                format!(
+                    r#"filter "{id}" {{
+                        type "geo"
+                        database-path "{}"
+                        countries "XX"
+                    }}"#,
+                    database.display()
+                )
+            })
+            .collect();
+        format!("filters {{\n{}\n}}", filters.join("\n"))
+    }
+
+    /// The geo filters of `databases`, registered, and the file watcher as
+    /// `ZentinelProxy::new` starts it, except that the periodic check of the
+    /// files comes an hour from now: a change is read only if the watch
+    /// reports it.
+    fn watched_geo_filters(
+        databases: &[(&str, &std::path::Path)],
+    ) -> (Arc<GeoFilterManager>, Arc<GeoDatabaseWatcher>) {
+        let config = Config::from_kdl(&kdl("a", "^/a", &geo_filters(databases)))
+            .expect("the configuration parses");
+        let geo = Arc::new(GeoFilterManager::from_config(&config).expect("the databases open"));
+        let watcher = ZentinelProxy::spawn_geo_database_watcher_with(
+            Arc::clone(&geo),
+            Duration::from_millis(500),
+            Duration::from_secs(3600),
+        );
+        (geo, watcher)
+    }
+
+    /// The country filter `id` finds for an address.
+    fn country_of(geo: &GeoFilterManager, id: &str) -> Option<String> {
+        geo.check(id, "192.0.2.1")
+            .expect("the filter is registered")
+            .country_code
+    }
+
+    /// Replace `database` as an update tool does: write the new file next to
+    /// it, then rename it over the old one.
+    fn replace_database(database: &std::path::Path, country: &str) {
+        let next = database.with_file_name(format!(
+            "{}.next",
+            database.file_name().unwrap().to_string_lossy()
+        ));
+        crate::geo_filter::test_database::write_country_database(&next, country);
+        std::fs::rename(&next, database).expect("rename over the old database");
+    }
+
+    /// A database replaced by a rename is read again, and so is the next one:
+    /// the watch does not end with the file it was set on.
+    #[tokio::test]
+    async fn a_database_replaced_by_a_rename_is_read_again_each_time() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // The real path, which is what the system reports events under on
+        // every platform: this test is about the rename, not about the name.
+        let root = std::fs::canonicalize(dir.path()).expect("canonicalize");
+        let database = root.join("country.mmdb");
+        crate::geo_filter::test_database::write_country_database(&database, "US");
+        let (geo, _watcher) = watched_geo_filters(&[("region", &database)]);
+        assert_eq!(country_of(&geo, "region").as_deref(), Some("US"));
+
+        for country in ["DE", "FR", "JP"] {
+            replace_database(&database, country);
+            assert!(
+                eventually(|| country_of(&geo, "region").as_deref() == Some(country)).await,
+                "the database replaced by a rename (now {country}) was not read again"
+            );
+        }
+    }
+
+    /// Two databases that change within the time the watcher waits for
+    /// changes to settle are both read again.
+    #[tokio::test]
+    async fn two_databases_that_change_close_together_are_both_read_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonicalize");
+        let (first, second) = (root.join("first.mmdb"), root.join("second.mmdb"));
+        crate::geo_filter::test_database::write_country_database(&first, "US");
+        crate::geo_filter::test_database::write_country_database(&second, "US");
+        let (geo, _watcher) = watched_geo_filters(&[("first", &first), ("second", &second)]);
+
+        replace_database(&first, "DE");
+        replace_database(&second, "FR");
+        assert!(
+            eventually(|| country_of(&geo, "first").as_deref() == Some("DE")).await,
+            "the first database was not read again"
+        );
+        assert!(
+            eventually(|| country_of(&geo, "second").as_deref() == Some("FR")).await,
+            "the second database was not read again"
+        );
+    }
+
+    /// The name of a database can go through a symbolic link to its
+    /// directory; the files are then reported under the directory's own name.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_database_named_through_a_symlinked_directory_is_read_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (real, link) = (dir.path().join("real"), dir.path().join("link"));
+        std::fs::create_dir(&real).expect("create the directory");
+        std::os::unix::fs::symlink(&real, &link).expect("create the link");
+        crate::geo_filter::test_database::write_country_database(&real.join("country.mmdb"), "US");
+        let database = link.join("country.mmdb");
+        let (geo, watcher) = watched_geo_filters(&[("region", &database)]);
+        assert_eq!(country_of(&geo, "region").as_deref(), Some("US"));
+        assert_eq!(
+            watcher.watched_paths(),
+            std::collections::HashSet::from([database])
+        );
+
+        replace_database(&real.join("country.mmdb"), "DE");
+        assert!(
+            eventually(|| country_of(&geo, "region").as_deref() == Some("DE")).await,
+            "the database in a symlinked directory was not read again"
         );
     }
 

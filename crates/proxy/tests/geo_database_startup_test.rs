@@ -5,6 +5,12 @@
 //! without it. Startup now fails instead, and says which filter and which
 //! file. `zentinel test` and `zentinel validate` open the same databases, so a
 //! configuration that passes them does not stop startup on one.
+//!
+//! An IP2Location file that was cut short opens, as only its header is read
+//! then, and the lookups that read what is missing fail. A file shorter than
+//! the size its header records is now refused, and opening a database includes
+//! a few trial lookups that find other damage in what they read, so such a
+//! file is refused like a missing one.
 
 #![cfg(unix)]
 
@@ -214,4 +220,143 @@ fn validate_fails_for_a_geo_filter_whose_database_is_missing() {
         "`zentinel validate` passed although a geo database is missing; {output}"
     );
     assert_names_both_filters(&output, &databases);
+}
+
+// ---------------------------------------------------------------------------
+// An IP2Location file that was cut short
+// ---------------------------------------------------------------------------
+
+/// An IP2Location DB1 (country only) file with IPv4 rows only: the addresses
+/// below 128.0.0.0 are in `first` and the rest in `second`.
+///
+/// The header is laid out as `ip2location` reads it (`read_header` in
+/// `ip2location-0.6.1/src/ip2location/db.rs`); the country strings come after
+/// the rows.
+fn ip2location_database(first: &str, second: &str) -> Vec<u8> {
+    const HEADER_LEN: usize = 64;
+    const ROWS: [u32; 3] = [0, 0x8000_0000, u32::MAX];
+    let strings = HEADER_LEN + ROWS.len() * 8;
+
+    // A country is its code and its name, each behind its length.
+    let mut country_strings = Vec::new();
+    let mut positions = Vec::new();
+    for code in [first, second] {
+        positions.push(u32::try_from(strings + country_strings.len()).unwrap());
+        let name = format!("Country {code}");
+        country_strings.push(code.len() as u8);
+        country_strings.extend_from_slice(code.as_bytes());
+        country_strings.push(name.len() as u8);
+        country_strings.extend_from_slice(name.as_bytes());
+    }
+
+    let mut file = vec![0u8; HEADER_LEN];
+    for (i, from) in ROWS.iter().enumerate() {
+        file.extend_from_slice(&from.to_le_bytes());
+        file.extend_from_slice(&positions[i.min(1)].to_le_bytes());
+    }
+    file.extend(country_strings);
+
+    file[0] = 1; // database type: DB1
+    file[1] = 2; // columns in a row: the address and the country
+    file[2..5].copy_from_slice(&[24, 1, 1]); // year, month, day
+    file[5..9].copy_from_slice(&2u32.to_le_bytes()); // IPv4 rows
+    file[9..13].copy_from_slice(&(HEADER_LEN as u32 + 1).to_le_bytes()); // 1-based
+    file[29] = 1; // product code: IP2Location
+    let len = u32::try_from(file.len()).unwrap();
+    file[31..35].copy_from_slice(&len.to_le_bytes());
+    file
+}
+
+/// A configuration with one geo filter on `database`, written into `dir`.
+fn write_config_for(dir: &Path, database: &Path) -> PathBuf {
+    let config = dir.join("zentinel.kdl");
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+system {{ worker-threads 1 }}
+listeners {{
+    listener "http" {{
+        address "127.0.0.1:{listener_port}"
+        protocol "http"
+    }}
+}}
+filters {{
+    filter "region" {{
+        type "geo"
+        database-path "{database}"
+        countries "RU"
+    }}
+}}
+routes {{
+    route "default" {{
+        matches {{ path-prefix "/" }}
+        upstream "backend"
+        filters "region"
+    }}
+}}
+upstreams {{
+    upstream "backend" {{
+        target "127.0.0.1:{backend_port}"
+    }}
+}}
+observability {{
+    metrics {{ enabled #false }}
+}}
+"#,
+            database = database.display(),
+            listener_port = free_port(),
+            backend_port = free_port(),
+        ),
+    )
+    .unwrap();
+    config
+}
+
+#[test]
+fn test_passes_for_a_whole_ip2location_file_and_fails_for_one_cut_short() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("country.BIN");
+    let config = write_config_for(dir.path(), &database);
+    let whole = ip2location_database("US", "DE");
+    let run = || run_to_completion(&["test", "-c", config.to_str().unwrap()]);
+
+    std::fs::write(&database, &whole).unwrap();
+    let (success, output) = run();
+    assert!(
+        success,
+        "`zentinel test` failed for a whole IP2Location file; {output}"
+    );
+
+    // One byte short of the size its header records.
+    std::fs::write(&database, &whole[..whole.len() - 1]).unwrap();
+    let (success, output) = run();
+    assert!(
+        !success,
+        "`zentinel test` passed for an IP2Location file that was cut short; {output}"
+    );
+    for expected in ["region", &database.display().to_string(), "cut short"] {
+        assert!(
+            output.contains(expected),
+            "the error does not mention {expected}; {output}"
+        );
+    }
+
+    // Cut short, with the size its header records changed to match: the trial
+    // lookups find that the end of the file is missing.
+    let mut cut = whole[..whole.len() - 1].to_vec();
+    let len = u32::try_from(cut.len()).unwrap();
+    cut[31..35].copy_from_slice(&len.to_le_bytes());
+    std::fs::write(&database, &cut).unwrap();
+    let (success, output) = run();
+    assert!(
+        !success,
+        "`zentinel test` passed for an IP2Location file that fails its trial lookups; {output}"
+    );
+    for expected in ["region", &database.display().to_string(), "trial lookup"] {
+        assert!(
+            output.contains(expected),
+            "the error does not mention {expected}; {output}"
+        );
+    }
 }

@@ -654,6 +654,29 @@ start, and one error lists every geo filter that failed, in the order of their
 ids, with its file and the reason. `zentinel test` and `zentinel validate` open
 the databases the same way.
 
+A database is opened at startup, on a reload, and when its file changes. Each
+time, right after it opens, a few trial lookups are made: three IPv4
+addresses (`0.0.0.0`, `192.0.2.1`, `255.255.255.255`) and, for a database that
+has IPv6 data, two IPv6 addresses (`2001:db8::1`, `3fff::1`). An address that
+is not in the database is fine; any other failure makes the database fail to
+open, and the error names the file and the trial lookup. The trial lookups are
+a sample: they find damage in the part of the file they read, and do not show
+that the whole file can be read.
+
+An IP2Location file that is shorter than the size its header records does not
+open, and the error says that the file is cut short and gives both sizes. The
+IP2Location reader maps a file and reads only its header when it opens it, so
+such a file would open, and the lookups that read the part that is missing
+would fail, each applying the filter's `on-failure` to its request. Files of
+product code 0 (some older ones) and files that record no size are not checked
+for their size.
+
+A database that fails either check is treated like one that does not open:
+startup, `zentinel test` and `zentinel validate` fail, and a reload naming it
+is rejected. When the file of a filter in use changes to one that fails, the
+database in use stays and an error is logged; the file is not tried again
+until it changes.
+
 A configuration reload brings the geo filters up to date with the new
 configuration: a filter it adds is registered, a filter whose settings
 (`database-path` included) change gets a new pool and an empty cache, and a
@@ -677,9 +700,47 @@ for each filter that is added or changed, and a database that is in use is in
 memory twice while the check has it open. An IP2Location database is
 memory-mapped rather than read.
 
-A changed database file is re-read on its own. The files watched for that
-follow a reload: a database a reload adds is watched and one no filter uses
-any more is not.
+A changed database file is re-read on its own. The watcher watches the
+directory each database file is in, not the file itself, and reads a database
+again when a file of its name is created, written to or renamed there. This
+way a file replaced by renaming a new one over it is seen every time, not only
+the first. Databases in one directory share one watch, and a directory is no
+longer watched when no filter uses a database in it. The watches follow a
+reload: a database a reload adds is watched and one no filter uses any more is
+not. A file that is renamed to another name, or removed, is not read: the
+database in use stays. When `database-path` is a symbolic link, the directory
+of the link is the one that is watched, so a change to the file it points to,
+if that is in another directory, is found by the periodic check below, within
+two intervals.
+
+A change is read once it has settled: the watcher waits until 500 ms have
+passed with no further change to any database file, then reads each database
+that changed once. Several databases that change together are all read. Files
+that never stop changing are not waited for for ever: after 10 seconds (20
+times the 500 ms) what has changed so far is read.
+
+The files are also looked at every 5 seconds, whether or not a change was
+reported, in case the watch missed one (the directory itself was replaced, or
+the system has no watches left). The size, modification time and, on Unix,
+device and inode of each file are compared with those of the file the database
+in use was opened from. A file that differs, and has stayed as it is since the
+previous look, is read again. A file read again for a change event is not read
+again by this, and neither is one that failed to load, until it changes. The
+interval is not configurable.
+
+To replace a database file, write the complete new file in the same directory
+and rename it over the old one (`mv new.mmdb GeoLite2-Country.mmdb`). Check the
+new file before it is renamed into place, for example against the checksum its
+provider publishes. The checks made when a database opens catch most files that
+are not completely written, not all of them (the size is checked only for an
+IP2Location file that records it), and do not show that the data is correct:
+renaming a complete, checked file into place is what makes the replacement
+safe. Do not overwrite the file in place: an IP2Location database is
+memory-mapped, so a file that is rewritten while it is in use is read
+half-written, and one that becomes shorter can stop the process (`SIGBUS`)
+when a lookup reads past its new end. A MaxMind database is read into memory
+when it opens, so this does not apply to it, but the rename is still the way to
+replace it.
 
 ### `decompression`
 

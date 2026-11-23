@@ -11,16 +11,22 @@
 //! - Configurable fail-open/fail-closed on lookup errors
 //! - X-GeoIP-Country response header injection
 
-use std::collections::{HashMap, HashSet};
-use std::net::IpAddr;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::ffi::OsString;
+use std::io::Read;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use dashmap::DashMap;
+use notify::event::{ModifyKind, RenameMode};
 use notify::{Event, EventKind, RecursiveMode, Watcher};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use tokio::sync::mpsc;
+use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, trace, warn};
 
 use zentinel_config::{
@@ -68,6 +74,39 @@ pub trait GeoDatabase: Send + Sync {
 }
 
 // =============================================================================
+// Trial lookups
+// =============================================================================
+
+/// The IPv4 addresses looked up in a database as soon as it is open: both
+/// ends of the address space, which the `ip2location` crate's own tests
+/// look up too, and an address of the documentation range between them.
+const TRIAL_IPV4: [Ipv4Addr; 3] = [
+    Ipv4Addr::new(0, 0, 0, 0),
+    Ipv4Addr::new(192, 0, 2, 1),
+    Ipv4Addr::new(255, 255, 255, 255),
+];
+
+/// The IPv6 addresses looked up in a database that has IPv6 data as soon as
+/// it is open: two of the documentation ranges, which are in different
+/// parts of the address space.
+const TRIAL_IPV6: [Ipv6Addr; 2] = [
+    Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1),
+    Ipv6Addr::new(0x3fff, 0, 0, 0, 0, 0, 0, 1),
+];
+
+/// The error for a database whose trial lookup of `ip` failed.
+fn trial_failure(
+    backend: &str,
+    path: &Path,
+    ip: IpAddr,
+    error: impl std::fmt::Display,
+) -> GeoLookupError {
+    GeoLookupError::LoadError(format!(
+        "failed to open {backend} database {path:?}: the trial lookup of {ip} failed: {error}"
+    ))
+}
+
+// =============================================================================
 // MaxMind Database Backend
 // =============================================================================
 
@@ -78,14 +117,32 @@ pub struct MaxMindDatabase {
 
 impl MaxMindDatabase {
     /// Open a MaxMind database file
+    ///
+    /// Looks up the trial addresses before it returns: an address with no
+    /// record is fine, any other failure is an error.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, GeoLookupError> {
         let path = path.as_ref();
         let reader = maxminddb::Reader::open_readfile(path).map_err(|e| {
             GeoLookupError::LoadError(format!("failed to open MaxMind database {:?}: {}", path, e))
         })?;
+        let database = Self { reader };
+        database.trial_lookups(path)?;
 
         debug!(path = ?path, "Opened MaxMind GeoIP database");
-        Ok(Self { reader })
+        Ok(database)
+    }
+
+    /// Look up the trial addresses. A database of IP version 4 is not asked
+    /// about IPv6 addresses, which `maxminddb` refuses in one.
+    fn trial_lookups(&self, path: &Path) -> Result<(), GeoLookupError> {
+        let ipv6 = self.reader.metadata().ip_version != 4;
+        let ipv4 = TRIAL_IPV4.into_iter().map(IpAddr::V4);
+        let ipv6 = TRIAL_IPV6.into_iter().map(IpAddr::V6).filter(|_| ipv6);
+        for ip in ipv4.chain(ipv6) {
+            self.lookup(ip)
+                .map_err(|e| trial_failure("MaxMind", path, ip, e))?;
+        }
+        Ok(())
     }
 }
 
@@ -136,6 +193,19 @@ pub struct Ip2LocationDatabase {
 
 impl Ip2LocationDatabase {
     /// Open an IP2Location database file
+    ///
+    /// The `ip2location` crate maps the file and reads only its header when it
+    /// opens it, so a file that was cut short opens, and the lookups that read
+    /// the part that is missing fail, each applying the filter's `on-failure`
+    /// to its request. Two checks are made here instead:
+    ///
+    /// - A file shorter than the size its header records is refused. Files of
+    ///   product code 0, some older ones, and files that record no size are
+    ///   not checked.
+    /// - The trial addresses are looked up, and a failure other than "no
+    ///   record" is an error. That finds other damage in what the lookups
+    ///   read. The addresses are a sample, spread over the address space, and
+    ///   do not show that the whole file can be read.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, GeoLookupError> {
         let path = path.as_ref();
         let db = ip2location::DB::from_file(path).map_err(|e| {
@@ -145,8 +215,98 @@ impl Ip2LocationDatabase {
             ))
         })?;
 
+        // The header is read again here, by the path, and not from the map. A
+        // file being replaced can be read as the header of the one and the
+        // map of the other; then the next change event, or the periodic
+        // check, reads the database again.
+        let header = Ip2LocationHeader::read(path);
+        if let Ok(header) = &header {
+            if header.is_cut_short() {
+                return Err(GeoLookupError::LoadError(format!(
+                    "failed to open IP2Location database {:?}: the file is cut short: \
+                     it is {} bytes and its header records {} bytes",
+                    path, header.file_size, header.recorded_size
+                )));
+            }
+        }
+        // A header that cannot be read counts as having IPv6 rows, so that
+        // the IPv6 addresses are looked up and a failure stands.
+        let with_ipv6 = match &header {
+            Ok(header) => header.ipv6_rows != 0,
+            Err(_) => true,
+        };
+
+        let database = Self { db };
+        database.trial_lookups(path, with_ipv6)?;
+
         debug!(path = ?path, "Opened IP2Location GeoIP database");
-        Ok(Self { db })
+        Ok(database)
+    }
+
+    /// Look up the trial addresses. The IPv6 ones only when the file has IPv6
+    /// rows: what the crate answers for an IPv6 address in a file without
+    /// them depends on where its header says they would start.
+    fn trial_lookups(&self, path: &Path, with_ipv6: bool) -> Result<(), GeoLookupError> {
+        if !with_ipv6 {
+            debug!(path = ?path, "IP2Location database has no IPv6 rows");
+        }
+        let ipv4 = TRIAL_IPV4.into_iter().map(IpAddr::V4);
+        let ipv6 = TRIAL_IPV6.into_iter().map(IpAddr::V6).filter(|_| with_ipv6);
+        for ip in ipv4.chain(ipv6) {
+            match self.db.ip_lookup(ip) {
+                Ok(_) | Err(ip2location::error::Error::RecordNotFound) => {}
+                Err(e) => return Err(trial_failure("IP2Location", path, ip, e)),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The fields of the header of an IP2Location file that are used here, and
+/// the size of the file. The `ip2location` crate reads the header too, but
+/// does not give these.
+struct Ip2LocationHeader {
+    /// The count of IPv6 rows
+    ipv6_rows: u32,
+    /// 1 for the files of IP2Location, 0 for some older ones
+    product_code: u8,
+    /// The size of the whole file, as the file records it; 0 for none
+    recorded_size: u32,
+    /// The size of the file
+    file_size: u64,
+}
+
+impl Ip2LocationHeader {
+    /// The length of the part of the header that is read.
+    const LEN: usize = 35;
+
+    /// Read the header of the file at `path`, and its size, from one open of
+    /// the file. The offsets are those of `read_header` in the crate (which
+    /// counts from 1): the count of IPv6 rows is the four bytes at 13, the
+    /// product code the byte at 29, and the size the four bytes at 31, in
+    /// little endian.
+    fn read(path: &Path) -> std::io::Result<Self> {
+        let mut file = std::fs::File::open(path)?;
+        let mut header = [0u8; Self::LEN];
+        file.read_exact(&mut header)?;
+        let u32_at = |at: usize| {
+            u32::from_le_bytes([header[at], header[at + 1], header[at + 2], header[at + 3]])
+        };
+        Ok(Self {
+            ipv6_rows: u32_at(13),
+            product_code: header[29],
+            recorded_size: u32_at(31),
+            file_size: file.metadata()?.len(),
+        })
+    }
+
+    /// Whether the file is shorter than its header records. Files of product
+    /// code 0, some older ones, and files that record no size are not
+    /// checked.
+    fn is_cut_short(&self) -> bool {
+        self.product_code == 1
+            && self.recorded_size != 0
+            && self.file_size < u64::from(self.recorded_size)
     }
 }
 
@@ -216,6 +376,50 @@ pub struct GeoFilterResult {
 }
 
 // =============================================================================
+// Database files
+// =============================================================================
+
+/// What a database file looked like at one moment, to tell that it changed:
+/// its size and modification time and, where there are such things, the
+/// device and inode it is on. A file written next to it and renamed over it
+/// differs in the inode, whatever its size and time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl FileStamp {
+    /// The stamp of the file at `path`, following links; none when the file
+    /// cannot be looked at.
+    fn of(path: &Path) -> Option<Self> {
+        let metadata = std::fs::metadata(path).ok()?;
+        Some(Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+        })
+    }
+}
+
+/// What a [`GeoFilterPool`] knows of the file its database is read from.
+struct DatabaseFile {
+    /// The file as it was when its database was last opened, or opened again
+    /// without success. A file that stays as it is does not need opening
+    /// again, whether or not the last time worked.
+    tried: Option<FileStamp>,
+    /// The file as it was at the previous periodic check.
+    seen: Option<FileStamp>,
+}
+
+// =============================================================================
 // GeoFilterPool
 // =============================================================================
 
@@ -240,6 +444,8 @@ pub struct GeoFilterPool {
     database_path: PathBuf,
     /// Database type
     database_type: GeoDatabaseType,
+    /// The database file as the pool last saw it
+    file: Mutex<DatabaseFile>,
 }
 
 impl GeoFilterPool {
@@ -257,6 +463,11 @@ impl GeoFilterPool {
         })?;
 
         let database_path = PathBuf::from(&config.database_path);
+
+        // The file is looked at before it is opened: one replaced in between
+        // then counts as changed since, and is read once more, rather than
+        // not at all.
+        let stamp = FileStamp::of(&database_path);
 
         // Open the database
         let database: Arc<dyn GeoDatabase> = match db_type {
@@ -288,18 +499,39 @@ impl GeoFilterPool {
             cache_ttl,
             database_path,
             database_type: db_type,
+            file: Mutex::new(DatabaseFile {
+                tried: stamp,
+                seen: stamp,
+            }),
         })
     }
 
     /// Reload the database from disk
     ///
     /// This atomically swaps the database and clears the cache.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the new database does not open (see
+    /// [`MaxMindDatabase::open`] and [`Ip2LocationDatabase::open`], which
+    /// look up trial addresses before they succeed). The database in use,
+    /// and its cache, are then left as they are. The file is not tried again
+    /// by [`Self::reload_if_file_changed`] until it changes.
     pub fn reload_database(&self) -> Result<(), GeoLookupError> {
         info!(
             database_path = %self.database_path.display(),
             database_type = ?self.database_type,
             "Reloading geo database"
         );
+
+        // As in `new`, the file is looked at before it is opened. It is
+        // noted whether or not it opens, so that a file that does not open is
+        // not tried again each time the periodic check comes round.
+        let stamp = FileStamp::of(&self.database_path);
+        *self.file.lock() = DatabaseFile {
+            tried: stamp,
+            seen: stamp,
+        };
 
         // Open the new database
         let new_database: Arc<dyn GeoDatabase> = match self.database_type {
@@ -324,6 +556,36 @@ impl GeoFilterPool {
         );
 
         Ok(())
+    }
+
+    /// The periodic check of the database file.
+    ///
+    /// Reloads the database (see [`Self::reload_database`]) when the file
+    /// differs from the one the database in use was opened from, in its size,
+    /// modification time or, on Unix, device and inode, and has not changed
+    /// since the previous call: a file still being written is left until it
+    /// has stayed as it is for a whole interval between two calls. Returns
+    /// the result of the reload, or none when there was none.
+    ///
+    /// A file that was read again for a change event is not read again here,
+    /// and neither is one whose reload failed, until it changes. A file that
+    /// cannot be looked at is left alone.
+    pub fn reload_if_file_changed(&self) -> Option<Result<(), GeoLookupError>> {
+        let now = FileStamp::of(&self.database_path);
+        let due = {
+            let mut file = self.file.lock();
+            let due = now.is_some() && now != file.tried && now == file.seen;
+            file.seen = now;
+            due
+        };
+        if !due {
+            return None;
+        }
+        info!(
+            database_path = %self.database_path.display(),
+            "Geo database file has changed since it was opened"
+        );
+        Some(self.reload_database())
     }
 
     /// Get the database file path
@@ -491,6 +753,10 @@ impl GeoFilterPool {
             cache_ttl,
             database_path,
             database_type,
+            file: Mutex::new(DatabaseFile {
+                tried: None,
+                seen: None,
+            }),
         }
     }
 }
@@ -802,6 +1068,29 @@ impl GeoFilterManager {
             .map(|e| (e.key().clone(), e.value().database_path().to_path_buf()))
             .collect()
     }
+
+    /// The periodic check: reload the database of every filter whose file
+    /// changed and has stayed as it is since the previous call (see
+    /// [`GeoFilterPool::reload_if_file_changed`]).
+    ///
+    /// Returns the filters whose database was read again, in the order of
+    /// their ids, with the result for each. Opens databases, which blocks on
+    /// file reads.
+    pub fn reload_changed_files(&self) -> Vec<(String, Result<(), GeoLookupError>)> {
+        let mut pools: Vec<(String, Arc<GeoFilterPool>)> = self
+            .filter_pools
+            .iter()
+            .map(|e| (e.key().clone(), Arc::clone(e.value())))
+            .collect();
+        pools.sort_by(|(a, _), (b, _)| a.cmp(b));
+        pools
+            .into_iter()
+            .filter_map(|(filter_id, pool)| {
+                pool.reload_if_file_changed()
+                    .map(|result| (filter_id, result))
+            })
+            .collect()
+    }
 }
 
 impl Default for GeoFilterManager {
@@ -814,14 +1103,79 @@ impl Default for GeoFilterManager {
 // GeoDatabaseWatcher
 // =============================================================================
 
+/// The databases the watcher is told about, by the directory they are in and
+/// then their file name. The directory is as the system names it (see
+/// [`watch_target`]); a file maps to the paths the filters give it, which can
+/// be more than one.
+type WatchedDirectories = HashMap<PathBuf, HashMap<OsString, Vec<PathBuf>>>;
+
+/// The directory to watch for the database file at `path`, and the name of
+/// the file in it.
+///
+/// The directory is resolved: through links, and for a path with no directory
+/// to the working directory. The system reports the files that change under
+/// the name it knows their directory by (on macOS `/var` is `/private/var`),
+/// which can differ from the one the configuration uses.
+fn watch_target(path: &Path) -> std::io::Result<(PathBuf, OsString)> {
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the path has no file name",
+        )
+    })?;
+    let directory = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    Ok((std::fs::canonicalize(directory)?, name.to_os_string()))
+}
+
+/// The paths of an event that are a reason to read a database again: a file
+/// that was created or written to, and a file that was renamed to the name it
+/// now has. A file that was renamed to another name, or removed, is not: the
+/// database in use stays until a file is put in its place.
+///
+/// The inotify watcher reports one rename as three events: `Name(From)` for
+/// the old path, `Name(To)` for the new one, and `Name(Both)` for both, the
+/// old path first. The others report `Name(Any)`, for either path.
+fn changed_paths(event: &Event) -> &[PathBuf] {
+    match event.kind {
+        EventKind::Modify(ModifyKind::Name(RenameMode::From)) => &[],
+        EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => match event.paths.last() {
+            Some(new_path) => std::slice::from_ref(new_path),
+            None => &[],
+        },
+        EventKind::Create(_) | EventKind::Modify(_) => &event.paths,
+        _ => &[],
+    }
+}
+
+/// The paths the filters give to the file that an event is about, if it is
+/// one of the databases in a watched directory.
+fn databases_of_event(watched: &WatchedDirectories, event_path: &Path) -> Vec<PathBuf> {
+    let (Some(directory), Some(name)) = (event_path.parent(), event_path.file_name()) else {
+        return Vec::new();
+    };
+    watched
+        .get(directory)
+        .and_then(|files| files.get(name))
+        .cloned()
+        .unwrap_or_default()
+}
+
 /// Watches geo database files for changes and triggers reloads
+///
+/// A database file is not watched itself but the directory it is in: a file
+/// that is replaced by renaming a new one over it is a different file under
+/// the same name, and a watch on the old one ends with it.
 pub struct GeoDatabaseWatcher {
     /// The watcher instance; none while there is no database to watch
     watcher: RwLock<Option<notify::RecommendedWatcher>>,
     /// Mapping from database path to filter IDs using it
     path_to_filters: RwLock<HashMap<PathBuf, Vec<String>>>,
-    /// The paths `watcher` is watching
-    watched: RwLock<HashSet<PathBuf>>,
+    /// The directories `watcher` is watching, and the databases in them.
+    /// Shared with the function `watcher` calls for each event.
+    watched: Arc<RwLock<WatchedDirectories>>,
     /// Where `watcher` reports the paths that changed; set by
     /// [`Self::start_watching`]
     events: RwLock<Option<mpsc::Sender<PathBuf>>>,
@@ -835,7 +1189,7 @@ impl GeoDatabaseWatcher {
         Self {
             watcher: RwLock::new(None),
             path_to_filters: RwLock::new(HashMap::new()),
-            watched: RwLock::new(HashSet::new()),
+            watched: Arc::new(RwLock::new(HashMap::new())),
             events: RwLock::new(None),
             manager,
         }
@@ -843,9 +1197,11 @@ impl GeoDatabaseWatcher {
 
     /// Start watching all registered database files
     ///
-    /// The receiver gets the path of each database file that changed. It
-    /// stays open while there is nothing to watch: a later
-    /// [`Self::sync_watches`] can add databases.
+    /// The receiver gets the path, as the filters name it, of each database
+    /// file that changed: one that was created, written to or renamed, not
+    /// one that was removed. It stays open while there is nothing to watch: a
+    /// later [`Self::sync_watches`] can add databases. [`Self::run`] reads
+    /// the receiver.
     pub fn start_watching(&self) -> Result<mpsc::Receiver<PathBuf>, GeoLookupError> {
         let (tx, rx) = mpsc::channel::<PathBuf>(10);
         *self.events.write() = Some(tx);
@@ -857,12 +1213,13 @@ impl GeoDatabaseWatcher {
         Ok(rx)
     }
 
-    /// Make the watched files the database files of the manager's filters as
-    /// they are now: watch the ones it has gained and stop watching the ones
-    /// it has lost.
+    /// Make the watched directories those of the database files of the
+    /// manager's filters as they are now: watch the ones it has gained and
+    /// stop watching the ones it has lost. Databases in one directory share
+    /// its watch, which ends with the last of them.
     ///
-    /// Does nothing before [`Self::start_watching`]. A file that cannot be
-    /// watched is logged and tried again by the next call.
+    /// Does nothing before [`Self::start_watching`]. A file whose directory
+    /// cannot be watched is logged and tried again by the next call.
     ///
     /// # Errors
     ///
@@ -898,13 +1255,21 @@ impl GeoDatabaseWatcher {
 
         if watcher_slot.is_none() {
             // Create file watcher
+            let watched = Arc::clone(&self.watched);
             let watcher =
                 notify::recommended_watcher(move |event: Result<Event, notify::Error>| {
-                    if let Ok(event) = event {
-                        if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
-                            for path in &event.paths {
-                                let _ = tx.blocking_send(path.clone());
-                            }
+                    let event = match event {
+                        Ok(event) => event,
+                        Err(e) => {
+                            warn!(error = %e, "Geo database file watcher error");
+                            return;
+                        }
+                    };
+                    for path in changed_paths(&event) {
+                        // The lock is not held while sending, which can wait.
+                        let databases = databases_of_event(&watched.read(), path);
+                        for database in databases {
+                            let _ = tx.blocking_send(database);
                         }
                     }
                 })
@@ -917,77 +1282,194 @@ impl GeoDatabaseWatcher {
             return Ok(());
         };
 
-        let mut watched = self.watched.write();
+        // The directories of the databases, and the databases in each
+        let mut wanted: WatchedDirectories = HashMap::new();
+        for path in path_map.keys() {
+            match watch_target(path) {
+                Ok((directory, name)) => {
+                    wanted
+                        .entry(directory)
+                        .or_default()
+                        .entry(name)
+                        .or_default()
+                        .push(path.clone());
+                }
+                Err(e) => warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "Failed to find the directory of a geo database file to watch"
+                ),
+            }
+        }
 
-        // Stop watching the files no filter uses any more
-        let unused: Vec<PathBuf> = watched
-            .iter()
-            .filter(|path| !path_map.contains_key(*path))
+        // The lock on what is watched is not held while the watcher is told
+        // about directories: some watchers (inotify) answer on the thread that
+        // takes that lock for each event.
+        let before = self.watched_paths();
+        let watched_directories: HashSet<PathBuf> = self.watched.read().keys().cloned().collect();
+        let added: Vec<PathBuf> = wanted
+            .keys()
+            .filter(|directory| !watched_directories.contains(*directory))
             .cloned()
             .collect();
-        for path in unused {
-            if let Err(e) = watcher.unwatch(&path) {
-                debug!(path = %path.display(), error = %e, "Failed to stop watching geo database file");
+        let removed: Vec<PathBuf> = watched_directories
+            .iter()
+            .filter(|directory| !wanted.contains_key(*directory))
+            .cloned()
+            .collect();
+
+        // The databases of the new directories are known before the directories
+        // are watched, so that no event of one is dropped for not being. One
+        // that cannot be watched is taken out again below.
+        *self.watched.write() = wanted;
+
+        // Stop watching the directories no filter uses any more
+        for directory in &removed {
+            if let Err(e) = watcher.unwatch(directory) {
+                debug!(
+                    directory = %directory.display(),
+                    error = %e,
+                    "Failed to stop watching geo database directory"
+                );
             }
-            watched.remove(&path);
+        }
+
+        // Watch each directory not watched yet
+        for directory in &added {
+            if let Err(e) = watcher.watch(directory, RecursiveMode::NonRecursive) {
+                warn!(
+                    directory = %directory.display(),
+                    error = %e,
+                    "Failed to watch geo database directory"
+                );
+                self.watched.write().remove(directory);
+            } else {
+                debug!(
+                    directory = %directory.display(),
+                    "Watching geo database directory"
+                );
+            }
+        }
+
+        let after = self.watched_paths();
+        for path in before.difference(&after) {
             info!(
                 path = %path.display(),
                 "Stopped watching geo database"
             );
         }
-
-        // Add watches for each database path not watched yet
-        for path in path_map.keys() {
-            if watched.contains(path) {
-                continue;
-            }
-            if let Err(e) = watcher.watch(path, RecursiveMode::NonRecursive) {
-                warn!(
-                    path = %path.display(),
-                    error = %e,
-                    "Failed to watch geo database file"
-                );
-            } else {
-                watched.insert(path.clone());
-                info!(
-                    path = %path.display(),
-                    "Watching geo database for changes"
-                );
-            }
+        for path in after.difference(&before) {
+            info!(
+                path = %path.display(),
+                "Watching geo database for changes"
+            );
         }
 
         Ok(())
     }
 
-    /// The database files being watched
+    /// The database files being watched, as the filters name them
     pub fn watched_paths(&self) -> HashSet<PathBuf> {
-        self.watched.read().clone()
+        self.watched
+            .read()
+            .values()
+            .flat_map(|files| files.values().flatten())
+            .cloned()
+            .collect()
+    }
+
+    /// The directories being watched, as the system names them
+    #[cfg(test)]
+    pub(crate) fn watched_directories(&self) -> HashSet<PathBuf> {
+        self.watched.read().keys().cloned().collect()
     }
 
     /// Handle a file change event
     pub fn handle_change(&self, path: &Path) {
-        let path_map = self.path_to_filters.read();
-        if let Some(filter_ids) = path_map.get(path) {
+        // The lock is not held while the databases are read, which takes a
+        // while and which `sync_watches` waits for the lock to follow.
+        let filter_ids = self.path_to_filters.read().get(path).cloned();
+        if let Some(filter_ids) = filter_ids {
             info!(
                 path = %path.display(),
                 filters = ?filter_ids,
                 "Geo database file changed, reloading"
             );
 
-            for filter_id in filter_ids {
-                match self.manager.reload_filter(filter_id) {
-                    Ok(()) => {
-                        info!(
-                            filter_id = %filter_id,
-                            "Geo filter database reloaded successfully"
-                        );
+            for filter_id in &filter_ids {
+                log_reload(filter_id, self.manager.reload_filter(filter_id));
+            }
+        }
+    }
+
+    /// Read the databases again as their files change, until `events` ends.
+    ///
+    /// The paths come from [`Self::start_watching`]. One that arrives is
+    /// held until `settle` has gone by with no other arriving, so that a file
+    /// written in steps, or several files changing together, are read when
+    /// they are done. Every path held is then read again, once; none is
+    /// dropped. Files that do not stop changing are not waited for for ever:
+    /// the wait ends at 20 times `settle`, and what changed by then is read.
+    ///
+    /// Every `poll_interval` the files are looked at as well, whether or not
+    /// an event came (see [`GeoFilterManager::reload_changed_files`]): a
+    /// watch can miss a change, as when the directory itself is replaced or
+    /// the system has no more watches to give. The files are read on this
+    /// task, so a slow read holds up the next.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `poll_interval` is zero.
+    pub async fn run(
+        &self,
+        mut events: mpsc::Receiver<PathBuf>,
+        settle: Duration,
+        poll_interval: Duration,
+    ) {
+        let mut poll = tokio::time::interval(poll_interval);
+        poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        // The first tick is immediate, and the files were opened just now.
+        poll.tick().await;
+
+        loop {
+            tokio::select! {
+                first = events.recv() => {
+                    let Some(first) = first else {
+                        return;
+                    };
+                    let mut changed = BTreeSet::from([first]);
+                    // Each path that arrives starts the wait over, but the wait
+                    // as a whole has a limit: files that never stop changing
+                    // are read all the same.
+                    let limit = tokio::time::Instant::now()
+                        + settle.saturating_mul(SETTLE_LIMIT_FACTOR);
+                    loop {
+                        let now = tokio::time::Instant::now();
+                        if now >= limit {
+                            warn!(
+                                changed = changed.len(),
+                                limit_ms = settle.saturating_mul(SETTLE_LIMIT_FACTOR).as_millis() as u64,
+                                "Geo database files did not stop changing, reading what changed so far"
+                            );
+                            break;
+                        }
+                        match tokio::time::timeout_at((now + settle).min(limit), events.recv())
+                            .await
+                        {
+                            Ok(Some(path)) => {
+                                changed.insert(path);
+                            }
+                            // Quiet for `settle`, or no more events.
+                            _ => break,
+                        }
                     }
-                    Err(e) => {
-                        error!(
-                            filter_id = %filter_id,
-                            error = %e,
-                            "Failed to reload geo filter database"
-                        );
+                    for path in &changed {
+                        self.handle_change(path);
+                    }
+                }
+                _ = poll.tick() => {
+                    for (filter_id, result) in self.manager.reload_changed_files() {
+                        log_reload(&filter_id, result);
                     }
                 }
             }
@@ -1000,6 +1482,29 @@ impl GeoDatabaseWatcher {
         *self.watcher.write() = None;
         self.watched.write().clear();
         info!("Stopped watching geo database files");
+    }
+}
+
+/// How many times `settle` [`GeoDatabaseWatcher::run`] waits at most for the
+/// changes to a database to settle.
+const SETTLE_LIMIT_FACTOR: u32 = 20;
+
+/// Log how the reload of a filter's database went.
+fn log_reload(filter_id: &str, result: Result<(), GeoLookupError>) {
+    match result {
+        Ok(()) => {
+            info!(
+                filter_id = %filter_id,
+                "Geo filter database reloaded successfully"
+            );
+        }
+        Err(e) => {
+            error!(
+                filter_id = %filter_id,
+                error = %e,
+                "Failed to reload geo filter database; the database in use stays"
+            );
+        }
     }
 }
 
@@ -1064,10 +1569,27 @@ pub(crate) mod test_database {
     /// Its search tree is one node whose two records both point at the one
     /// record of the data section.
     pub(crate) fn write_country_database(path: &Path, country: &str) {
+        std::fs::write(path, country_database(country, 4, 0)).expect("write the test database");
+    }
+
+    /// As [`write_country_database`], for a database of IP version 6, which
+    /// says every address, of either version, is in `country`.
+    pub(crate) fn write_country_database_v6(path: &Path, country: &str) {
+        std::fs::write(path, country_database(country, 6, 0)).expect("write the test database");
+    }
+
+    /// As [`write_country_database`], but the records of the search tree
+    /// point far beyond the end of the data section, so a lookup of any
+    /// address fails.
+    pub(crate) fn write_dangling_database(path: &Path) {
+        std::fs::write(path, country_database("US", 4, 1000)).expect("write the test database");
+    }
+
+    fn country_database(country: &str, ip_version: u16, record_offset: u32) -> Vec<u8> {
         const NODE_COUNT: u32 = 1;
         // A record past the node count points into the data section, after
         // the 16 bytes that separate the two.
-        let record = (NODE_COUNT + 16).to_be_bytes();
+        let record = (NODE_COUNT + 16 + record_offset).to_be_bytes();
 
         let mut file = Vec::new();
         file.extend_from_slice(&record[1..]);
@@ -1081,12 +1603,88 @@ pub(crate) mod test_database {
             ("build_epoch", uint64(1_700_000_000)),
             ("database_type", string("Test-Country")),
             ("description", map(&[])),
-            ("ip_version", uint16(4)),
+            ("ip_version", uint16(ip_version)),
             ("languages", array(&[string("en")])),
             ("node_count", uint32(NODE_COUNT)),
             ("record_size", uint16(24)),
         ]));
-        std::fs::write(path, file).expect("write the test database");
+        file
+    }
+
+    /// An IP2Location DB1 (country only) file, as bytes.
+    ///
+    /// The IPv4 addresses are in three ranges, from 0.0.0.0, 64.0.0.0 and
+    /// 128.0.0.0, which `countries` names in turn. With `ipv6`, there is an
+    /// IPv6 table too: `::` to `2fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff` is in
+    /// the first country and the rest in the last. Without it, the header says
+    /// there are no IPv6 rows and where they would start is 0.
+    ///
+    /// The layout is the header, the IPv4 rows, the IPv6 rows and then the
+    /// country strings, so the last byte of the file is the end of the name of
+    /// the last country. The reader finds a row from its 1-based address in
+    /// the header, and a country from the position of its string in the file;
+    /// see `ip2location-0.6.1/src/ip2location/db.rs` (`read_header`,
+    /// `ipv4_lookup`, `ipv6_lookup`, `read_record`).
+    pub(crate) fn ip2location_country_database(countries: [&str; 3], ipv6: bool) -> Vec<u8> {
+        const HEADER_LEN: usize = 64;
+        // Each range starts at the address given here, and the last row only
+        // ends the one before it.
+        const IPV4_ROWS: [u32; 4] = [0, 0x4000_0000, 0x8000_0000, u32::MAX];
+        const IPV6_ROWS: [u128; 3] = [0, 0x3000 << 112, u128::MAX];
+        // A row is the address its range starts at, then the position of the
+        // string of its country (IPv4: 4 + 4 bytes; IPv6: 16 + 4 bytes).
+        const IPV4_ROW_LEN: usize = 8;
+        const IPV6_ROW_LEN: usize = 20;
+
+        let ipv4_table = HEADER_LEN;
+        let ipv6_table = ipv4_table + IPV4_ROWS.len() * IPV4_ROW_LEN;
+        let strings = if ipv6 {
+            ipv6_table + IPV6_ROWS.len() * IPV6_ROW_LEN
+        } else {
+            ipv6_table
+        };
+
+        // A country is its code and its name, each behind its length.
+        let mut country_strings = Vec::new();
+        let mut positions = [0u32; 3];
+        for (position, code) in positions.iter_mut().zip(countries) {
+            *position = u32::try_from(strings + country_strings.len()).expect("small file");
+            let name = format!("Country {code}");
+            country_strings.push(code.len() as u8);
+            country_strings.extend_from_slice(code.as_bytes());
+            country_strings.push(name.len() as u8);
+            country_strings.extend_from_slice(name.as_bytes());
+        }
+
+        let mut file = vec![0u8; HEADER_LEN];
+        for (i, from) in IPV4_ROWS.iter().enumerate() {
+            file.extend_from_slice(&from.to_le_bytes());
+            file.extend_from_slice(&positions[i.min(2)].to_le_bytes());
+        }
+        if ipv6 {
+            for (from, country) in IPV6_ROWS.iter().zip([0, 2, 2]) {
+                // The reader takes an address from its bytes in reverse.
+                file.extend_from_slice(&from.to_le_bytes());
+                file.extend_from_slice(&positions[country].to_le_bytes());
+            }
+        }
+        file.extend(country_strings);
+
+        let one_based = |at: usize| u32::try_from(at + 1).expect("small file").to_le_bytes();
+        file[0] = 1; // database type: DB1
+        file[1] = 2; // columns in a row: the address and the country
+        file[2..5].copy_from_slice(&[24, 1, 1]); // year, month, day
+        file[5..9].copy_from_slice(&3u32.to_le_bytes()); // IPv4 rows
+        file[9..13].copy_from_slice(&one_based(ipv4_table));
+        if ipv6 {
+            file[13..17].copy_from_slice(&2u32.to_le_bytes()); // IPv6 rows
+            file[17..21].copy_from_slice(&one_based(ipv6_table));
+        }
+        // No index tables: bytes 21..29 stay 0.
+        file[29] = 1; // product code: IP2Location
+        let len = u32::try_from(file.len()).expect("small file");
+        file[31..35].copy_from_slice(&len.to_le_bytes());
+        file
     }
 }
 
@@ -2022,5 +2620,498 @@ mod tests {
         let watcher = GeoDatabaseWatcher::new(manager);
         watcher.sync_watches().expect("nothing to do");
         assert!(watcher.watched_paths().is_empty());
+    }
+
+    #[test]
+    fn databases_in_one_directory_share_a_watch_that_ends_with_the_last_of_them() {
+        let (one, two) = (
+            tempfile::tempdir().expect("tempdir"),
+            tempfile::tempdir().expect("tempdir"),
+        );
+        let path = |dir: &tempfile::TempDir, name: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, b"database").expect("write database");
+            path
+        };
+        let (a, b, c) = (
+            path(&one, "a.mmdb"),
+            path(&one, "b.mmdb"),
+            path(&two, "c.mmdb"),
+        );
+        let directory = |dir: &tempfile::TempDir| std::fs::canonicalize(dir.path()).unwrap();
+        let filter =
+            |id: &str, path: &Path| geo_blocking(id, &path.display().to_string(), r#""RU""#);
+        let opener = Opener::new();
+
+        let manager = Arc::new(GeoFilterManager::new());
+        let watcher = GeoDatabaseWatcher::new(Arc::clone(&manager));
+        let _events = watcher.start_watching().expect("start watching");
+        let apply = |filters: &[String]| {
+            let plan = manager
+                .prepare_with(&filters_config(filters), |c| opener.open(c))
+                .expect("the databases open");
+            manager.apply(&plan);
+            manager.remove_unlisted(&plan);
+            watcher.sync_watches().expect("sync the watches");
+        };
+
+        apply(&[filter("a", &a), filter("b", &b), filter("c", &c)]);
+        assert_eq!(
+            watcher.watched_directories(),
+            HashSet::from([directory(&one), directory(&two)]),
+            "three files in two directories take two watches"
+        );
+        assert_eq!(
+            watcher.watched_paths(),
+            HashSet::from([a.clone(), b.clone(), c.clone()])
+        );
+
+        apply(&[filter("c", &c)]);
+        assert_eq!(
+            watcher.watched_directories(),
+            HashSet::from([directory(&two)])
+        );
+
+        apply(&[filter("a", &a)]);
+        assert_eq!(
+            watcher.watched_directories(),
+            HashSet::from([directory(&one)])
+        );
+        assert_eq!(watcher.watched_paths(), HashSet::from([a]));
+    }
+
+    #[test]
+    fn an_event_is_matched_to_a_database_by_directory_and_file_name() {
+        let mut watched = WatchedDirectories::new();
+        watched
+            .entry(PathBuf::from("/geo"))
+            .or_default()
+            .entry(OsString::from("a.mmdb"))
+            .or_default()
+            .push(PathBuf::from("/geo/../geo/a.mmdb"));
+
+        assert_eq!(
+            databases_of_event(&watched, Path::new("/geo/a.mmdb")),
+            [PathBuf::from("/geo/../geo/a.mmdb")],
+            "the path is the one the filter gave"
+        );
+        assert!(databases_of_event(&watched, Path::new("/geo/b.mmdb")).is_empty());
+        assert!(databases_of_event(&watched, Path::new("/other/a.mmdb")).is_empty());
+        assert!(databases_of_event(&watched, Path::new("/")).is_empty());
+    }
+
+    #[test]
+    fn the_paths_of_an_event_that_are_read_again_are_those_of_files_created_or_changed() {
+        use notify::event::{AccessKind, CreateKind, DataChange, MetadataKind, RemoveKind};
+
+        let (old, new) = (
+            PathBuf::from("/geo/a.mmdb.old"),
+            PathBuf::from("/geo/a.mmdb"),
+        );
+        let event = |kind: EventKind, paths: &[&PathBuf]| {
+            paths.iter().fold(Event::new(kind), |event, path| {
+                event.add_path((*path).clone())
+            })
+        };
+        let read = |event: &Event| changed_paths(event).to_vec();
+
+        // Created or written to.
+        for kind in [
+            EventKind::Create(CreateKind::File),
+            EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)),
+        ] {
+            assert_eq!(
+                read(&event(kind, &[&new])),
+                std::slice::from_ref(&new),
+                "{kind:?}"
+            );
+        }
+
+        // One rename, as the inotify watcher reports it.
+        let from = event(
+            EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+            &[&new],
+        );
+        assert!(read(&from).is_empty(), "the old name is not read");
+        let to = event(EventKind::Modify(ModifyKind::Name(RenameMode::To)), &[&new]);
+        assert_eq!(read(&to), std::slice::from_ref(&new), "the new name is");
+        let both = event(
+            EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+            &[&old, &new],
+        );
+        assert_eq!(
+            read(&both),
+            std::slice::from_ref(&new),
+            "only the new name of both"
+        );
+
+        // As the macOS watcher reports a rename: for either path.
+        let any = event(
+            EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+            &[&new],
+        );
+        assert_eq!(read(&any), std::slice::from_ref(&new));
+
+        // Removed, or only looked at.
+        for kind in [
+            EventKind::Remove(RemoveKind::File),
+            EventKind::Access(AccessKind::Any),
+            EventKind::Any,
+        ] {
+            assert!(read(&event(kind, &[&new])).is_empty(), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn a_database_named_without_a_directory_is_looked_for_in_the_working_directory() {
+        // The tests run in the crate's directory.
+        let (directory, name) = watch_target(Path::new("Cargo.toml")).expect("a target");
+        assert_eq!(directory, std::fs::canonicalize(".").unwrap());
+        assert_eq!(name, std::ffi::OsString::from("Cargo.toml"));
+    }
+
+    // =========================================================================
+    // Databases that are opened from real files
+    // =========================================================================
+
+    fn bin(countries: [&str; 3], ipv6: bool) -> Vec<u8> {
+        test_database::ip2location_country_database(countries, ipv6)
+    }
+
+    fn country_of(database: &dyn GeoDatabase, ip: &str) -> Option<String> {
+        database
+            .lookup(ip.parse().unwrap())
+            .unwrap_or_else(|e| panic!("{ip}: {e}"))
+    }
+
+    #[test]
+    fn an_ip2location_file_opens_and_names_the_country_of_each_range() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("country.BIN");
+        for ipv6 in [false, true] {
+            std::fs::write(&path, bin(["US", "DE", "FR"], ipv6)).unwrap();
+            let database = Ip2LocationDatabase::open(&path).expect("a whole file opens");
+
+            assert_eq!(country_of(&database, "0.0.0.0").as_deref(), Some("US"));
+            assert_eq!(country_of(&database, "64.0.0.1").as_deref(), Some("DE"));
+            assert_eq!(country_of(&database, "192.0.2.1").as_deref(), Some("FR"));
+            if ipv6 {
+                assert_eq!(country_of(&database, "2001:db8::1").as_deref(), Some("US"));
+                assert_eq!(country_of(&database, "3fff::1").as_deref(), Some("FR"));
+            }
+        }
+    }
+
+    #[test]
+    fn an_ip2location_file_that_is_cut_short_does_not_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("country.BIN");
+        for ipv6 in [false, true] {
+            let whole = bin(["US", "DE", "FR"], ipv6);
+            for len in 0..whole.len() {
+                std::fs::write(&path, &whole[..len]).unwrap();
+                assert!(
+                    Ip2LocationDatabase::open(&path).is_err(),
+                    "the first {len} of {} bytes of a file (IPv6 rows: {ipv6}) opened",
+                    whole.len()
+                );
+            }
+        }
+    }
+
+    /// `file` with the size its header records, and the product code, set.
+    fn with_header(mut file: Vec<u8>, product_code: u8, recorded_size: usize) -> Vec<u8> {
+        file[29] = product_code;
+        file[31..35].copy_from_slice(&u32::try_from(recorded_size).unwrap().to_le_bytes());
+        file
+    }
+
+    #[test]
+    fn an_ip2location_file_shorter_than_its_header_records_does_not_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("country.BIN");
+        let whole = bin(["US", "DE", "FR"], true);
+        // Every lookup the trial makes would succeed: only the size says that
+        // the file is not whole.
+        std::fs::write(&path, with_header(whole.clone(), 1, whole.len() + 7)).unwrap();
+
+        let message = match Ip2LocationDatabase::open(&path) {
+            Ok(_) => panic!("a file shorter than its header says opened"),
+            Err(e) => e.to_string(),
+        };
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(message.contains("cut short"), "{message}");
+        assert!(message.contains(&whole.len().to_string()), "{message}");
+        assert!(
+            message.contains(&(whole.len() + 7).to_string()),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn the_recorded_size_is_not_checked_for_the_legacy_product_code_or_a_record_of_zero() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("country.BIN");
+        let whole = bin(["US", "DE", "FR"], true);
+
+        std::fs::write(&path, with_header(whole.clone(), 0, whole.len() + 7)).unwrap();
+        Ip2LocationDatabase::open(&path).expect("product code 0 is not checked");
+
+        std::fs::write(&path, with_header(whole.clone(), 1, 0)).unwrap();
+        Ip2LocationDatabase::open(&path).expect("a size of 0 is not checked");
+
+        // A file longer than its header says is not cut short.
+        std::fs::write(&path, with_header(whole.clone(), 1, whole.len() - 1)).unwrap();
+        Ip2LocationDatabase::open(&path).expect("a longer file is not checked");
+    }
+
+    #[test]
+    fn a_cut_short_ip2location_file_whose_size_record_matches_fails_the_trial_lookups() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("country.BIN");
+        for ipv6 in [false, true] {
+            let whole = bin(["US", "DE", "FR"], ipv6);
+            // From the end of the header, where the file can be mapped.
+            for len in 35..whole.len() {
+                std::fs::write(&path, with_header(whole[..len].to_vec(), 1, len)).unwrap();
+                let message = match Ip2LocationDatabase::open(&path) {
+                    Ok(_) => panic!(
+                        "the first {len} of {} bytes of a file (IPv6 rows: {ipv6}) opened",
+                        whole.len()
+                    ),
+                    Err(e) => e.to_string(),
+                };
+                assert!(message.contains(&path.display().to_string()), "{message}");
+                assert!(message.contains("trial lookup"), "{message}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_maxmind_database_of_ip_version_6_opens_and_answers_for_both_versions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("country.mmdb");
+        test_database::write_country_database_v6(&path, "US");
+
+        let database = MaxMindDatabase::open(&path).expect("the database opens");
+        assert_eq!(country_of(&database, "2001:db8::1").as_deref(), Some("US"));
+        assert_eq!(country_of(&database, "192.0.2.1").as_deref(), Some("US"));
+    }
+
+    #[test]
+    fn a_maxmind_database_whose_records_point_outside_its_data_does_not_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("country.mmdb");
+        test_database::write_dangling_database(&path);
+
+        let message = match MaxMindDatabase::open(&path) {
+            Ok(_) => panic!("a database whose records point outside its data opened"),
+            Err(e) => e.to_string(),
+        };
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(message.contains("trial lookup"), "{message}");
+    }
+
+    // =========================================================================
+    // Files that change
+    // =========================================================================
+
+    /// A manager with one geo filter, `region`, on the database at `path`.
+    fn region_manager(path: &Path) -> Arc<GeoFilterManager> {
+        let config = filters_config(&[geo_blocking(
+            "region",
+            &path.display().to_string(),
+            r#""RU""#,
+        )]);
+        Arc::new(GeoFilterManager::from_config(&config).expect("the database opens"))
+    }
+
+    /// The country the filter `region` finds for an address in the third
+    /// range of a database from [`bin`].
+    fn region_country(manager: &GeoFilterManager) -> Option<String> {
+        manager
+            .check("region", "192.0.2.1")
+            .expect("the filter is registered")
+            .country_code
+    }
+
+    /// Replace the file as an update tool does: write the new one next to it,
+    /// then rename it over the old one.
+    fn replace_file(path: &Path, contents: &[u8]) {
+        let next = path.with_file_name("next.tmp");
+        std::fs::write(&next, contents).expect("write the new file");
+        std::fs::rename(&next, path).expect("rename over the old file");
+    }
+
+    async fn eventually(check: impl Fn() -> bool) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline {
+            if check() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        check()
+    }
+
+    #[test]
+    fn the_periodic_check_reloads_a_file_that_changed_and_has_stayed_as_it_is() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("country.BIN");
+        std::fs::write(&path, bin(["AA", "BB", "US"], false)).unwrap();
+        let manager = region_manager(&path);
+        assert_eq!(region_country(&manager).as_deref(), Some("US"));
+        assert!(manager.reload_changed_files().is_empty(), "nothing changed");
+
+        replace_file(&path, &bin(["AA", "BB", "DE"], false));
+        assert!(
+            manager.reload_changed_files().is_empty(),
+            "a change is not read until the file has stayed as it is for a check"
+        );
+        let reloaded = manager.reload_changed_files();
+        assert_eq!(reloaded.len(), 1, "the file stayed as it is: {reloaded:?}");
+        assert_eq!(reloaded[0].0, "region");
+        assert!(reloaded[0].1.is_ok(), "{reloaded:?}");
+        assert_eq!(region_country(&manager).as_deref(), Some("DE"));
+
+        assert!(
+            manager.reload_changed_files().is_empty(),
+            "the file has not changed since it was read"
+        );
+    }
+
+    #[test]
+    fn a_file_read_again_for_an_event_is_not_read_again_by_the_periodic_check() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("country.BIN");
+        std::fs::write(&path, bin(["AA", "BB", "US"], false)).unwrap();
+        let manager = region_manager(&path);
+
+        replace_file(&path, &bin(["AA", "BB", "DE"], false));
+        manager.reload_filter("region").expect("what an event does");
+        assert_eq!(region_country(&manager).as_deref(), Some("DE"));
+
+        for _ in 0..3 {
+            assert!(manager.reload_changed_files().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_file_that_fails_the_trial_lookup_is_not_tried_again_until_it_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("country.BIN");
+        std::fs::write(&path, bin(["AA", "BB", "US"], true)).unwrap();
+        let manager = region_manager(&path);
+
+        // A file cut short replaces it. Its header records the size it has,
+        // so that it is the trial lookups that fail.
+        let whole = bin(["AA", "BB", "DE"], true);
+        let half = whole.len() / 2;
+        replace_file(&path, &with_header(whole[..half].to_vec(), 1, half));
+        assert!(manager.reload_changed_files().is_empty());
+        let tried = manager.reload_changed_files();
+        assert_eq!(tried.len(), 1, "{tried:?}");
+        let message = match &tried[0].1 {
+            Ok(()) => panic!("a file cut in half was read"),
+            Err(e) => e.to_string(),
+        };
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(message.contains("trial lookup"), "{message}");
+        assert_eq!(
+            region_country(&manager).as_deref(),
+            Some("US"),
+            "the database in use stays"
+        );
+
+        for _ in 0..3 {
+            assert!(
+                manager.reload_changed_files().is_empty(),
+                "a file that failed is not tried again while it stays as it is"
+            );
+        }
+
+        // A whole file replaces it: that is a change.
+        replace_file(&path, &bin(["AA", "BB", "FR"], true));
+        assert!(manager.reload_changed_files().is_empty());
+        let tried = manager.reload_changed_files();
+        assert_eq!(tried.len(), 1, "{tried:?}");
+        assert!(tried[0].1.is_ok(), "{tried:?}");
+        assert_eq!(region_country(&manager).as_deref(), Some("FR"));
+    }
+
+    #[tokio::test]
+    async fn files_that_never_stop_changing_are_read_at_the_limit_of_the_wait() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("country.BIN");
+        std::fs::write(&path, bin(["AA", "BB", "US"], false)).unwrap();
+        let manager = region_manager(&path);
+        let watcher = Arc::new(GeoDatabaseWatcher::new(Arc::clone(&manager)));
+        let events = watcher.start_watching().expect("start watching");
+        let sender = watcher.events.read().clone().expect("watching has started");
+        let task = tokio::spawn({
+            let watcher = Arc::clone(&watcher);
+            async move {
+                watcher
+                    .run(events, Duration::from_millis(20), Duration::from_secs(3600))
+                    .await
+            }
+        });
+
+        // A change is reported again every 5 ms, which is less than `settle`:
+        // it never settles. The wait is over 20 times `settle` after it began.
+        let reported = tokio::spawn({
+            let path = path.clone();
+            async move {
+                while sender.send(path.clone()).await.is_ok() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+        });
+        replace_file(&path, &bin(["AA", "BB", "DE"], false));
+        assert!(
+            eventually(|| region_country(&manager).as_deref() == Some("DE")).await,
+            "changes that never settled were not read"
+        );
+
+        reported.abort();
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn the_watcher_checks_the_files_on_its_own_when_no_event_comes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("country.BIN");
+        std::fs::write(&path, bin(["AA", "BB", "US"], false)).unwrap();
+        let manager = region_manager(&path);
+        assert_eq!(region_country(&manager).as_deref(), Some("US"));
+
+        // Nothing is watched, so no event comes.
+        let (events, receiver) = mpsc::channel(10);
+        let watcher = Arc::new(GeoDatabaseWatcher::new(Arc::clone(&manager)));
+        let task = tokio::spawn({
+            let watcher = Arc::clone(&watcher);
+            async move {
+                watcher
+                    .run(
+                        receiver,
+                        Duration::from_millis(50),
+                        Duration::from_millis(20),
+                    )
+                    .await
+            }
+        });
+
+        replace_file(&path, &bin(["AA", "BB", "DE"], false));
+        assert!(
+            eventually(|| region_country(&manager).as_deref() == Some("DE")).await,
+            "the replaced file was not read by the periodic check"
+        );
+
+        drop(events);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the watcher stops when its events end")
+            .expect("the watcher does not panic");
     }
 }
