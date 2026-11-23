@@ -658,7 +658,6 @@ routes {
         }
         upstream "backend"
         filters "waf"
-        waf-enabled #true
     }
 }
 ```

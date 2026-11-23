@@ -1289,3 +1289,120 @@ listeners { listener "l" { address "127.0.0.1:8080" } }
     let config = load(kdl).expect("a repeated system block loads");
     assert_eq!(config.server.worker_threads, 3);
 }
+
+// ---------------------------------------------------------------------------
+// Settings that are read and not applied
+//
+// `kdl::unapplied` reports these, one message per node written. Each one is
+// still read once, so writing it twice is an error and not two messages.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_cache_block_with_two_vary_headers_nodes_is_an_error() {
+    assert_duplicate(
+        Ctx::RouteCache,
+        r#"vary-headers "Accept""#,
+        r#"vary-headers "Origin""#,
+        "vary-headers",
+    );
+}
+
+#[test]
+fn a_cache_block_with_two_ignore_query_params_nodes_is_an_error() {
+    assert_duplicate(
+        Ctx::RouteCache,
+        r#"ignore-query-params "a""#,
+        r#"ignore-query-params "b""#,
+        "ignore-query-params",
+    );
+}
+
+#[test]
+fn an_inference_block_with_two_model_header_nodes_is_an_error() {
+    assert_duplicate(
+        Ctx::Inference,
+        r#"model-header "x-a""#,
+        r#"model-header "x-b""#,
+        "model-header",
+    );
+}
+
+#[test]
+fn an_inference_block_with_two_routing_blocks_is_an_error() {
+    assert_duplicate(
+        Ctx::Inference,
+        r#"routing { strategy "round-robin" }"#,
+        r#"routing { strategy "least-tokens-queued" }"#,
+        "routing",
+    );
+}
+
+#[test]
+fn an_upstream_tls_block_with_two_ca_cert_nodes_is_an_error() {
+    assert_duplicate_within(
+        Ctx::Upstream,
+        "tls {\nca-cert \"/a.pem\"\nca-cert \"/b.pem\"\n}",
+        "tls {\nca-cert \"/a.pem\"\n}",
+        "ca-cert",
+    );
+}
+
+#[test]
+fn a_connection_pool_with_two_max_idle_nodes_is_an_error() {
+    assert_duplicate_within(
+        Ctx::Upstream,
+        "connection-pool {\nmax-idle 10\nmax-idle 20\n}",
+        "connection-pool {\nmax-idle 10\n}",
+        "max-idle",
+    );
+}
+
+#[test]
+fn a_connection_pool_with_two_max_lifetime_secs_nodes_is_an_error() {
+    assert_duplicate_within(
+        Ctx::Upstream,
+        "connection-pool {\nmax-lifetime-secs 60\nmax-lifetime-secs 120\n}",
+        "connection-pool {\nmax-lifetime-secs 60\n}",
+        "max-lifetime-secs",
+    );
+}
+
+#[test]
+fn a_listener_with_two_max_concurrent_streams_nodes_is_an_error() {
+    assert_duplicate(
+        Ctx::Listener,
+        "max-concurrent-streams 100",
+        "max-concurrent-streams 200",
+        "max-concurrent-streams",
+    );
+}
+
+#[test]
+fn a_logging_block_with_two_level_nodes_is_an_error() {
+    assert_duplicate_within(
+        Ctx::Observability,
+        "logging {\nlevel \"info\"\nlevel \"debug\"\n}",
+        "logging {\nlevel \"info\"\n}",
+        "level",
+    );
+}
+
+#[test]
+fn a_logging_block_with_two_format_nodes_is_an_error() {
+    assert_duplicate_within(
+        Ctx::Observability,
+        "logging {\nformat \"json\"\nformat \"pretty\"\n}",
+        "logging {\nformat \"json\"\n}",
+        "format",
+    );
+}
+
+#[test]
+fn a_body_inspection_block_with_two_inspect_response_body_nodes_is_an_error() {
+    assert_duplicate_within(
+        Ctx::Waf,
+        "body-inspection {\ninspect-response-body #true\ninspect-response-body #false\n}",
+        "body-inspection {\ninspect-response-body #true\n}",
+        "inspect-response-body",
+    );
+}

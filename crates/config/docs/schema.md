@@ -16,6 +16,7 @@ Complete reference for all Zentinel configuration options.
 - [Observability](#observability)
 - [Limits](#limits)
 - [Cache](#cache)
+- [Accepted but not applied](#accepted-but-not-applied)
 
 ---
 
@@ -26,7 +27,7 @@ Global server configuration.
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
 | `worker-threads` | `u32` | `0` | Number of worker threads (0 = auto-detect CPU cores) |
-| `max-connections` | `u32` | `10000` | Maximum total connections |
+| `max-connections` | `u32` | `10000` | Not applied ([details](#accepted-but-not-applied)). Client connections are not limited |
 | `graceful-shutdown-timeout-secs` | `u64` | `30` | On SIGTERM/SIGINT, how long to wait for open connections to close before exiting (seconds). The process exits earlier once none are left. A second SIGTERM/SIGINT while it waits ends the process at once |
 | `daemon` | `bool` | `false` | Run as daemon, as with `-d`. The configuration is checked before the fork, so a broken one fails in the foreground |
 | `pid-file` | `string` | `/tmp/pingora.pid` | Path to the PID file a daemon writes (an existing one is renamed to `<pid-file>.old`) |
@@ -60,7 +61,7 @@ Port binding configuration.
 | `default-route` | `string` | - | Default route if no match |
 | `request-timeout-secs` | `u64` | `60` | Request timeout |
 | `keepalive-timeout-secs` | `u64` | `75` | Keep-alive timeout |
-| `max-concurrent-streams` | `u32` | `100` | Max concurrent HTTP/2 streams |
+| `max-concurrent-streams` | `u32` | `100` | Not applied ([details](#accepted-but-not-applied)). The listener's HTTP/2 stream limit is not set from it |
 
 ### TlsConfig
 
@@ -172,9 +173,10 @@ Request routing configuration.
 | `upstream` | `string` | - | Target upstream ID |
 | `service-type` | `string` | `"web"` | Service type |
 | `policies` | `RoutePolicies` | `{}` | Route policies |
+| `cache` | `RouteCacheConfig` | - | HTTP caching config (see [Cache](#routecacheconfig)) |
 | `filters` | `[string]` | `[]` | Filter IDs to apply |
 | `builtin-handler` | `string` | - | Built-in handler (for `builtin` service type) |
-| `waf-enabled` | `bool` | `false` | Enable WAF for this route |
+| `waf-enabled` | `bool` | `false` | Not applied ([details](#accepted-but-not-applied)). It does not change how requests are handled; a route's traffic is inspected by the agents its `filters` list |
 | `circuit-breaker` | `CircuitBreakerConfig` | - | Circuit breaker settings |
 | `retry-policy` | `RetryPolicy` | - | Retry policy |
 | `static-files` | `StaticFileConfig` | - | Static file config (for `static` type) |
@@ -185,7 +187,7 @@ Request routing configuration.
 | `websocket-inspection` | `bool` | `false` | Inspect WebSocket frames. No WebSocket extension (such as `permessage-deflate`) is negotiated on the route, and a frame that cannot be decoded closes the connection. See [WebSocket inspection](../../proxy/docs/websocket.md) |
 | `websocket-max-frame-size` | `bytes` | `1MB` | Largest WebSocket frame payload the route's inspection decodes, as a byte count or a size such as `"4MB"`. Between 1 byte and 16MB. A larger frame closes the connection with status 1009. A frame too large for an agent's transport to carry in one message fails the call to the agent and follows its filter's `failure-mode`. Only used with `websocket-inspection`, and `zentinel lint` warns when it is set without |
 | `shadow` | `ShadowConfig` | - | Traffic mirroring config |
-| `fallback` | `FallbackConfig` | - | Fallback routing config |
+| `fallback` | `FallbackConfig` | - | Fallback routing config. A block of the route itself, beside `inference`; inside `inference` it is not read |
 
 ### RetryPolicy
 
@@ -299,11 +301,12 @@ not put `filters` on a route that is probed for health. A route with no
 | `max-body-size` | `string` | - | Body size limit (e.g., `"10MB"`) |
 | `rate-limit` | `RateLimitPolicy` | - | Rate limit policy |
 | `failure-mode` | `string` | `"closed"` | Failure mode: `open` or `closed`. Also decides what a request gets when the route lists a filter the active configuration does not define, which only happens while a reload or rollback is being applied: `closed` answers 503, `open` continues with the filters that are defined |
-| `cache` | `RouteCacheConfig` | - | HTTP caching config (see [Cache](#routecacheconfig)) |
+| `cache` | `RouteCacheConfig` | - | Not read inside `policies`: a route's cache is the route's own `cache` block, beside `policies` (see [RouteCacheConfig](#routecacheconfig)) |
 
 ### RouteCacheConfig
 
-Per-route cache configuration, nested under `policies.cache`.
+Per-route cache configuration, written as a `cache` block in the route itself,
+beside `policies`. A `cache` block inside `policies` is not read.
 
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
@@ -314,12 +317,14 @@ Per-route cache configuration, nested under `policies.cache`.
 | `cacheable-status-codes` | `[u16]` | `[200, 203, 204, 206, 300, 301]` | Status codes to cache (each 100 to 599) |
 | `stale-while-revalidate-secs` | `u32` | - | Serve stale while refreshing (at most `4294967295`) |
 | `stale-if-error-secs` | `u32` | - | Serve stale on upstream error (at most `4294967295`) |
-| `vary-headers` | `[string]` | `[]` | Not read by the proxy at present. The response's `Vary` decides which request headers keep entries apart |
-| `ignore-query-params` | `[string]` | `[]` | Query params to exclude from cache key |
+| `vary-headers` | `[string]` | `[]` | Not applied ([details](#accepted-but-not-applied)). The response's `Vary` decides which request headers keep entries apart |
+| `ignore-query-params` | `[string]` | `[]` | Not applied ([details](#accepted-but-not-applied)). The query string is part of the cache key as written |
 | `exclude-extensions` | `[string]` | `[]` | File extensions to exclude from caching (without dot, e.g., `"php"`, `"html"`) |
 | `exclude-paths` | `[string]` | `[]` | Path patterns to exclude from caching (glob: `*`, `**`, `?`) |
-| `respect-cache-control` | `bool` | `true` | Honor upstream Cache-Control headers |
-| `ignore-no-cache` | `bool` | `false` | Cache even if upstream returns no-cache |
+
+Other names are not settings and are reported as unknown keys by
+`zentinel lint`: `ttl-secs` (the TTL is `default-ttl-secs`),
+`respect-cache-control` and `ignore-no-cache`.
 
 Responses to requests with `Authorization` (unless `Cache-Control` has `public`, `s-maxage` or `must-revalidate`), responses with `Set-Cookie`, and responses with `Vary: *` are not stored. Any other `Vary` keeps one entry per value of the request headers it names. See [What the Response Cache Stores](kdl-format.md#what-the-response-cache-stores).
 
@@ -328,12 +333,12 @@ Responses to requests with `Authorization` (unless `Cache-Control` has `public`,
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
 | `provider` | `string` | `"generic"` | Provider: `generic`, `openai`, `anthropic` |
-| `model-header` | `string` | - | Header containing model name |
+| `model-header` | `string` | - | Not applied ([details](#accepted-but-not-applied)). Model routing reads the model name only from the `x-model` or `x-model-id` request header; token counting also reads `model` from the request body |
 | `rate-limit` | `TokenRateLimit` | - | Token-based rate limiting |
 | `budget` | `TokenBudgetConfig` | - | Token budget tracking |
 | `cost-attribution` | `CostAttributionConfig` | - | Per-model pricing |
-| `routing` | `InferenceRouting` | - | Inference-aware routing |
-| `model-routing` | `ModelRoutingConfig` | - | Model-based upstream routing |
+| `routing` | `InferenceRouting` | - | Not applied ([details](#accepted-but-not-applied)). No upstream is chosen by it; an upstream's strategy is its `load-balancing` |
+| `model-routing` | `ModelRoutingConfig` | - | Model-based upstream routing: `model "<pattern>" upstream="<id>"` rules and `default-upstream "<id>"`, written directly in the block (a `mappings { mapping ... }` block is not read) |
 | `guardrails` | `GuardrailsConfig` | - | Semantic guardrails |
 
 ### TokenRateLimit
@@ -391,7 +396,7 @@ WebSocket upgrade and a proxied MCP tool call are not checked.
 
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
-| `upstreams` | `[FallbackUpstream]` | `[]` | Ordered fallback upstreams |
+| `fallback-upstream` | `[FallbackUpstream]` | `[]` | Ordered fallback upstreams, one `fallback-upstream "<id>" { provider ...; model-mapping { ... } }` node each. An `upstream` node, or `model-mapping` directly in `fallback`, is not read |
 | `triggers` | `FallbackTriggers` | `{}` | Conditions that trigger fallback |
 | `max-attempts` | `u32` | `3` | Max fallback attempts |
 
@@ -412,7 +417,7 @@ Backend server pool configuration.
 | `health-check` | `HealthCheck` | - | Health check configuration |
 | `connection-pool` | `ConnectionPoolConfig` | `{}` | Connection pool settings |
 | `timeouts` | `UpstreamTimeouts` | `{}` | Timeout settings |
-| `tls` | `UpstreamTlsConfig` | - | TLS configuration |
+| `tls` | `UpstreamTlsConfig` | - | TLS configuration. `ca-cert` inside it is not applied ([details](#accepted-but-not-applied)) |
 | `http-version` | `HttpVersionConfig` | `{}` | HTTP version settings |
 | `h2c` | `bool` | `#false` | HTTP/2 over cleartext TCP with prior knowledge. Only without `tls`; never falls back to HTTP/1.1 |
 
@@ -483,10 +488,10 @@ Intervals are in seconds and must be greater than zero.
 
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
-| `max-connections` | `u32` | `100` | Max connections per target |
-| `max-idle` | `u32` | `20` | Max idle connections |
+| `max-connections` | `u32` | `100` | Not applied ([details](#accepted-but-not-applied)). Connections to a target are not capped by it |
+| `max-idle` | `u32` | `20` | Not applied ([details](#accepted-but-not-applied)). The idle connections kept are a fixed value for the whole proxy (256), not set per upstream |
 | `idle-timeout-secs` | `u64` | `60` | Idle connection timeout |
-| `max-lifetime-secs` | `u64` | - | Max connection lifetime |
+| `max-lifetime-secs` | `u64` | - | Not applied ([details](#accepted-but-not-applied)). Connections are not closed because of their age. `max-lifetime` is the same setting |
 
 ### UpstreamTimeouts
 
@@ -667,8 +672,8 @@ Web Application Firewall configuration.
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
 | `inspect-request-body` | `bool` | `true` | Send request bodies to the route's agents that subscribe to `request_body`. `#false` keeps them from every agent. Without a `waf` block, request bodies go to those agents too, with the defaults below except `content-types` (every content type is sent) |
-| `inspect-response-body` | `bool` | `false` | Inspect response bodies |
-| `max-inspection-bytes` | `u64` | `1048576` | The most of a request body held for the agents in `request-body-mode "buffer"`, counted as received. A content-coded body may not decode to more than this either (`decompress`), in every mode that decodes it. A body of up to this many bytes is sent whole; a longer one is not sent to any agent, and each agent's filter `failure-mode` decides (see below). With `0`, every body that is not empty is a longer one. The response-body byte count kept for `inspect-response-body` is capped by it too; it is only traced, and never refuses or changes a response |
+| `inspect-response-body` | `bool` | `false` | Not applied ([details](#accepted-but-not-applied)). A response body goes to the agents that subscribe to the `response-body` event |
+| `max-inspection-bytes` | `u64` | `1048576` | The most of a request body held for the agents in `request-body-mode "buffer"`, counted as received. A content-coded body may not decode to more than this either (`decompress`), in every mode that decodes it. A body of up to this many bytes is sent whole; a longer one is not sent to any agent, and each agent's filter `failure-mode` decides (see below). With `0`, every body that is not empty is a longer one. The response-body byte count kept for inspection is capped by it too; it is only traced, and never refuses or changes a response |
 | `content-types` | `[string]` | *form/json/xml* | Content types to inspect. An entry matches as a case-insensitive prefix, and `type/subtype` also matches `type/<name>+subtype` (see [below](#which-request-bodies-are-inspected-content-types)). A request with a body and no `Content-Type` is inspected whatever the list says, unless `inspect-untyped-bodies` is `#false`. A `Content-Type` with a byte outside visible ASCII is inspected whatever the list says |
 | `inspect-untyped-bodies` | `bool` | `true` | Inspect the body of a request that has no `Content-Type` (absent or blank) whatever `content-types` lists. `#false` leaves such a request to the list, where it is matched as the empty string; a `Content-Type` with a byte outside visible ASCII is not "none" and is inspected either way (see [below](#which-request-bodies-are-inspected-content-types)) |
 | `decompress` | `bool` | `true` | Decode a request body in a supported `Content-Encoding` (`gzip`, `x-gzip`, `deflate`, `br`) for the agents, within `max-decompression-ratio` and `max-inspection-bytes`. With `#false`, such a body is not decoded and follows the agents' `failure-mode` (see below) |
@@ -915,13 +920,16 @@ Metrics, logging, and tracing configuration.
 
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
-| `level` | `string` | `"info"` | Log level |
-| `format` | `string` | `"json"` | Format: `json`, `pretty` |
+| `level` | `string` | `"info"` | Not applied ([details](#accepted-but-not-applied)). The proxy's own log takes its level from the `RUST_LOG` environment variable (`info`, or `debug` with `--verbose`) |
+| `format` | `string` | `"json"` | Not applied ([details](#accepted-but-not-applied)). The proxy's own log is written as text |
 | `timestamps` | `bool` | `true` | Include timestamps |
 | `file` | `string` | - | Log file path |
 | `access-log` | `AccessLogConfig` | - | Access log config |
 | `error-log` | `ErrorLogConfig` | - | Error log config |
 | `audit-log` | `AuditLogConfig` | - | Audit log config |
+
+`level` and `format` here are not the `level` of `error-log` or the `format` of
+`access-log`, which are applied.
 
 File logs are opt-in: a log is opened only when its block is present (and not
 `enabled #false`). Each file is independent. An access or error log that cannot
@@ -1045,3 +1053,50 @@ HTTP response caching configuration.
 | `disk-path` | `string` | - | Disk cache path |
 | `disk-shards` | `u32` | `16` | Number of disk shards |
 | `disk-max-size` | `usize` | - | Disk tier max size (hybrid only) |
+
+---
+
+## Accepted but not applied
+
+These settings are read from the file and then used by nothing, so they do not
+change how the proxy behaves. Loading still succeeds, as it always has. Each
+one is logged as a warning when the configuration is loaded, naming the setting
+and where it is written; `zentinel lint` reports it; and `zentinel test
+--strict` fails on it. The fix is to remove the line. They are reported
+whatever value is written, including the default.
+
+| Setting | Where | What happens instead |
+|---------|-------|----------------------|
+| `max-connections` | `system` | Client connections are not limited |
+| `max-concurrent-streams` | `listener` | The listener's HTTP/2 stream limit is not set from it |
+| `waf-enabled` | `route` | It does not change how requests are handled. A route's traffic is inspected by the agents its `filters` list |
+| `cache { ... }` | inside a route's `policies` | The block is not read, so the route is not cached by it. A route's cache is the `cache` block in the route itself, beside `policies`; moving the block there turns the cache on |
+| `vary-headers` | route `cache` | The response's `Vary` header decides which request headers keep entries apart |
+| `ignore-query-params` | route `cache` | The query string is part of the cache key as written |
+| `ca-cert` | upstream `tls` | The file is not read. The upstream's certificate is verified against the platform's trusted root certificates |
+| `max-connections`, `max-idle`, `max-lifetime-secs` (`max-lifetime`) | upstream `connection-pool` | Not applied. `idle-timeout-secs` is |
+| `level`, `format` | `observability { logging }` | The proxy's own log takes its level from `RUST_LOG` (`info`, or `debug` with `--verbose`) and is written as text. The `level` of `error-log` and the `format` of `access-log` are applied |
+| `inspect-response-body` | `waf { body-inspection }` | A response body goes to the agents that subscribe to the `response-body` event |
+| `model-header` | `inference` | It names no header that is read. Model routing reads the model name only from the `x-model` or `x-model-id` request header, and token counting also reads `model` from the request body |
+| `routing { strategy, queue-depth-header }` | `inference` | No upstream is chosen by it. An upstream's strategy is its `load-balancing` setting |
+
+A setting leaves this list when the proxy starts to apply it.
+
+Some keys are not read at all, usually because they are written in the wrong
+place. In a route's `inference` and `fallback` blocks, and in the blocks inside
+them (`rate-limit`, `budget`, `cost-attribution`, `guardrails`, `model-routing`,
+`triggers`, `fallback-upstream`), every key or property that the parser does
+not read is reported the same way, saying what the block does read. Some that
+were written in these docs and examples:
+
+| Written | What is read |
+|---------|--------------|
+| `upstream "x"` in `fallback` | `fallback-upstream "x" { ... }` |
+| `provider="x"` on a `fallback-upstream` | a child node: `provider "x"` |
+| `model-mapping` directly in `fallback` | `model-mapping` inside `fallback-upstream` |
+| a `fallback` block inside `inference` | `fallback` beside `inference`, in the route |
+| `mappings { mapping ... }`, `model-header` in `model-routing` | `model "<pattern>" upstream="<id>"` rules and `default-upstream` |
+| `key` in `rate-limit` or `budget` | not a setting of either |
+| `daily-limit`, `monthly-limit`, `alert-threshold` in `budget` | `limit` over a `period`, and `alert-thresholds` |
+| `models { ... }` in `cost-attribution`, `input-cost-per-1k` | `pricing { model "<pattern>" { input-cost-per-million ...; output-cost-per-million ... } }` |
+| `token-estimation` in `inference`, `detect-types` or `types` in `pii-detection` | `estimation-method` in `rate-limit`, `categories` |

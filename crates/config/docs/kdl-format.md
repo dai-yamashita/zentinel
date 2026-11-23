@@ -29,7 +29,7 @@ listener address="0.0.0.0:8080" protocol="http"
 // Node with children (block)
 server {
     worker-threads 4
-    max-connections 10000
+    graceful-shutdown-timeout-secs 30
 }
 ```
 
@@ -143,7 +143,6 @@ cache {
 ```kdl
 server {
     worker-threads 0          // 0 = auto-detect CPU cores
-    max-connections 10000
     graceful-shutdown-timeout-secs 30
     daemon #false
     pid-file "/var/run/zentinel.pid"
@@ -196,7 +195,6 @@ listeners {
     listener "internal-h2c" {
         address "10.0.0.1:8080"
         protocol "h2c"
-        max-concurrent-streams 100
     }
 
     // Internal listener that serves a *separate* route set: requests here are
@@ -386,7 +384,6 @@ routes {
             method "GET" "POST"
         }
         upstream "admin-backend"
-        waf-enabled #true
     }
 
     // Static file serving
@@ -493,8 +490,6 @@ upstreams {
         }
 
         connection-pool {
-            max-connections 100
-            max-idle 20
             idle-timeout-secs 60
         }
 
@@ -513,7 +508,6 @@ upstreams {
         tls {
             sni "api.internal"
             insecure-skip-verify #false
-            ca-cert "/etc/ssl/certs/internal-ca.crt"
         }
 
         http-version {
@@ -686,7 +680,6 @@ waf {
 
     body-inspection {
         inspect-request-body #true
-        inspect-response-body #false
         max-inspection-bytes 1048576
         content-types "application/json" "application/x-www-form-urlencoded" "multipart/form-data"
         decompress #true
@@ -731,8 +724,6 @@ observability {
     }
 
     logging {
-        level "info"
-        format "json"
         timestamps #true
 
         access-log {
@@ -797,7 +788,9 @@ cache {
 
 #### Per-Route Cache Configuration
 
-Cache can be configured per-route inside the `policies` block:
+Cache is configured per route by a `cache` block written in the route itself,
+beside `policies`. A `cache` block inside `policies` is not read (see
+[Accepted but not applied](schema.md#accepted-but-not-applied)).
 
 ```kdl
 route "api" {
@@ -805,19 +798,18 @@ route "api" {
         path-prefix "/api"
     }
     upstream "api-backend"
-    policies {
-        cache {
-            enabled #true
-            default-ttl-secs 300
-            vary-headers "Accept" "Accept-Encoding"  // not read at present; the response's Vary decides
-            stale-while-revalidate-secs 60
+    // The request headers that keep entries apart are the ones the response's
+    // own `Vary` header names; there is no setting for them
+    cache {
+        enabled #true
+        default-ttl-secs 300
+        stale-while-revalidate-secs 60
 
-            // Exclude specific file extensions from caching
-            exclude-extensions "php" "html" "asp"
+        // Exclude specific file extensions from caching
+        exclude-extensions "php" "html" "asp"
 
-            // Exclude paths using glob patterns (*, **, ?)
-            exclude-paths "/wp-admin/**" "/login" "/api/auth/**"
-        }
+        // Exclude paths using glob patterns (*, **, ?)
+        exclude-paths "/wp-admin/**" "/login" "/api/auth/**"
     }
 }
 ```
@@ -853,14 +845,14 @@ KDL properties use `kebab-case`:
 
 ```kdl
 // Correct
-max-connections 1000
+worker-threads 4
 request-timeout-secs 60
-waf-enabled #true
+websocket-inspection #true
 
 // Incorrect (will not parse correctly)
-maxConnections 1000
+workerThreads 4
 request_timeout_secs 60
-wafEnabled #true
+websocketInspection #true
 ```
 
 ## Lists and Arrays
