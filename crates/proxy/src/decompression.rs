@@ -32,7 +32,7 @@
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use flate2::read::{DeflateDecoder, GzDecoder};
+use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 use thiserror::Error;
 use tracing::{debug, trace, warn};
 
@@ -145,6 +145,10 @@ impl DecompressionStats {
 }
 
 /// Parse Content-Encoding header to determine encoding type
+///
+/// Request body inspection does not use this: it reads every
+/// `Content-Encoding` header with [`content_codings`] and
+/// [`BodyCoding::classify`].
 pub fn parse_content_encoding(header_value: &str) -> Option<&str> {
     // Handle multiple encodings (e.g., "gzip, chunked")
     // We only decompress the first compression encoding
@@ -162,11 +166,109 @@ pub fn parse_content_encoding(header_value: &str) -> Option<&str> {
 }
 
 /// Check if the content encoding is supported for decompression
+///
+/// Request body inspection does not use this: it reads every
+/// `Content-Encoding` header with [`content_codings`] and
+/// [`BodyCoding::classify`].
 pub fn is_supported_encoding(encoding: &str) -> bool {
     matches!(
         encoding.to_lowercase().as_str(),
         "gzip" | "x-gzip" | "deflate" | "br" | "brotli"
     )
+}
+
+/// The content codings a request declares, from the values of all its
+/// `Content-Encoding` headers (RFC 9110 section 8.4).
+///
+/// Each value is a comma-separated list; the codings of all the headers
+/// follow one another in the order they were sent. Names are compared
+/// without regard to ASCII case, so they come back lowercase, without the
+/// spaces and tabs around them. Empty list elements and `identity`, which
+/// stands for no coding, are left out.
+pub fn content_codings<'a>(values: impl IntoIterator<Item = &'a [u8]>) -> Vec<String> {
+    values
+        .into_iter()
+        .flat_map(|value| {
+            String::from_utf8_lossy(value)
+                .split(',')
+                .map(|coding| coding.trim_matches([' ', '\t']).to_ascii_lowercase())
+                .collect::<Vec<_>>()
+        })
+        .filter(|coding| !coding.is_empty() && coding != "identity")
+        .collect()
+}
+
+/// The name [`decompress_body`] is given for a coding it can decode.
+fn decodable_coding(coding: &str) -> Option<&'static str> {
+    match coding {
+        "gzip" | "x-gzip" => Some("gzip"),
+        "deflate" => Some("deflate"),
+        "br" | "brotli" => Some("br"),
+        _ => None,
+    }
+}
+
+/// How many characters of a request's declared codings are kept for logs.
+const DECLARED_CODINGS_LOG_LIMIT: usize = 64;
+
+/// A content-coded request body that is not decoded for inspection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndecodedBody {
+    /// The `encoding` of the metric: `gzip`, `deflate` or `br` for a body
+    /// in one of those alone, `other` for any other coding or for several.
+    pub label: &'static str,
+    /// The codings the request declared, lowercase, for logs.
+    pub declared: String,
+}
+
+/// How a request body's `Content-Encoding` headers are handled for the
+/// agents that inspect the body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BodyCoding {
+    /// No content coding, or only `identity`: inspected as sent.
+    Identity,
+    /// One coding that is supported, with decoding on: decoded, within the
+    /// configured limits, for inspection. The name is `gzip`, `deflate` or
+    /// `br`.
+    Decode(&'static str),
+    /// Not decoded: decoding is off, or the coding is not supported, or
+    /// there are several of them. The body cannot be inspected as sent.
+    NotDecoded(UndecodedBody),
+}
+
+impl BodyCoding {
+    /// Classify a request by the values of all its `Content-Encoding`
+    /// headers. `decode` is whether a body in a supported coding can be
+    /// decoded: the route's `body-inspection { decompress }`, and a mode
+    /// that sends the agents the body whole, not in chunks as it arrives.
+    /// `hybrid` mode holds a body whole only up to its threshold, so a body
+    /// that goes past it is not decoded after all
+    /// (`RequestContext::body_goes_in_pieces`).
+    pub fn classify<'a>(values: impl IntoIterator<Item = &'a [u8]>, decode: bool) -> Self {
+        let codings = content_codings(values);
+        let mut declared = codings.join(", ");
+        if let Some((end, _)) = declared.char_indices().nth(DECLARED_CODINGS_LOG_LIMIT) {
+            declared.truncate(end);
+        }
+        match codings.as_slice() {
+            [] => BodyCoding::Identity,
+            [coding] => match (decodable_coding(coding), decode) {
+                (Some(name), true) => BodyCoding::Decode(name),
+                (Some(name), false) => BodyCoding::NotDecoded(UndecodedBody {
+                    label: name,
+                    declared,
+                }),
+                (None, _) => BodyCoding::NotDecoded(UndecodedBody {
+                    label: "other",
+                    declared,
+                }),
+            },
+            _ => BodyCoding::NotDecoded(UndecodedBody {
+                label: "other",
+                declared,
+            }),
+        }
+    }
 }
 
 /// Decompress body data with ratio and size limits
@@ -254,12 +356,34 @@ fn decompress_gzip(
 }
 
 /// Decompress deflate data with incremental ratio checking
+///
+/// The `deflate` coding is the zlib format (RFC 9110 section 8.4.1.2), but
+/// a raw deflate stream (RFC 1951) is sent for it as well. The bytes are
+/// read as zlib first; when that does not decode them, they are read again,
+/// from the start, as raw deflate. The first two bytes of a raw stream can
+/// look like a zlib header (a stored block can start that way), so they do
+/// not tell the formats apart, and a zlib stream's checksum does.
+///
+/// A limit that stops the zlib read (`RatioExceeded`, `SizeExceeded`) is the
+/// result as it is: the body is not read again as raw deflate, so it is
+/// reported as over the limit it went over. A body that neither format
+/// decodes fails with the raw read's error. Both reads stop at the same
+/// limits, so the work is at most twice that of one.
 fn decompress_deflate(
     data: &[u8],
     config: &DecompressionConfig,
 ) -> Result<Vec<u8>, DecompressionError> {
-    let mut decoder = DeflateDecoder::new(data);
-    decompress_with_limits(&mut decoder, data.len(), config)
+    let mut zlib = ZlibDecoder::new(data);
+    match decompress_with_limits(&mut zlib, data.len(), config) {
+        // Not zlib (a decoder error): read it again as raw deflate.
+        Err(e @ (DecompressionError::InvalidData(_) | DecompressionError::IoError(_))) => {
+            trace!(error = %e, "Not a zlib stream, reading the deflate body as raw deflate");
+            let mut raw = DeflateDecoder::new(data);
+            decompress_with_limits(&mut raw, data.len(), config)
+        }
+        // Decoded, or stopped by a limit.
+        result => result,
+    }
 }
 
 /// Decompress brotli data with incremental ratio checking
@@ -412,6 +536,130 @@ mod tests {
         assert_eq!(parse_content_encoding("gzip, chunked"), Some("gzip"));
     }
 
+    fn codings(values: &[&str]) -> Vec<String> {
+        content_codings(values.iter().map(|v| v.as_bytes()))
+    }
+
+    #[test]
+    fn content_codings_reads_a_comma_separated_list() {
+        assert_eq!(codings(&["gzip"]), ["gzip"]);
+        assert_eq!(codings(&["gzip, br"]), ["gzip", "br"]);
+        assert_eq!(codings(&["gzip,br"]), ["gzip", "br"]);
+    }
+
+    #[test]
+    fn content_codings_ignores_case_and_surrounding_whitespace() {
+        assert_eq!(codings(&["GZip"]), ["gzip"]);
+        assert_eq!(codings(&[" gzip "]), ["gzip"]);
+        assert_eq!(codings(&["\tgzip\t,\tBR "]), ["gzip", "br"]);
+    }
+
+    #[test]
+    fn content_codings_follows_every_header_in_order() {
+        assert_eq!(codings(&["gzip", "br"]), ["gzip", "br"]);
+        assert_eq!(codings(&["deflate, gzip", "br"]), ["deflate", "gzip", "br"]);
+    }
+
+    #[test]
+    fn content_codings_leaves_out_identity_and_empty_elements() {
+        assert!(codings(&["identity"]).is_empty());
+        assert!(codings(&["Identity, IDENTITY"]).is_empty());
+        assert_eq!(codings(&["identity, gzip"]), ["gzip"]);
+        assert!(codings(&[""]).is_empty());
+        assert!(codings(&[" "]).is_empty());
+        assert!(codings(&[","]).is_empty());
+        assert_eq!(codings(&["gzip,,br,"]), ["gzip", "br"]);
+        assert!(codings(&[]).is_empty());
+    }
+
+    #[test]
+    fn content_codings_keeps_a_value_that_is_not_text() {
+        // Not a name that is decoded, so it must not read as no coding.
+        assert_eq!(content_codings([&b"gz\xffip"[..]]).len(), 1);
+    }
+
+    fn classify(values: &[&str], decompress: bool) -> BodyCoding {
+        BodyCoding::classify(values.iter().map(|v| v.as_bytes()), decompress)
+    }
+
+    fn not_decoded(label: &'static str, declared: &str) -> BodyCoding {
+        BodyCoding::NotDecoded(UndecodedBody {
+            label,
+            declared: declared.to_string(),
+        })
+    }
+
+    #[test]
+    fn classify_a_body_without_a_coding_as_it_is() {
+        assert_eq!(classify(&[], true), BodyCoding::Identity);
+        assert_eq!(classify(&["identity"], true), BodyCoding::Identity);
+        assert_eq!(classify(&[""], false), BodyCoding::Identity);
+    }
+
+    #[test]
+    fn classify_one_supported_coding_as_decoded_when_enabled() {
+        assert_eq!(classify(&["gzip"], true), BodyCoding::Decode("gzip"));
+        assert_eq!(classify(&["x-gzip"], true), BodyCoding::Decode("gzip"));
+        assert_eq!(classify(&["GZIP "], true), BodyCoding::Decode("gzip"));
+        assert_eq!(classify(&["deflate"], true), BodyCoding::Decode("deflate"));
+        assert_eq!(classify(&["br"], true), BodyCoding::Decode("br"));
+        assert_eq!(classify(&["brotli"], true), BodyCoding::Decode("br"));
+        assert_eq!(
+            classify(&["identity, gzip"], true),
+            BodyCoding::Decode("gzip")
+        );
+        assert_eq!(
+            classify(&["gzip", "identity"], true),
+            BodyCoding::Decode("gzip")
+        );
+    }
+
+    #[test]
+    fn classify_a_supported_coding_as_not_decoded_when_disabled() {
+        assert_eq!(classify(&["gzip"], false), not_decoded("gzip", "gzip"));
+        assert_eq!(classify(&["BR"], false), not_decoded("br", "br"));
+    }
+
+    #[test]
+    fn classify_an_unsupported_coding_as_not_decoded() {
+        assert_eq!(classify(&["zstd"], true), not_decoded("other", "zstd"));
+        assert_eq!(classify(&["ZSTD "], true), not_decoded("other", "zstd"));
+        assert_eq!(
+            classify(&["compress"], true),
+            not_decoded("other", "compress")
+        );
+        assert_eq!(classify(&["zstd"], false), not_decoded("other", "zstd"));
+    }
+
+    #[test]
+    fn classify_several_codings_as_not_decoded() {
+        assert_eq!(
+            classify(&["gzip, br"], true),
+            not_decoded("other", "gzip, br")
+        );
+        assert_eq!(
+            classify(&["gzip", "br"], true),
+            not_decoded("other", "gzip, br")
+        );
+        assert_eq!(
+            classify(&["gzip, gzip"], true),
+            not_decoded("other", "gzip, gzip")
+        );
+    }
+
+    #[test]
+    fn classify_keeps_the_declared_codings_for_logs_short() {
+        let long = vec!["x"; 200].join(", ");
+        let BodyCoding::NotDecoded(undecoded) = classify(&[long.as_str()], true) else {
+            panic!("several codings are not decoded");
+        };
+        assert_eq!(
+            undecoded.declared.chars().count(),
+            DECLARED_CODINGS_LOG_LIMIT
+        );
+        assert_eq!(undecoded.label, "other");
+    }
+
     #[test]
     fn test_decompress_gzip() {
         let original = b"Hello, World! This is a test of gzip decompression.";
@@ -426,6 +674,25 @@ mod tests {
         assert!(result.ratio > 0.0);
     }
 
+    /// `deflate` as RFC 9110 defines the coding: the zlib format.
+    fn compress_zlib(data: &[u8]) -> Vec<u8> {
+        use flate2::write::ZlibEncoder;
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn test_decompress_deflate_in_the_zlib_format() {
+        let original = b"Hello, World! This is a test of zlib-wrapped deflate.";
+        let compressed = compress_zlib(original);
+        let config = DecompressionConfig::default();
+
+        let result = decompress_body(&compressed, "deflate", &config).unwrap();
+
+        assert_eq!(result.data, original);
+    }
+
     #[test]
     fn test_decompress_deflate() {
         let original = b"Hello, World! This is a test of deflate decompression.";
@@ -435,6 +702,128 @@ mod tests {
         let result = decompress_body(&compressed, "deflate", &config).unwrap();
 
         assert_eq!(result.data, original);
+    }
+
+    /// A raw deflate stream (RFC 1951) of two stored blocks, the first of
+    /// which is not the last and holds one byte. Its first two bytes, `78 01`,
+    /// are also a valid zlib header: `0x78` is the block header (not final,
+    /// stored) followed by padding bits that a stored block leaves unread,
+    /// and `0x01` is the low byte of the block's `LEN`.
+    fn raw_deflate_that_starts_like_zlib(data: &[u8]) -> Vec<u8> {
+        let (first, rest) = data.split_at(1);
+        let mut stream = vec![0x78, 0x01, 0x00, 0xfe, 0xff];
+        stream.extend_from_slice(first);
+        // The last block.
+        stream.push(0x01);
+        let len = u16::try_from(rest.len()).unwrap();
+        stream.extend_from_slice(&len.to_le_bytes());
+        stream.extend_from_slice(&(!len).to_le_bytes());
+        stream.extend_from_slice(rest);
+        stream
+    }
+
+    #[test]
+    fn a_raw_deflate_stream_can_start_like_a_zlib_header() {
+        let original = b"Hello, World! This is a test of deflate decompression.";
+        let stream = raw_deflate_that_starts_like_zlib(original);
+
+        // The first two bytes pass the zlib header check (RFC 1950).
+        assert_eq!(stream[0] & 0x0f, 8, "compression method");
+        assert_eq!((u16::from(stream[0]) * 256 + u16::from(stream[1])) % 31, 0);
+        assert_eq!(stream[1] & 0x20, 0, "no preset dictionary");
+
+        // And it is a valid raw deflate stream all the same.
+        let mut decoded = Vec::new();
+        DeflateDecoder::new(&stream[..])
+            .read_to_end(&mut decoded)
+            .unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_decompress_deflate_that_starts_like_a_zlib_header() {
+        let original = b"Hello, World! This is a test of deflate decompression.";
+        let compressed = raw_deflate_that_starts_like_zlib(original);
+        let config = DecompressionConfig::default();
+
+        let result = decompress_body(&compressed, "deflate", &config).unwrap();
+
+        assert_eq!(result.data, original);
+    }
+
+    #[test]
+    fn deflate_that_is_neither_zlib_nor_raw_fails_to_decode() {
+        let config = DecompressionConfig::default();
+
+        // A reserved block type (`BTYPE` 11), and not a zlib header either.
+        let result = decompress_body(&[0xff; 16], "deflate", &config);
+        assert!(
+            matches!(
+                result,
+                Err(DecompressionError::InvalidData(_) | DecompressionError::IoError(_))
+            ),
+            "{result:?}"
+        );
+
+        // A zlib stream cut short, which is not a raw one either.
+        let varied: Vec<u8> = (0..2000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+            .collect();
+        let zlib = compress_zlib(&varied);
+        let result = decompress_body(&zlib[..zlib.len() - 6], "deflate", &config);
+        assert!(
+            matches!(
+                result,
+                Err(DecompressionError::InvalidData(_) | DecompressionError::IoError(_))
+            ),
+            "{result:?}"
+        );
+    }
+
+    /// The limits stop `deflate` whichever format it is in, and a limit that
+    /// stops the zlib read is reported as it is, not as a body that is not
+    /// zlib: reading it again as raw deflate would only find it invalid.
+    #[test]
+    fn deflate_stops_at_the_size_limit_in_either_format() {
+        let original = vec![b'X'; 100_000];
+        let config = DecompressionConfig {
+            max_ratio: 1000.0,
+            max_output_bytes: 50_000,
+        };
+
+        for (format, compressed) in [
+            ("zlib", compress_zlib(&original)),
+            ("raw", compress_deflate(&original)),
+        ] {
+            let result = decompress_body(&compressed, "deflate", &config);
+            assert!(
+                matches!(
+                    result,
+                    Err(DecompressionError::SizeExceeded { limit: 50_000, .. })
+                ),
+                "{format}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn deflate_stops_at_the_ratio_limit_in_either_format() {
+        let original = vec![b'A'; 100_000];
+        let config = DecompressionConfig {
+            max_ratio: 2.0,
+            max_output_bytes: 10 * 1024 * 1024,
+        };
+
+        for (format, compressed) in [
+            ("zlib", compress_zlib(&original)),
+            ("raw", compress_deflate(&original)),
+        ] {
+            let result = decompress_body(&compressed, "deflate", &config);
+            assert!(
+                matches!(result, Err(DecompressionError::RatioExceeded { .. })),
+                "{format}: {result:?}"
+            );
+        }
     }
 
     #[test]
