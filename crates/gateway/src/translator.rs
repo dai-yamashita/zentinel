@@ -22,6 +22,7 @@ use kube::api::ListParams;
 use kube::{Api, Client, ResourceExt};
 use tracing::{debug, error, info, warn};
 
+use zentinel_common::limits::Ipv6PrefixLen;
 use zentinel_common::types::{HealthCheckType, LoadBalancingAlgorithm, Priority, TlsVersion};
 use zentinel_config::{
     Config, ConnectionPoolConfig, Filter, FilterConfig, HeaderModifications, HealthCheck,
@@ -338,7 +339,7 @@ impl ConfigTranslator {
                 trace_id_format: Default::default(),
                 auto_reload: true,
                 route_cache_size: 1000,
-                client_ipv6_prefix_length: Default::default(),
+                client_ipv6_prefix_length: client_ipv6_prefix_length_from_env()?,
             },
             listeners,
             routes,
@@ -636,6 +637,7 @@ impl ConfigTranslator {
                     error_pages: None,
                     websocket: false,
                     websocket_inspection: false,
+                    websocket_max_frame_size: zentinel_config::DEFAULT_WEBSOCKET_MAX_FRAME_SIZE,
                     shadow: None,
                     fallback: None,
                 };
@@ -1172,6 +1174,7 @@ impl ConfigTranslator {
                 error_pages: None,
                 websocket: false,
                 websocket_inspection: false,
+                websocket_max_frame_size: zentinel_config::DEFAULT_WEBSOCKET_MAX_FRAME_SIZE,
                 shadow: None,
                 fallback: None,
             };
@@ -1410,6 +1413,7 @@ impl ConfigTranslator {
                 error_pages: None,
                 websocket: false,
                 websocket_inspection: false,
+                websocket_max_frame_size: zentinel_config::DEFAULT_WEBSOCKET_MAX_FRAME_SIZE,
                 shadow: None,
                 fallback: None,
             };
@@ -1562,6 +1566,41 @@ impl ConfigTranslator {
         }
         false
     }
+}
+
+/// The environment variable that sets `client-ipv6-prefix-length` in the
+/// generated proxy configuration: how many leading bits of an IPv6 address
+/// identify one client for the per-client limits. The proxy reads that
+/// setting at startup only, so a change takes effect when the proxy restarts.
+pub const CLIENT_IPV6_PREFIX_LENGTH_ENV: &str = "CLIENT_IPV6_PREFIX_LENGTH";
+
+/// The `client-ipv6-prefix-length` for the generated proxy configuration,
+/// from [`CLIENT_IPV6_PREFIX_LENGTH_ENV`]; 64 when it is unset or empty.
+///
+/// # Errors
+///
+/// Returns [`GatewayError::Translation`] when the variable is set to anything
+/// but a whole number from 1 to 128. The default is not used instead: the
+/// proxy would then count clients differently than the operator asked.
+pub fn client_ipv6_prefix_length_from_env() -> Result<Ipv6PrefixLen, GatewayError> {
+    parse_client_ipv6_prefix_length(std::env::var(CLIENT_IPV6_PREFIX_LENGTH_ENV).ok().as_deref())
+}
+
+fn parse_client_ipv6_prefix_length(value: Option<&str>) -> Result<Ipv6PrefixLen, GatewayError> {
+    let value = match value.map(str::trim) {
+        None | Some("") => return Ok(Ipv6PrefixLen::DEFAULT),
+        Some(value) => value,
+    };
+    value
+        .parse::<u8>()
+        .ok()
+        .and_then(|bits| Ipv6PrefixLen::new(bits).ok())
+        .ok_or_else(|| {
+            GatewayError::Translation(format!(
+                "{CLIENT_IPV6_PREFIX_LENGTH_ENV} is {value:?}, but must be a whole number of \
+                 bits from 1 to 128"
+            ))
+        })
 }
 
 /// Whether the items translated from one resource can be written to the proxy
@@ -1738,5 +1777,39 @@ mod tests {
             &upstreams,
             &HashMap::new()
         ));
+    }
+
+    #[test]
+    fn client_ipv6_prefix_length_defaults_to_64_when_unset_or_empty() {
+        for value in [None, Some(""), Some("  ")] {
+            assert_eq!(
+                parse_client_ipv6_prefix_length(value).unwrap(),
+                Ipv6PrefixLen::DEFAULT,
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn client_ipv6_prefix_length_is_read_from_the_value() {
+        for bits in [1u8, 48, 64, 128] {
+            assert_eq!(
+                parse_client_ipv6_prefix_length(Some(&bits.to_string()))
+                    .unwrap()
+                    .get(),
+                bits
+            );
+        }
+    }
+
+    #[test]
+    fn client_ipv6_prefix_length_rejects_a_value_out_of_range() {
+        for value in ["0", "129", "256", "-1", "64.5", "sixty-four"] {
+            let err = parse_client_ipv6_prefix_length(Some(value))
+                .expect_err(value)
+                .to_string();
+            assert!(err.contains(CLIENT_IPV6_PREFIX_LENGTH_ENV), "{err}");
+            assert!(err.contains("from 1 to 128"), "{err}");
+        }
     }
 }

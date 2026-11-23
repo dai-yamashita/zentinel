@@ -3,14 +3,18 @@ Description=Zentinel Echo Agent - Reference Implementation
 Documentation=https://github.com/zentinelproxy/zentinel
 After=network.target zentinel.service
 PartOf=zentinel.service
-# No start rate limit; restarts are spaced by RestartSec=. See zentinel.service.
+# No start rate limit; restarts are spaced by RestartSec= and RestartSteps=.
+# See zentinel.service.
 StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/echo-agent --socket /var/run/zentinel/echo.sock
 Restart=on-failure
+# Growing delay, 5 s up to 120 s (systemd 254+). See zentinel.service.
 RestartSec=5s
+RestartSteps=5
+RestartMaxDelaySec=120s
 TimeoutStartSec=10
 TimeoutStopSec=10
 KillMode=mixed

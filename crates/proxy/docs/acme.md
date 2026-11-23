@@ -215,6 +215,15 @@ storage/
         └── meta.json    # Expiry, issued date, domains
 ```
 
+`save_certificate()` replaces each file whole: it writes a temporary file in
+the same directory, flushes it and renames it over the old one, so a reader
+never sees a partly written file. The key is written first (created with mode
+0600), then the certificate, then `meta.json`. The key and the certificate
+cannot change in one step; a reload that reads them between the two renames
+finds a key that does not match the certificate and keeps the pair it serves
+(see below). If the process stops before `meta.json` is written, the metadata
+still carries the old expiry, so the next check renews again.
+
 Key methods:
 - `load_certificate()` / `save_certificate()` - Certificate persistence
 - `load_credentials_json()` / `save_credentials_json()` - Account credentials
@@ -286,6 +295,31 @@ if let Some(ref challenge_manager) = self.acme_challenges {
 }
 ```
 
+### Startup
+
+Before ACME is initialized, every TLS listener that does not take its default
+certificate from ACME is built, and startup stops if one cannot be (for
+example a `cert-file` that does not exist). That check makes no request to the
+CA.
+
+ACME is then initialized, for listeners with protocol `https` or `h2` (the
+two are built the same way). A listener's certificate is read from
+`<storage>/domains/<first domain>/cert.pem` and `key.pem`.
+
+- When the first certificate cannot be issued, startup stops there with the
+  ACME error. The exception is an error ACME treats as retryable while a
+  certificate already exists: startup continues with it and the renewal is
+  retried in the background.
+- A start that stops during ACME initialization runs it again on the next
+  start, at the pace the service manager restarts the process.
+- If the files are still missing when the listener is built, startup fails
+  with an error naming the listener, its address and the missing file. The
+  proxy does not skip the listener and keep running.
+
+`zentinel test` does not check the default certificate of an `https` or `h2`
+listener that ACME manages: it is issued while the proxy starts, so it need
+not exist yet.
+
 ### TLS Hot-Reload
 
 After a successful renewal, the scheduler applies the new certificate to the
@@ -293,9 +327,9 @@ running listeners; no `SIGHUP` is needed.
 
 The renewal schedulers are created while ACME is initialized, before any
 listener has built its certificate resolver. They are therefore given the
-`CertificateReloader`, the registry that each HTTPS listener adds its
-`HotReloadableSniResolver` to as it starts (the registry `SIGHUP` also uses),
-rather than a resolver:
+`CertificateReloader`, the registry that each `https` and `h2` listener adds
+its `HotReloadableSniResolver` to as it starts (the registry `SIGHUP` also
+uses), rather than a resolver:
 
 ```rust
 // RenewalScheduler::apply_renewed_certificate()
@@ -316,7 +350,23 @@ ACME `sni` certificate that the listener was serving cannot be loaded. An ACME
 the listener starts and when it reloads. This also applies to a `SIGHUP`
 reload.
 
-If a listener cannot load the renewed files, it keeps serving the certificates it
+Every certificate load checks that the private key belongs to the
+certificate, and a reload refuses an ACME certificate that has expired. (At
+startup an expired ACME certificate is still loaded, so the listener starts
+and the renewal replaces it.)
+
+A listener's certificates are reloaded together, all or none. One ACME `sni`
+certificate that the listener was serving and that can no longer be read (its
+files deleted, unreadable, or truncated) therefore fails the reload of the
+whole listener: every other certificate of that listener, including one that
+was just renewed, stays at the version loaded before, and each later renewal
+or `SIGHUP` fails the same way until the unreadable files are fixed or the
+`sni` entry is removed. The error names the listener and the primary domain of
+the certificate that could not be loaded. Listeners that do not serve it
+are not affected.
+
+If a listener cannot load the renewed files (unreadable, a key that does not
+match, expired), it keeps serving the certificates it
 had. The scheduler logs an error naming the listener and the domain, and
 `zentinel_tls_reload_total{listener,result="failure"}` is incremented. The reload
 is not retried: the next check finds a valid certificate and does not renew

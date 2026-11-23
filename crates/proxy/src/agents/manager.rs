@@ -18,7 +18,7 @@ use zentinel_agent_protocol::{
 use zentinel_common::{
     errors::{ZentinelError, ZentinelResult},
     types::CircuitBreakerConfig,
-    CircuitBreaker,
+    Admission, CircuitBreaker, TrialSlot,
 };
 use zentinel_config::{AgentConfig, BodyStreamingMode, Config, FailureMode};
 
@@ -26,6 +26,41 @@ use super::agent_v2::AgentV2;
 use super::context::AgentCallContext;
 use super::decision::AgentDecision;
 use super::metrics::AgentMetrics;
+
+/// A call let through an agent's circuit breaker, holding the half-open trial
+/// slot it may have taken.
+///
+/// The slot is given back when the call is over, whatever its end: after a
+/// success the breaker can let the next trial in, after a failure the breaker
+/// has re-opened and giving it back does nothing, and a call that ends with no
+/// result (the request future was dropped because the client went away, or a
+/// sibling agent's decision ended the request) does not keep the slot until
+/// the breaker's timeout lets another trial in.
+#[must_use = "dropping the admission at once gives its trial slot back before the call"]
+struct AgentAdmission<'a> {
+    breaker: &'a CircuitBreaker,
+    slot: Option<TrialSlot>,
+}
+
+impl<'a> AgentAdmission<'a> {
+    /// Ask `breaker` whether a call may go ahead. `None` means it may not.
+    fn admit(breaker: &'a CircuitBreaker) -> Option<Self> {
+        let slot = match breaker.admit() {
+            Admission::Refused => return None,
+            Admission::Allowed => None,
+            Admission::Trial(slot) => Some(slot),
+        };
+        Some(Self { breaker, slot })
+    }
+}
+
+impl Drop for AgentAdmission<'_> {
+    fn drop(&mut self) {
+        if let Some(slot) = self.slot.take() {
+            self.breaker.release_half_open_slot(slot);
+        }
+    }
+}
 
 /// Loads the agents of a configuration before it becomes current.
 ///
@@ -858,8 +893,9 @@ impl AgentManager {
                 }
             };
 
-            // Check circuit breaker
-            if !agent.circuit_breaker().is_closed() {
+            // Check circuit breaker; a half-open trial slot is held until the
+            // call is over.
+            let Some(_admission) = AgentAdmission::admit(agent.circuit_breaker()) else {
                 warn!(
                     agent_id = %agent.id(),
                     correlation_id = %event.correlation_id,
@@ -879,7 +915,7 @@ impl AgentManager {
                     ));
                 }
                 continue;
-            }
+            };
 
             // Call agent with timeout
             let start = Instant::now();
@@ -1080,8 +1116,9 @@ impl AgentManager {
                 }
             };
 
-            // Check circuit breaker
-            if !agent.circuit_breaker().is_closed() {
+            // Check circuit breaker; a half-open trial slot is held until the
+            // call is over.
+            let Some(_admission) = AgentAdmission::admit(agent.circuit_breaker()) else {
                 warn!(
                     agent_id = %agent.id(),
                     correlation_id = %ctx.correlation_id,
@@ -1100,7 +1137,7 @@ impl AgentManager {
                         .with_decided_by(agent.id()));
                 }
                 continue;
-            }
+            };
 
             // Call agent with timeout (using pingora-timeout for efficiency).
             // The filter's `timeout-ms` applies here as in the parallel
@@ -1305,8 +1342,9 @@ impl AgentManager {
                         None
                     };
 
-                    // Check circuit breaker
-                    if !agent.circuit_breaker().is_closed() {
+                    // Check circuit breaker; a half-open trial slot is held
+                    // until the call is over.
+                    let Some(_admission) = AgentAdmission::admit(agent.circuit_breaker()) else {
                         warn!(
                             agent_id = %agent.id(),
                             correlation_id = %correlation_id,
@@ -1318,7 +1356,7 @@ impl AgentManager {
                             filter_failure_mode,
                             "Circuit breaker open".to_string(),
                         ));
-                    }
+                    };
 
                     // Call agent with timeout
                     let start = Instant::now();
@@ -1632,15 +1670,16 @@ impl AgentManager {
             None
         };
 
-        // Check circuit breaker
-        if !agent.circuit_breaker().is_closed() {
+        // Check circuit breaker; a half-open trial slot is held until the
+        // call is over.
+        let Some(_admission) = AgentAdmission::admit(agent.circuit_breaker()) else {
             return Err(ZentinelError::Agent {
                 agent: agent_name.to_string(),
                 message: "Circuit breaker open".to_string(),
                 event: "guardrail_inspect".to_string(),
                 source: None,
             });
-        }
+        };
 
         let start = Instant::now();
         let timeout_duration = Duration::from_millis(agent.timeout_ms());
@@ -2100,6 +2139,7 @@ mod body_mode_tests {
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+    use zentinel_common::types::CircuitBreakerState;
 
     fn agent_from_kdl(circuit_breaker: &str) -> AgentConfig {
         let kdl = format!(
@@ -2152,6 +2192,62 @@ mod tests {
         assert!(agent.circuit_breaker().is_closed());
         agent.record_failure();
         assert!(!agent.circuit_breaker().is_closed());
+    }
+
+    fn half_open_breaker() -> CircuitBreaker {
+        let breaker = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 1,
+            success_threshold: 3,
+            // Long enough that a stalled trial is not restarted during the
+            // test (that takes another timeout once half-open).
+            timeout_seconds: 1,
+            half_open_max_requests: 1,
+        });
+        breaker.record_failure();
+        std::thread::sleep(Duration::from_millis(1100));
+        // The request that ends the open period holds no trial slot.
+        let first = AgentAdmission::admit(&breaker).expect("open period is over");
+        assert!(first.slot.is_none());
+        drop(first);
+        breaker
+    }
+
+    /// An agent call let through as the half-open trial that ends without a
+    /// result -- its future dropped mid-call because the client went away --
+    /// gives its slot back, so the agent is not skipped until the breaker's
+    /// timeout. With `is_closed()` the slot stayed taken.
+    #[test]
+    fn a_trial_agent_call_that_ends_without_a_result_does_not_block_the_agent() {
+        let breaker = half_open_breaker();
+        let trial = AgentAdmission::admit(&breaker).expect("the one trial");
+        assert!(trial.slot.is_some());
+        assert!(
+            AgentAdmission::admit(&breaker).is_none(),
+            "the one slot is taken while the call runs"
+        );
+        drop(trial);
+        assert!(
+            AgentAdmission::admit(&breaker).is_some(),
+            "the slot came back with the call"
+        );
+    }
+
+    /// A successful trial gives its slot back too, so a `success-threshold`
+    /// above `half-open-max-requests` is reached call after call instead of
+    /// one call per timeout.
+    #[test]
+    fn a_successful_trial_agent_call_lets_the_next_trial_in() {
+        let breaker = half_open_breaker();
+        for _ in 0..2 {
+            let trial = AgentAdmission::admit(&breaker).expect("a trial");
+            breaker.record_success();
+            drop(trial);
+            assert_eq!(breaker.state(), CircuitBreakerState::HalfOpen);
+        }
+        let trial = AgentAdmission::admit(&breaker).expect("a trial");
+        breaker.record_success();
+        drop(trial);
+        assert_eq!(breaker.state(), CircuitBreakerState::Closed);
     }
 
     /// A success in between resets the count: failures must be consecutive.

@@ -157,11 +157,29 @@ let policy = RetryPolicy::default();
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `max_attempts` | u32 | 3 | Maximum retry attempts |
+| `max_attempts` | u32 | 3 | Attempts at one request, the first one included, whatever made the proxy try again |
 | `timeout_ms` | u64 | 30000 | Total timeout for all attempts |
 | `backoff_base_ms` | u64 | 100 | Initial backoff delay |
 | `backoff_max_ms` | u64 | 5000 | Maximum backoff delay |
 | `retryable_status_codes` | Vec<u16> | [502, 503, 504] | Status codes to retry |
+
+### Idempotent methods
+
+```rust
+use zentinel_common::types::is_idempotent_method;
+
+assert!(is_idempotent_method("GET"));
+assert!(!is_idempotent_method("POST"));
+assert!(!is_idempotent_method("get")); // method names are case-sensitive
+assert!(!is_idempotent_method("QUERY")); // not an RFC 9110 method
+```
+
+`is_idempotent_method` is true for the six idempotent methods of RFC 9110
+section 9.2.2: GET, HEAD, OPTIONS, TRACE, PUT and DELETE. It is the one
+definition the proxy uses to decide whether a request may be sent again, after
+an error and after a retryable status code alike. A request with any other
+method is sent again only where `retry_non_idempotent` is set
+(`RetryPolicy::may_retry_method`).
 
 ## Circuit Breaker
 

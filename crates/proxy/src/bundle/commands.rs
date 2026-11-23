@@ -46,7 +46,13 @@ pub enum BundleCommand {
         #[arg(long)]
         prefix: Option<PathBuf>,
 
-        /// Skip checksum verification
+        /// Install without checking the archives' SHA256 checksums
+        ///
+        /// The .sha256 files are not downloaded, so an archive that does not
+        /// match its published checksum is installed as well. Each agent
+        /// installed this way is reported as unverified, with a warning on
+        /// stderr. The install script's --skip-verify is different: it still
+        /// checks a checksum it can download and stops on a mismatch.
         #[arg(long)]
         skip_verify: bool,
     },
@@ -254,6 +260,12 @@ fn cmd_install(
             download.archive_size / 1024,
             checksum_status
         );
+        if !download.checksum_verified {
+            eprintln!(
+                "    Warning: {} {} was installed without checking its SHA256 checksum (--skip-verify)",
+                agent.name, agent.version
+            );
+        }
         installed += 1;
         ready.push(agent);
     }

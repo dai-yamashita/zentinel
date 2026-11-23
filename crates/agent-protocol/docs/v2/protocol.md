@@ -385,8 +385,19 @@ pub struct ResponseHeadersMessage {
 are strings. A value that is valid UTF-8 (`café`) is sent as that text. Any
 other value is sent with each byte as the Unicode code point of the same value
 (U+0000 to U+00FF, as if read as ISO-8859-1): the byte `0xE9` is sent as
-`é`. A value is never sent as an empty string because of its bytes. The
-upstream and the client receive the original bytes.
+`é`. The choice is made for the value as a whole: `caf\xC3\xA9\xFF` is not
+valid UTF-8, so all its bytes are mapped one by one and it is sent as `cafÃ©ÿ`.
+A value is never sent as an empty string because of its bytes. The upstream and
+the client receive the original bytes, unless an agent changes that header.
+
+The mapping is not reversible. The values `caf\xE9` (ISO-8859-1) and
+`caf\xC3\xA9` (UTF-8) are different bytes, and both are sent as `café`. From
+the string alone, an agent cannot tell which bytes the client or the upstream
+sent, and cannot detect that a value was not valid UTF-8.
+
+A value an agent writes in a header change is a string, and is written as its
+UTF-8 bytes: an agent that writes back the `café` it received for `caf\xE9`
+makes the upstream receive `caf\xC3\xA9`.
 
 ### ResponseBodyChunk
 

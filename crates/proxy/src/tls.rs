@@ -306,6 +306,7 @@ impl SniResolver {
 
         // Get cert_file and key_file - manual certs or ACME-managed paths
         let (cert_path_buf, key_path_buf);
+        let default_is_acme = config.cert_file.is_none() || config.key_file.is_none();
         let (cert_file, key_file) = match (&config.cert_file, &config.key_file) {
             (Some(cert), Some(key)) => (cert.as_path(), key.as_path()),
             _ if config.acme.is_some() => {
@@ -327,7 +328,11 @@ impl SniResolver {
         };
 
         // Load default certificate
-        let default_cert = load_certified_key(cert_file, key_file)?;
+        let default_cert = if default_is_acme {
+            load_acme_certified_key(cert_file, key_file, previous.is_some())?
+        } else {
+            load_certified_key(cert_file, key_file)?
+        };
 
         info!(
             listener_id = %listener_id_str,
@@ -376,7 +381,12 @@ impl SniResolver {
                 _ => unreachable!("Config validation ensures certs or acme"),
             };
 
-            let cert = match load_certified_key(sni_cert_path, sni_key_path) {
+            let loaded = if sni_config.cert_file.is_some() && sni_config.key_file.is_some() {
+                load_certified_key(sni_cert_path, sni_key_path)
+            } else {
+                load_acme_certified_key(sni_cert_path, sni_key_path, previous.is_some())
+            };
+            let cert = match loaded {
                 Ok(cert) => Arc::new(cert),
                 Err(e) => {
                     // If ACME is configured, the certificate might not exist yet.
@@ -1431,7 +1441,78 @@ fn load_certified_key(cert_path: &Path, key_path: &Path) -> Result<CertifiedKey,
         .load_private_key(key)
         .map_err(|e| TlsError::CertKeyMismatch(format!("Failed to load private key: {:?}", e)))?;
 
-    Ok(CertifiedKey::new(certs, signing_key))
+    let certified = CertifiedKey::new(certs, signing_key);
+    // A key that does not belong to the certificate would fail every
+    // handshake; refuse the pair here, where a reload can keep the previous
+    // one and the error names the files.
+    match certified.keys_match() {
+        Ok(()) => {}
+        Err(rustls::Error::InconsistentKeys(rustls::InconsistentKeys::KeyMismatch)) => {
+            return Err(TlsError::CertKeyMismatch(format!(
+                "the private key in {} does not belong to the certificate in {}",
+                key_path.display(),
+                cert_path.display()
+            )));
+        }
+        // The key's public half or the certificate could not be compared;
+        // the pair is loaded as before.
+        Err(e) => debug!(
+            cert_file = %cert_path.display(),
+            key_file = %key_path.display(),
+            error = %e,
+            "Could not check that the private key matches the certificate"
+        ),
+    }
+
+    Ok(certified)
+}
+
+/// Load an ACME-managed certificate and key from the ACME storage.
+///
+/// Like [`load_certified_key`], which already refuses a key that does not
+/// belong to the certificate. When `reloading`, a certificate that has
+/// expired is refused too, so that a reload keeps the pair it was serving
+/// instead of swapping in an expired one. At startup an expired certificate
+/// is still loaded: it is served until the renewal scheduler replaces it,
+/// rather than keeping the listener from starting.
+fn load_acme_certified_key(
+    cert_path: &Path,
+    key_path: &Path,
+    reloading: bool,
+) -> Result<CertifiedKey, TlsError> {
+    let certified = load_certified_key(cert_path, key_path)?;
+    if reloading {
+        reject_expired(&certified, cert_path)?;
+    }
+    Ok(certified)
+}
+
+/// Refuse a certificate whose end-entity certificate is past its `notAfter`.
+fn reject_expired(certified: &CertifiedKey, cert_path: &Path) -> Result<(), TlsError> {
+    use x509_parser::prelude::*;
+
+    let Some(end_entity) = certified.cert.first() else {
+        return Err(TlsError::CertificateLoad(format!(
+            "{}: No certificates found in file",
+            cert_path.display()
+        )));
+    };
+    let (_, cert) = X509Certificate::from_der(end_entity).map_err(|e| {
+        TlsError::InvalidCertificate(format!(
+            "{}: failed to parse X.509 certificate: {}",
+            cert_path.display(),
+            e
+        ))
+    })?;
+    let not_after = cert.validity().not_after;
+    if not_after.timestamp() <= chrono::Utc::now().timestamp() {
+        return Err(TlsError::InvalidCertificate(format!(
+            "{}: the certificate expired at {}",
+            cert_path.display(),
+            not_after
+        )));
+    }
+    Ok(())
 }
 
 /// Extract DNS hostnames from a certificate's CN and Subject Alternative Names.
@@ -1733,6 +1814,31 @@ pub fn build_server_config_with_resolver(
     Ok(server_config)
 }
 
+/// Load what a `tls` block reads besides its default certificate: the `sni`
+/// certificates that name files, and the client CA when client authentication
+/// is on.
+///
+/// For a listener whose default certificate is issued by ACME and need not
+/// exist yet, so that the rest of the block can still be checked.
+///
+/// # Errors
+///
+/// Returns the error of the first file that cannot be loaded; it names the
+/// file.
+pub fn check_extra_tls_files(config: &TlsConfig) -> Result<(), TlsError> {
+    for sni in &config.additional_certs {
+        if let (Some(cert), Some(key)) = (&sni.cert_file, &sni.key_file) {
+            load_certified_key(cert, key)?;
+        }
+    }
+    if config.client_auth {
+        if let Some(ca_path) = &config.ca_file {
+            load_client_ca(ca_path)?;
+        }
+    }
+    Ok(())
+}
+
 /// Validate TLS configuration files exist and are readable
 pub fn validate_tls_config(config: &TlsConfig) -> Result<(), TlsError> {
     // If ACME is configured, skip manual cert file validation
@@ -1836,6 +1942,55 @@ mod tests {
         let hostname = "Example.COM";
         let normalized = hostname.to_lowercase();
         assert_eq!(normalized, "example.com");
+    }
+}
+
+#[cfg(test)]
+mod load_tests {
+    use super::*;
+
+    fn fixture(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tls")
+            .join(name)
+    }
+
+    #[test]
+    fn a_matching_pair_loads() {
+        load_certified_key(
+            &fixture("server-default.crt"),
+            &fixture("server-default.key"),
+        )
+        .expect("a certificate with its own key");
+    }
+
+    /// A key that belongs to another certificate is refused, naming both
+    /// files, instead of being served and failing every handshake.
+    #[test]
+    fn a_key_of_another_certificate_is_refused() {
+        let err = load_certified_key(&fixture("server-api.crt"), &fixture("server-default.key"))
+            .expect_err("mismatched pair");
+        assert!(matches!(err, TlsError::CertKeyMismatch(_)), "{err}");
+        let message = err.to_string();
+        assert!(message.contains("server-default.key"), "{message}");
+        assert!(message.contains("server-api.crt"), "{message}");
+    }
+
+    /// An expired ACME certificate is not swapped in by a reload; at startup
+    /// it is still loaded, so the listener starts and the renewal replaces it.
+    #[test]
+    fn an_expired_acme_certificate_is_refused_on_reload_only() {
+        let (cert, key) = (fixture("expired.crt"), fixture("expired.key"));
+        let err = load_acme_certified_key(&cert, &key, true).expect_err("expired on reload");
+        assert!(err.to_string().contains("expired"), "{err}");
+        load_acme_certified_key(&cert, &key, false).expect("loaded at startup");
+
+        load_acme_certified_key(
+            &fixture("server-default.crt"),
+            &fixture("server-default.key"),
+            true,
+        )
+        .expect("a valid certificate reloads");
     }
 }
 

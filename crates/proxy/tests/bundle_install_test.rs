@@ -17,7 +17,8 @@
 //!   told the agent to listen;
 //! - `bundle install ratelimit` explains that rate limiting is built in;
 //! - `bundle install` stops when an archive's `.sha256` cannot be fetched or
-//!   read, and installs it unverified only with `--skip-verify`.
+//!   read, and installs it unverified, with a warning on stderr, only with
+//!   `--skip-verify`.
 
 #![cfg(unix)]
 
@@ -268,6 +269,11 @@ fn bundle_install_wires_agents_the_way_they_are_started() {
         assert!(out.status.success(), "install {agent}: {}", text(&out));
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(stdout.contains(", verified)"), "{}", text(&out));
+        assert!(
+            !String::from_utf8_lossy(&out.stderr).contains("without checking its SHA256 checksum"),
+            "{}",
+            text(&out)
+        );
         assert!(stdout.contains("include \""), "{}", text(&out));
     }
 
@@ -490,6 +496,15 @@ fn bundle_install_skip_verify_installs_without_a_checksum_file() {
     assert!(out.status.success(), "{}", text(&out));
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("unverified"),
+        "{}",
+        text(&out)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "Warning: waf {} was installed without checking its SHA256 checksum (--skip-verify)",
+            PINS.waf
+        )),
         "{}",
         text(&out)
     );

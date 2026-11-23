@@ -74,7 +74,10 @@ cannot be downloaded, or does not start with a 64-digit hexadecimal digest,
 the agent is not installed and the command exits non-zero, naming the agent
 and the checksum URL. A digest that does not match the archive stops that
 agent's install in the same way. With `--skip-verify` the checksum is not
-requested and the agent is reported as `unverified`.
+requested, so an archive that does not match it is installed as well; the
+agent is reported as `unverified` and a warning is printed on stderr. The
+install script's `--skip-verify` is different: it still checks a checksum it
+can download and stops on a mismatch (see [deployment.md](deployment.md)).
 
 ### `zentinel bundle status`
 

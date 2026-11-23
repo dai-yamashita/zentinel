@@ -22,7 +22,7 @@ use tracing::{debug, info, trace, warn};
 
 use zentinel_common::ids::Scope;
 use zentinel_common::types::{CircuitBreakerConfig, CircuitBreakerState};
-use zentinel_common::CircuitBreaker;
+use zentinel_common::{Admission, CircuitBreaker, TrialSlot};
 
 /// Scope-aware circuit breaker manager.
 ///
@@ -102,13 +102,24 @@ impl ScopedCircuitBreakerManager {
             .clone()
     }
 
-    /// Check if a request should be allowed for a scope and upstream.
+    /// Decide whether a request is let through for a scope and upstream.
     ///
-    /// Returns `true` if the circuit breaker is closed or half-open.
+    /// See [`CircuitBreaker::admit`]. A request let through as a half-open
+    /// trial gets an [`Admission::Trial`]; when it ends without a result (it
+    /// was neither a success nor a failure) its slot goes back through
+    /// [`release_half_open_slot`](Self::release_half_open_slot), or the
+    /// breaker lets no other trial in until its timeout.
     /// This operation is lock-free and completes in O(1) time.
-    pub async fn is_allowed(&self, scope: &Scope, upstream_id: &str) -> bool {
+    pub async fn admit(&self, scope: &Scope, upstream_id: &str) -> Admission {
         let breaker = self.get_breaker(scope, upstream_id);
-        breaker.is_closed() // Lock-free, no await needed
+        breaker.admit() // Lock-free, no await needed
+    }
+
+    /// Give back the half-open trial slot of a request that ended without a
+    /// result; see [`CircuitBreaker::release_half_open_slot`].
+    pub async fn release_half_open_slot(&self, scope: &Scope, upstream_id: &str, slot: TrialSlot) {
+        let breaker = self.get_breaker(scope, upstream_id);
+        breaker.release_half_open_slot(slot);
     }
 
     /// Record a successful request for a scope and upstream.
@@ -301,10 +312,16 @@ mod tests {
         }
 
         // API scope should be open
-        assert!(!manager.is_allowed(&api_scope, "backend").await);
+        assert_eq!(
+            manager.admit(&api_scope, "backend").await,
+            Admission::Refused
+        );
 
         // Global scope with same upstream should still be allowed
-        assert!(manager.is_allowed(&global_scope, "backend").await);
+        assert_ne!(
+            manager.admit(&global_scope, "backend").await,
+            Admission::Refused
+        );
     }
 
     #[tokio::test]
@@ -324,7 +341,10 @@ mod tests {
         manager.record_failure(&svc_scope, "backend").await;
         manager.record_failure(&svc_scope, "backend").await;
 
-        assert!(!manager.is_allowed(&svc_scope, "backend").await);
+        assert_eq!(
+            manager.admit(&svc_scope, "backend").await,
+            Admission::Refused
+        );
     }
 
     #[tokio::test]
@@ -342,7 +362,10 @@ mod tests {
         // Single failure should trip it
         manager.record_failure(&svc_scope, "backend").await;
 
-        assert!(!manager.is_allowed(&svc_scope, "backend").await);
+        assert_eq!(
+            manager.admit(&svc_scope, "backend").await,
+            Admission::Refused
+        );
     }
 
     #[tokio::test]
@@ -354,11 +377,11 @@ mod tests {
 
         // Trip the breaker
         manager.record_failure(&scope, "backend").await;
-        assert!(!manager.is_allowed(&scope, "backend").await);
+        assert_eq!(manager.admit(&scope, "backend").await, Admission::Refused);
 
         // Reset it
         manager.reset(&scope, "backend").await;
-        assert!(manager.is_allowed(&scope, "backend").await);
+        assert_ne!(manager.admit(&scope, "backend").await, Admission::Refused);
     }
 
     #[tokio::test]
@@ -372,14 +395,14 @@ mod tests {
         manager.record_failure(&scope, "backend1").await;
         manager.record_failure(&scope, "backend2").await;
 
-        assert!(!manager.is_allowed(&scope, "backend1").await);
-        assert!(!manager.is_allowed(&scope, "backend2").await);
+        assert_eq!(manager.admit(&scope, "backend1").await, Admission::Refused);
+        assert_eq!(manager.admit(&scope, "backend2").await, Admission::Refused);
 
         // Reset all in scope
         manager.reset_scope(&scope).await;
 
-        assert!(manager.is_allowed(&scope, "backend1").await);
-        assert!(manager.is_allowed(&scope, "backend2").await);
+        assert_ne!(manager.admit(&scope, "backend1").await, Admission::Refused);
+        assert_ne!(manager.admit(&scope, "backend2").await, Admission::Refused);
     }
 
     #[tokio::test]
@@ -418,7 +441,7 @@ mod tests {
 
         // Wait for timeout and trigger half-open
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        manager.is_allowed(&scope, "backend").await;
+        let _ = manager.admit(&scope, "backend").await;
 
         assert_eq!(
             manager.state(&scope, "backend").await,
@@ -433,6 +456,37 @@ mod tests {
             manager.state(&scope, "backend").await,
             CircuitBreakerState::Closed
         );
+    }
+
+    /// A half-open trial that ends without a result gives its slot back, so
+    /// the next request is let through as a trial instead of being refused
+    /// until the breaker's timeout.
+    #[tokio::test]
+    async fn a_released_trial_slot_lets_the_next_trial_in() {
+        let manager = ScopedCircuitBreakerManager::with_default_config(CircuitBreakerConfig {
+            failure_threshold: 1,
+            success_threshold: 1,
+            // Long enough that a stalled trial is not restarted during the
+            // test (that takes another timeout once half-open).
+            timeout_seconds: 1,
+            half_open_max_requests: 1,
+        });
+        let scope = Scope::Global;
+        manager.record_failure(&scope, "backend").await;
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        // The request that ends the open period holds no slot.
+        assert_eq!(manager.admit(&scope, "backend").await, Admission::Allowed);
+        let Admission::Trial(slot) = manager.admit(&scope, "backend").await else {
+            panic!("the second request is the half-open trial");
+        };
+        assert_eq!(manager.admit(&scope, "backend").await, Admission::Refused);
+        manager
+            .release_half_open_slot(&scope, "backend", slot)
+            .await;
+        assert!(matches!(
+            manager.admit(&scope, "backend").await,
+            Admission::Trial(_)
+        ));
     }
 
     #[test]

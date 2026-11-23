@@ -83,6 +83,9 @@ spec:
         - name: metrics
           containerPort: {{ .Values.proxy.service.metricsPort }}
           protocol: TCP
+        - name: health
+          containerPort: {{ .Values.proxy.service.healthPort }}
+          protocol: TCP
         env:
         - name: RUST_LOG
           value: {{ .Values.proxy.logLevel | default "info,zentinel_proxy=info" }}
@@ -160,7 +163,7 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
         command:
-        - /usr/local/bin/zentinel-proxy
+        - /zentinel
         args:
         - -c
         - /etc/zentinel/config.kdl

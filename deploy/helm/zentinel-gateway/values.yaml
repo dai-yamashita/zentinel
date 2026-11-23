@@ -71,7 +71,13 @@ nodeSelector: {}
 tolerations: []
 affinity: {}
 
-# Additional environment variables
+# Additional environment variables for the controller. For example,
+# CLIENT_IPV6_PREFIX_LENGTH sets `client-ipv6-prefix-length` in the generated
+# proxy configuration (default 64; 1 to 128, anything else stops the
+# controller). The proxy reads it at startup, so restart the pod after a change.
+#   extraEnv:
+#     - name: CLIENT_IPV6_PREFIX_LENGTH
+#       value: "128"
 extraEnv: []
 
 # Pod security context
