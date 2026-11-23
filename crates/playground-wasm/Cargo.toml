@@ -1,6 +1,6 @@
 [package]
 name = "zentinel-playground-wasm"
-version = "0.6.60"
+version = "0.6.61"
 edition = "2021"
 authors = ["Zentinel Contributors"]
 license = "Apache-2.0"
