@@ -320,11 +320,16 @@ impl InferenceRateLimitManager {
         })
     }
 
-    /// Clean up idle rate limiters (called periodically)
-    pub fn cleanup(&self) {
-        // Currently, cleanup is handled internally by the rate limiters
-        // This is a hook for future cleanup logic
-        trace!("Inference rate limit cleanup");
+    /// Drop the rate limit buckets of idle clients on every route (called
+    /// periodically). Returns how many were dropped.
+    pub fn cleanup(&self) -> usize {
+        let removed: usize = self
+            .routes
+            .iter()
+            .filter_map(|state| state.rate_limiter.as_ref().map(|l| l.remove_idle()))
+            .sum();
+        trace!(removed, "Inference rate limit cleanup");
+        removed
     }
 }
 

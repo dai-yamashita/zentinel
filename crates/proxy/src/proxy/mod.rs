@@ -348,7 +348,11 @@ impl ZentinelProxy {
         ));
 
         // Start periodic cleanup task for rate limiters and geo caches
-        Self::spawn_cleanup_task(rate_limit_manager.clone(), geo_filter_manager.clone());
+        Self::spawn_cleanup_task(
+            rate_limit_manager.clone(),
+            geo_filter_manager.clone(),
+            inference_rate_limit_manager.clone(),
+        );
 
         // Mark as ready
         app_state.set_ready(true);
@@ -1145,6 +1149,7 @@ impl ZentinelProxy {
     fn spawn_cleanup_task(
         rate_limit_manager: Arc<RateLimitManager>,
         geo_filter_manager: Arc<GeoFilterManager>,
+        inference_rate_limit_manager: Arc<InferenceRateLimitManager>,
     ) {
         // Cleanup interval: 5 minutes
         const CLEANUP_INTERVAL: Duration = Duration::from_secs(300);
@@ -1162,6 +1167,9 @@ impl ZentinelProxy {
 
                 // Clean up expired geo filter caches
                 geo_filter_manager.clear_expired_caches();
+
+                // Drop the inference rate limit buckets of idle clients
+                inference_rate_limit_manager.cleanup();
 
                 debug!("Periodic cleanup completed");
             }

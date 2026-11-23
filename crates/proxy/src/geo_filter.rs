@@ -219,6 +219,11 @@ pub struct GeoFilterResult {
 // GeoFilterPool
 // =============================================================================
 
+/// Most lookup results one geo filter keeps cached. An entry is an address,
+/// a country code and a timestamp (well under 100 bytes), so a full cache is
+/// a few megabytes.
+pub(crate) const GEO_CACHE_MAX_ENTRIES: usize = 100_000;
+
 /// A single geo filter instance with its database and cache
 pub struct GeoFilterPool {
     /// The underlying GeoIP database (wrapped in RwLock for hot reload)
@@ -351,14 +356,7 @@ impl GeoFilterPool {
         let database = self.database.read();
         match database.lookup(ip) {
             Ok(country_code) => {
-                // Cache the result
-                self.cache.insert(
-                    ip,
-                    CachedCountry {
-                        country_code: country_code.clone(),
-                        cached_at: now,
-                    },
-                );
+                self.cache_result(ip, country_code.clone(), now);
                 self.evaluate(country_code, false)
             }
             Err(e) => {
@@ -366,6 +364,32 @@ impl GeoFilterPool {
                 self.handle_failure()
             }
         }
+    }
+
+    /// Cache a lookup result, keeping the cache at most
+    /// [`GEO_CACHE_MAX_ENTRIES`] entries.
+    ///
+    /// The cache is keyed by the full client address, so a client that
+    /// changes address often (any IPv6 client can within its prefix) adds an
+    /// entry per request. When the cache is full, expired entries are removed;
+    /// if it is still full, the result is not cached. The lookup itself is
+    /// unaffected, so a full cache costs a database lookup per request, never
+    /// a wrong answer.
+    fn cache_result(&self, ip: IpAddr, country_code: Option<String>, now: Instant) {
+        if self.cache.len() >= GEO_CACHE_MAX_ENTRIES && !self.cache.contains_key(&ip) {
+            self.clear_expired();
+            if self.cache.len() >= GEO_CACHE_MAX_ENTRIES {
+                trace!(ip = %ip, "Geo cache full; result not cached");
+                return;
+            }
+        }
+        self.cache.insert(
+            ip,
+            CachedCountry {
+                country_code,
+                cached_at: now,
+            },
+        );
     }
 
     /// Evaluate the filter action based on country code
@@ -1393,6 +1417,58 @@ mod tests {
 
         let (total, _) = pool.cache_stats();
         assert_eq!(total, 0);
+    }
+
+    fn geo_pool_with_ttl(cache_ttl_secs: u64) -> GeoFilterPool {
+        let db = MockGeoDatabase::with_entries(vec![("1.2.3.4", "US")]);
+        let config = GeoFilter {
+            database_path: "/mock/db.mmdb".to_string(),
+            database_type: Some(GeoDatabaseType::MaxMind),
+            action: GeoFilterAction::Block,
+            countries: vec!["CN".to_string()],
+            on_failure: GeoFailureMode::Open,
+            status_code: 403,
+            block_message: None,
+            cache_ttl_secs,
+            add_country_header: false,
+        };
+        GeoFilterPool::new_with_database(config, Arc::new(db))
+    }
+
+    /// Fills the pool's cache with `n` distinct IPv6 addresses of one /64.
+    fn fill_cache(pool: &GeoFilterPool, n: usize, at: Instant) {
+        for i in 0..n as u64 {
+            let ip = IpAddr::V6(std::net::Ipv6Addr::from(
+                0x2001_0db8_0000_0001_0000_0000_0000_0000u128 | i as u128,
+            ));
+            pool.cache_result(ip, Some("US".to_string()), at);
+        }
+    }
+
+    #[test]
+    fn cache_stops_growing_at_its_limit() {
+        let pool = geo_pool_with_ttl(3600);
+        fill_cache(&pool, GEO_CACHE_MAX_ENTRIES + 1000, Instant::now());
+        assert_eq!(pool.cache_stats().0, GEO_CACHE_MAX_ENTRIES);
+
+        // A full cache still answers from the database, uncached.
+        let result = pool.check("1.2.3.4");
+        assert!(result.allowed);
+        assert_eq!(result.country_code.as_deref(), Some("US"));
+        assert!(!result.cache_hit);
+        assert_eq!(pool.cache_stats().0, GEO_CACHE_MAX_ENTRIES);
+    }
+
+    #[test]
+    fn full_cache_drops_expired_entries_to_make_room() {
+        let pool = geo_pool_with_ttl(1);
+        let old = Instant::now() - Duration::from_secs(5);
+        fill_cache(&pool, GEO_CACHE_MAX_ENTRIES, old);
+        assert_eq!(pool.cache_stats(), (GEO_CACHE_MAX_ENTRIES, 0));
+
+        pool.check("1.2.3.4");
+        assert_eq!(pool.cache_stats(), (1, 1));
+        assert!(pool.check("1.2.3.4").cache_hit);
     }
 
     // =========================================================================

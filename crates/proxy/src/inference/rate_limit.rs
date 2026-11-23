@@ -123,6 +123,62 @@ impl TokenBucket {
         self.refill();
         self.tokens.load(Ordering::Acquire)
     }
+
+    /// Whether the bucket has refilled to its capacity. Such a bucket is the
+    /// same as a new one, so it can be dropped without changing any limit.
+    fn is_full(&self) -> bool {
+        self.current_tokens() >= self.max_tokens
+    }
+}
+
+/// Most clients one inference rate limiter keeps a bucket for, per bucket
+/// kind (tokens, requests).
+pub(crate) const MAX_TRACKED_KEYS: usize = 100_000;
+
+/// The bucket for `key`, created if missing.
+///
+/// A map at [`MAX_TRACKED_KEYS`] first drops its full buckets; if it is still
+/// full, the request is checked against a new bucket that is not kept. A
+/// client then still cannot take more than one burst in one request, but its
+/// usage is not carried over until the map has room again.
+fn bucket_for<'a>(
+    buckets: &'a DashMap<String, TokenBucket>,
+    key: &str,
+    new_bucket: impl Fn() -> TokenBucket,
+) -> BucketRef<'a> {
+    if let Some(bucket) = buckets.get(key) {
+        return BucketRef::Kept(bucket);
+    }
+    if buckets.len() >= MAX_TRACKED_KEYS {
+        buckets.retain(|_, bucket| !bucket.is_full());
+        if buckets.len() >= MAX_TRACKED_KEYS {
+            trace!(key = key, "Inference rate limiter full; bucket not kept");
+            return BucketRef::Transient(new_bucket());
+        }
+    }
+    BucketRef::Kept(
+        buckets
+            .entry(key.to_string())
+            .or_insert_with(new_bucket)
+            .downgrade(),
+    )
+}
+
+/// A bucket held in the map, or one made for a single check.
+enum BucketRef<'a> {
+    Kept(dashmap::mapref::one::Ref<'a, String, TokenBucket>),
+    Transient(TokenBucket),
+}
+
+impl std::ops::Deref for BucketRef<'_> {
+    type Target = TokenBucket;
+
+    fn deref(&self) -> &TokenBucket {
+        match self {
+            BucketRef::Kept(bucket) => bucket,
+            BucketRef::Transient(bucket) => bucket,
+        }
+    }
 }
 
 /// Token-based rate limiter for inference endpoints
@@ -154,12 +210,9 @@ impl TokenRateLimiter {
     /// Both token and request limits must pass for the request to be allowed.
     pub fn check(&self, key: &str, estimated_tokens: u64) -> TokenRateLimitResult {
         // Check token limit
-        let token_bucket = self
-            .token_buckets
-            .entry(key.to_string())
-            .or_insert_with(|| {
-                TokenBucket::new(self.config.tokens_per_minute, self.config.burst_tokens)
-            });
+        let token_bucket = bucket_for(&self.token_buckets, key, || {
+            TokenBucket::new(self.config.tokens_per_minute, self.config.burst_tokens)
+        });
 
         if let Err(retry_ms) = token_bucket.try_consume(estimated_tokens) {
             trace!(
@@ -177,7 +230,7 @@ impl TokenRateLimiter {
         if let (Some(rpm), Some(ref request_buckets)) =
             (self.config.requests_per_minute, &self.request_buckets)
         {
-            let request_bucket = request_buckets.entry(key.to_string()).or_insert_with(|| {
+            let request_bucket = bucket_for(request_buckets, key, || {
                 // For request limiting, use burst = rpm / 6 (10 second burst)
                 let burst = rpm.max(1) / 6;
                 TokenBucket::new(rpm, burst.max(1))
@@ -249,6 +302,20 @@ impl TokenRateLimiter {
         self.token_buckets.get(key).map(|b| b.current_tokens())
     }
 
+    /// Drop the buckets that have refilled to capacity: those clients have
+    /// been idle long enough that a new bucket behaves the same.
+    pub fn remove_idle(&self) -> usize {
+        let before = self.token_buckets.len();
+        self.token_buckets.retain(|_, bucket| !bucket.is_full());
+        let mut removed = before - self.token_buckets.len();
+        if let Some(ref request_buckets) = self.request_buckets {
+            let before = request_buckets.len();
+            request_buckets.retain(|_, bucket| !bucket.is_full());
+            removed += before - request_buckets.len();
+        }
+        removed
+    }
+
     /// Get stats for metrics
     pub fn stats(&self) -> TokenRateLimiterStats {
         TokenRateLimiterStats {
@@ -282,6 +349,58 @@ mod tests {
             burst_tokens: 200,
             estimation_method: TokenEstimation::Chars,
         }
+    }
+
+    /// One token a second, so a used bucket stays below its burst for the
+    /// length of a test.
+    fn slow_config() -> TokenRateLimit {
+        TokenRateLimit {
+            tokens_per_minute: 60,
+            requests_per_minute: None,
+            burst_tokens: 200,
+            estimation_method: TokenEstimation::Chars,
+        }
+    }
+
+    #[test]
+    fn remove_idle_drops_full_buckets_only() {
+        let limiter = TokenRateLimiter::new(slow_config());
+        assert!(limiter.check("idle", 0).is_allowed());
+        assert!(limiter.check("busy", 100).is_allowed());
+
+        assert_eq!(limiter.remove_idle(), 1);
+        assert_eq!(limiter.current_tokens("idle"), None);
+        assert_eq!(limiter.current_tokens("busy"), Some(100));
+    }
+
+    #[test]
+    fn buckets_stop_growing_at_the_limit() {
+        let limiter = TokenRateLimiter::new(slow_config());
+        for i in 0..MAX_TRACKED_KEYS {
+            assert!(limiter.check(&format!("client-{i}"), 100).is_allowed());
+        }
+        assert_eq!(limiter.stats().active_keys, MAX_TRACKED_KEYS);
+
+        // A new client is checked against a bucket that is not kept: one
+        // request still cannot take more than a burst.
+        assert!(limiter.check("new", 100).is_allowed());
+        assert!(!limiter.check("new", 300).is_allowed());
+        assert_eq!(limiter.stats().active_keys, MAX_TRACKED_KEYS);
+        assert_eq!(limiter.current_tokens("new"), None);
+
+        // Known clients keep their state.
+        assert!(!limiter.check("client-0", 150).is_allowed());
+    }
+
+    #[test]
+    fn full_map_drops_idle_buckets_to_make_room() {
+        let limiter = TokenRateLimiter::new(slow_config());
+        for i in 0..MAX_TRACKED_KEYS {
+            assert!(limiter.check(&format!("client-{i}"), 0).is_allowed());
+        }
+        assert!(limiter.check("new", 100).is_allowed());
+        assert_eq!(limiter.stats().active_keys, 1);
+        assert_eq!(limiter.current_tokens("new"), Some(100));
     }
 
     #[test]
