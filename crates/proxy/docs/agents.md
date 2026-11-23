@@ -446,6 +446,14 @@ agent "waf-agent" {
 }
 ```
 
+A call waits for a free slot within its `timeout-ms` (the filter's, else the
+agent's): the wait and the call share that time. A call that gets no slot in
+time is not made; it is answered by the filter's `failure-mode` (`closed`: 504,
+`open`: the request continues without this agent) and logged as `No free agent
+call slot within the timeout`. It does not count against the agent's circuit
+breaker, since the agent is busy rather than failing. A busy agent therefore
+holds a request, and what it buffered for the agent, for at most `timeout-ms`.
+
 ## Body Handling
 
 ### Body Modes

@@ -1085,6 +1085,13 @@ impl AgentManager {
             let agent_semaphore = semaphores.get(agent.id()).cloned();
             drop(semaphores); // Release lock before awaiting
 
+            // The call's `timeout-ms` covers the wait for a free call slot
+            // as well as the call, so a busy agent cannot hold requests (and
+            // what they buffered for it) for longer than that (#821).
+            let timeout_ms = filter.effective_timeout_ms(agent.timeout_ms());
+            let timeout_duration = Duration::from_millis(timeout_ms);
+            let queued_at = Instant::now();
+
             let _permit = match agent_semaphore {
                 Some(semaphore) => {
                     trace!(
@@ -1092,18 +1099,35 @@ impl AgentManager {
                         agent_id = %agent.id(),
                         "Acquiring per-agent semaphore permit"
                     );
-                    Some(semaphore.acquire_owned().await.map_err(|_| {
-                        error!(
-                            correlation_id = %ctx.correlation_id,
-                            agent_id = %agent.id(),
-                            "Failed to acquire agent call semaphore permit"
-                        );
-                        ZentinelError::Internal {
-                            message: "Failed to acquire agent call permit".to_string(),
-                            correlation_id: Some(ctx.correlation_id.to_string()),
-                            source: None,
+                    match timeout(timeout_duration, semaphore.acquire_owned()).await {
+                        Ok(permit) => Some(permit.map_err(|_| {
+                            error!(
+                                correlation_id = %ctx.correlation_id,
+                                agent_id = %agent.id(),
+                                "Failed to acquire agent call semaphore permit"
+                            );
+                            ZentinelError::Internal {
+                                message: "Failed to acquire agent call permit".to_string(),
+                                correlation_id: Some(ctx.correlation_id.to_string()),
+                                source: None,
+                            }
+                        })?),
+                        Err(_) => {
+                            agent.record_slot_timeout();
+                            warn!(
+                                agent_id = %agent.id(),
+                                correlation_id = %ctx.correlation_id,
+                                timeout_ms = timeout_ms,
+                                failure_mode = ?filter.failure_mode,
+                                "No free agent call slot within the timeout; agent not called"
+                            );
+                            if filter.failure_mode == FailureMode::Closed {
+                                return Ok(AgentDecision::block(504, "Gateway timeout")
+                                    .with_decided_by(agent.id()));
+                            }
+                            continue;
                         }
-                    })?)
+                    }
                 }
                 None => {
                     // No semaphore found (shouldn't happen, but fail gracefully)
@@ -1139,12 +1163,11 @@ impl AgentManager {
                 continue;
             };
 
-            // Call agent with timeout (using pingora-timeout for efficiency).
-            // The filter's `timeout-ms` applies here as in the parallel
-            // dispatch (#589).
+            // Call agent with what is left of the timeout (using
+            // pingora-timeout for efficiency). The filter's `timeout-ms`
+            // applies here as in the parallel dispatch (#589).
             let start = Instant::now();
-            let timeout_ms = filter.effective_timeout_ms(agent.timeout_ms());
-            let timeout_duration = Duration::from_millis(timeout_ms);
+            let call_timeout = timeout_duration.saturating_sub(queued_at.elapsed());
 
             trace!(
                 correlation_id = %ctx.correlation_id,
@@ -1153,7 +1176,7 @@ impl AgentManager {
                 "Calling agent"
             );
 
-            match timeout(timeout_duration, agent.call_event(event_type, event)).await {
+            match timeout(call_timeout, agent.call_event(event_type, event)).await {
                 Ok(Ok(response)) => {
                     let duration = start.elapsed();
                     agent.record_success(duration);
@@ -1321,11 +1344,31 @@ impl AgentManager {
                 let correlation_id = ctx.correlation_id.clone();
 
                 async move {
+                    // The call's `timeout-ms` covers the wait for a free call
+                    // slot as well as the call (#821).
+                    let timeout_duration = Duration::from_millis(timeout_ms);
+                    let queued_at = Instant::now();
+
                     // Acquire per-agent semaphore permit (queue isolation)
                     let _permit = if let Some(sem) = semaphore {
-                        match sem.acquire_owned().await {
-                            Ok(permit) => Some(permit),
+                        match timeout(timeout_duration, sem.acquire_owned()).await {
+                            Ok(Ok(permit)) => Some(permit),
                             Err(_) => {
+                                agent.record_slot_timeout();
+                                warn!(
+                                    agent_id = %agent.id(),
+                                    correlation_id = %correlation_id,
+                                    timeout_ms = timeout_ms,
+                                    filter_failure_mode = ?filter_failure_mode,
+                                    "No free agent call slot within the timeout; agent not called"
+                                );
+                                return Err((
+                                    agent.id().to_string(),
+                                    filter_failure_mode,
+                                    "Timeout waiting for a call slot".to_string(),
+                                ));
+                            }
+                            Ok(Err(_)) => {
                                 error!(
                                     correlation_id = %correlation_id,
                                     agent_id = %agent.id(),
@@ -1358,11 +1401,11 @@ impl AgentManager {
                         ));
                     };
 
-                    // Call agent with timeout
+                    // Call agent with what is left of the timeout
                     let start = Instant::now();
-                    let timeout_duration = Duration::from_millis(timeout_ms);
+                    let call_timeout = timeout_duration.saturating_sub(queued_at.elapsed());
 
-                    match timeout(timeout_duration, agent.call_event(event_type, event)).await {
+                    match timeout(call_timeout, agent.call_event(event_type, event)).await {
                         Ok(Ok(response)) => {
                             let duration = start.elapsed();
                             agent.record_success(duration);
@@ -2780,6 +2823,16 @@ mod tests {
         timeout_ms: u64,
         events: &str,
     ) -> (Arc<AgentManager>, tempfile::TempDir) {
+        manager_with_slow_agent_settings(delay, timeout_ms, events, "").await
+    }
+
+    /// [`manager_with_slow_agent_on`], with `extra` KDL lines in the agent block.
+    async fn manager_with_slow_agent_settings(
+        delay: Duration,
+        timeout_ms: u64,
+        events: &str,
+        extra: &str,
+    ) -> (Arc<AgentManager>, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = dir.path().join("slow.sock");
         let server = zentinel_agent_protocol::v2::uds_server::UdsAgentServerV2::new(
@@ -2808,6 +2861,7 @@ mod tests {
                     events {events}
                     timeout-ms {timeout_ms}
                     failure-mode "closed"
+                    {extra}
                 }}
             }}
             "#,
@@ -2903,6 +2957,92 @@ mod tests {
                 "{path}: the agent answered within its own timeout"
             );
             assert!(elapsed >= Duration::from_secs(2), "{path}: {elapsed:?}");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // #821: the wait for a free call slot counts against the timeout
+    // ------------------------------------------------------------------
+
+    /// With the agent's only call slot held by a call that takes 1.5 s, a
+    /// second call on `path` (request headers: parallel dispatch; response
+    /// headers: sequential) with a 300 ms filter timeout: its decision and
+    /// how long it took.
+    async fn second_call_while_the_slot_is_taken(
+        failure_mode: FailureMode,
+        path: &'static str,
+    ) -> (AgentDecision, Duration) {
+        let (manager, _dir) = manager_with_slow_agent_settings(
+            Duration::from_millis(1500),
+            10_000,
+            r#""request_headers" "response_headers""#,
+            "max-concurrent-calls 1",
+        )
+        .await;
+        let first = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move {
+                let filters = [FilterAgent {
+                    id: "slow".to_string(),
+                    failure_mode: FailureMode::Closed,
+                    timeout_ms: None,
+                }];
+                manager
+                    .process_request_headers(&call_context(), headers_for("/"), &filters)
+                    .await
+            })
+        };
+        // Let the first call take the slot.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let filters = [FilterAgent {
+            id: "slow".to_string(),
+            failure_mode,
+            timeout_ms: Some(300),
+        }];
+        let ctx = call_context();
+        let start = Instant::now();
+        let decision = match path {
+            "request headers" => {
+                manager
+                    .process_request_headers(&ctx, headers_for("/"), &filters)
+                    .await
+            }
+            "response headers" => {
+                manager
+                    .process_response_headers(&ctx, 200, &HashMap::new(), &filters)
+                    .await
+            }
+            other => panic!("unknown path {other}"),
+        }
+        .unwrap_or_else(|e| panic!("{path}: {e}"));
+        let elapsed = start.elapsed();
+
+        let first = first.await.expect("first call").expect("first decision");
+        assert_eq!(status_of(&first), None, "the first call is answered");
+        (decision, elapsed)
+    }
+
+    #[tokio::test]
+    async fn no_free_call_slot_within_the_timeout_fails_closed() {
+        for path in ["request headers", "response headers"] {
+            let (decision, elapsed) =
+                second_call_while_the_slot_is_taken(FailureMode::Closed, path).await;
+            assert_eq!(status_of(&decision), Some(504), "{path}");
+            assert!(
+                elapsed < Duration::from_millis(1000),
+                "{path}: waited {elapsed:?} for a slot, longer than the 300 ms timeout"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn no_free_call_slot_within_the_timeout_fails_open() {
+        for path in ["request headers", "response headers"] {
+            let (decision, elapsed) =
+                second_call_while_the_slot_is_taken(FailureMode::Open, path).await;
+            assert_eq!(status_of(&decision), None, "{path}: open continues");
+            assert!(elapsed < Duration::from_millis(1000), "{path}: {elapsed:?}");
         }
     }
 

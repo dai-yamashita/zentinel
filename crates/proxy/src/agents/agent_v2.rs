@@ -757,6 +757,22 @@ impl AgentV2 {
         self.circuit_breaker.record_failure();
     }
 
+    /// Record a call that found no free call slot within its timeout and
+    /// was not made. The agent did not fail, it is busy, so the circuit
+    /// breaker is not told.
+    pub fn record_slot_timeout(&self) {
+        let count = self
+            .metrics
+            .calls_slot_timeout
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        debug!(
+            agent_id = %self.config.id,
+            total_slot_timeouts = count,
+            "Recorded v2 agent call slot timeout"
+        );
+    }
+
     /// Get pool statistics.
     pub async fn pool_stats(&self) -> Option<AgentPoolStats> {
         self.pool.agent_stats(&self.config.id).await

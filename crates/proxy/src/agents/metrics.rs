@@ -15,6 +15,9 @@ pub struct AgentMetrics {
     pub calls_failed: AtomicU64,
     /// Timeout calls
     pub calls_timeout: AtomicU64,
+    /// Calls that found no free call slot (`max-concurrent-calls`) within
+    /// their timeout and were not made
+    pub calls_slot_timeout: AtomicU64,
     /// Circuit breaker trips
     pub circuit_breaker_trips: AtomicU64,
     /// Total call duration (microseconds)
