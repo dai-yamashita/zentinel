@@ -112,14 +112,18 @@ zentinel_upstream_failures_total{upstream="backend", route="api", reason="timeou
 zentinel_upstream_retries_refused_total{reason="non_idempotent_method"}
 ```
 
-`zentinel_upstream_retries_refused_total` counts requests that failed after they
-may have reached the upstream and were not sent again. `reason` is
+`zentinel_upstream_retries_refused_total` counts requests that failed and were
+not sent again, most of them after they may have reached the upstream. `reason` is
 `non_idempotent_method` (the method is not idempotent and the route's
-`retry-policy` does not set `retry-non-idempotent`) or `retry_buffer_truncated`
-(the request body was larger than the retry buffer). A request that an HTTP/2
-upstream did not process (REFUSED_STREAM, or a GOAWAY with a last stream id
-below its stream) is not counted for its method; it is counted, as
-`retry_buffer_truncated`, only when its body was larger than the retry buffer.
+`retry-policy` does not set `retry-non-idempotent`), `retry_buffer_truncated`
+(the request body was larger than the retry buffer) or `max_attempts` (the
+request had made the `max-attempts` of the route's `retry-policy`). A request
+that an HTTP/2 upstream did not process (REFUSED_STREAM, or a GOAWAY with a
+last stream id below its stream) is not counted for its method; it is counted
+as `retry_buffer_truncated` only when its body was larger than the retry
+buffer, and as `max_attempts` when it had made the route's `max-attempts`. A
+retry on another address of a target name that `max-attempts` stopped counts
+too, and nothing had been sent to the upstream in that case.
 
 ### Circuit Breaker Metrics
 

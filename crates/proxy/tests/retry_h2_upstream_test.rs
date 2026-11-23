@@ -6,7 +6,9 @@
 //! before any processing took place. Pingora's HTTP/2 client marks the error
 //! retryable, and the proxy sends the request again, a `POST` included, as
 //! long as its body can still be replayed. A body larger than the retry
-//! buffer cannot, so the request is not sent again.
+//! buffer cannot, so the request is not sent again. The route's `max-attempts`
+//! bounds these retries as it does any other: a request that has made its
+//! attempts is not sent again, whatever its method.
 //!
 //! The tests run the real binary against an HTTP/2 server (the `h2` crate) on
 //! a plain socket, reached with `h2c #true`. Where a test needs frames the
@@ -42,12 +44,53 @@ fn next_port() -> u16 {
     }
 }
 
+/// How often a proxy is started again, on new ports, when another process
+/// holds one of its ports.
+const START_ATTEMPTS: usize = 3;
+
+/// Why a proxy did not start.
+enum StartFailure {
+    /// Another process holds one of its ports; the log says so.
+    PortTaken(String),
+    /// Anything else.
+    Other(String),
+}
+
+/// Whether `log` shows that the proxy bound its metrics port and started to
+/// serve on its HTTP port. The HTTP listener binds when the service starts,
+/// and logs nothing when it has bound.
+fn listens(log: &str, port: u16, metrics_port: u16) -> bool {
+    let has_line = |parts: &[&str]| {
+        log.lines()
+            .any(|line| parts.iter().all(|part| line.contains(part)))
+    };
+    has_line(&[
+        "Metrics server listening",
+        &format!("127.0.0.1:{metrics_port}"),
+    ]) && has_line(&["HTTP listening on", &format!("127.0.0.1:{port}")])
+        && has_line(&["Starting service"])
+}
+
+/// What the log says when another process holds a port of the proxy.
+fn port_taken(log: &str) -> Option<&'static str> {
+    if log.contains("Failed to bind metrics server") {
+        Some("the metrics port is taken")
+    } else if log.contains("is in use, will try again") {
+        Some("the HTTP port is taken")
+    } else {
+        None
+    }
+}
+
 /// What the backend does to the first request or connection it is sent.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Fault {
     /// It reads the request, body included, and resets its stream with
     /// REFUSED_STREAM.
     RefuseStream,
+    /// It does as [`Fault::RefuseStream`] does for the first request, and for
+    /// every request after it.
+    RefuseEveryStream,
     /// On the first connection it answers the first request header with
     /// GOAWAY(NO_ERROR) and a last stream id of 0, so that request, which is
     /// on stream 1, was not processed. It keeps the connection open: closing
@@ -191,7 +234,9 @@ fn spawn_backend(fault: Fault) -> Backend {
                                     length += chunk.len();
                                     let _ = body.flow_control().release_capacity(chunk.len());
                                 }
-                                if fault == Fault::RefuseStream && number == 0 {
+                                if fault == Fault::RefuseEveryStream
+                                    || (fault == Fault::RefuseStream && number == 0)
+                                {
                                     respond.send_reset(h2::Reason::REFUSED_STREAM);
                                     return;
                                 }
@@ -236,10 +281,51 @@ struct Proxy {
 
 impl Proxy {
     fn start(dir: &Path, backend: &Backend) -> Proxy {
-        let (port, metrics_port) = (next_port(), next_port());
-        let path = dir.join("zentinel.kdl");
-        std::fs::write(&path, config(port, metrics_port, backend.port)).unwrap();
-        let log = dir.join("zentinel.log");
+        Proxy::start_with(dir, backend, "")
+    }
+
+    /// Starts the proxy with `retry_policy` in the route, a `retry-policy`
+    /// block or nothing.
+    fn start_with(dir: &Path, backend: &Backend, retry_policy: &str) -> Proxy {
+        Proxy::launch(dir, |port, metrics_port| {
+            config(port, metrics_port, backend.port, retry_policy)
+        })
+    }
+
+    /// Starts the proxy on two free ports, `make_config` writing its
+    /// configuration for them. If another process takes one of the ports
+    /// between the check and the proxy's bind, the proxy says so in its log;
+    /// it is stopped and started again on new ports.
+    fn launch(dir: &Path, make_config: impl Fn(u16, u16) -> String) -> Proxy {
+        let mut taken = Vec::new();
+        for attempt in 0..START_ATTEMPTS {
+            let (port, metrics_port) = (next_port(), next_port());
+            let config = make_config(port, metrics_port);
+            match Proxy::spawn(dir, attempt, port, metrics_port, &config) {
+                Ok(proxy) => return proxy,
+                Err(StartFailure::PortTaken(log)) => taken.push(log),
+                Err(StartFailure::Other(why)) => panic!("{why}"),
+            }
+        }
+        panic!(
+            "every start found a port taken by another process; logs:\n{}",
+            taken.join("\n--\n")
+        );
+    }
+
+    /// Starts the proxy and waits until its own log says that it listens on
+    /// both ports: a connection that succeeds could be one to another
+    /// process that holds the port.
+    fn spawn(
+        dir: &Path,
+        attempt: usize,
+        port: u16,
+        metrics_port: u16,
+        config: &str,
+    ) -> Result<Proxy, StartFailure> {
+        let path = dir.join(format!("zentinel-{attempt}.kdl"));
+        std::fs::write(&path, config).unwrap();
+        let log = dir.join(format!("zentinel-{attempt}.log"));
         let log_file = std::fs::File::create(&log).unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_zentinel"))
             .arg("-c")
@@ -248,20 +334,43 @@ impl Proxy {
             .stderr(Stdio::from(log_file))
             .spawn()
             .unwrap();
-        let proxy = Proxy {
+        // Dropping it, on a failure below too, stops this child.
+        let mut proxy = Proxy {
             child,
             port,
             metrics_port,
             log,
         };
         let deadline = Instant::now() + Duration::from_secs(30);
-        while TcpStream::connect(("127.0.0.1", port)).is_err()
-            || TcpStream::connect(("127.0.0.1", metrics_port)).is_err()
-        {
-            assert!(Instant::now() < deadline, "the proxy never listened");
-            std::thread::sleep(Duration::from_millis(100));
+        loop {
+            let log = proxy.log();
+            if let Some(why) = port_taken(&log) {
+                return Err(StartFailure::PortTaken(format!("{why}:\n{log}")));
+            }
+            if let Ok(Some(status)) = proxy.child.try_wait() {
+                return Err(StartFailure::Other(format!(
+                    "the proxy exited ({status}) before it listened; log:\n{log}"
+                )));
+            }
+            if listens(&log, port, metrics_port)
+                && TcpStream::connect(("127.0.0.1", port)).is_ok()
+                && TcpStream::connect(("127.0.0.1", metrics_port)).is_ok()
+            {
+                // Read after the connections: a bind that failed is in the log
+                // by now.
+                let log = proxy.log();
+                return match port_taken(&log) {
+                    Some(why) => Err(StartFailure::PortTaken(format!("{why}:\n{log}"))),
+                    None => Ok(proxy),
+                };
+            }
+            if Instant::now() >= deadline {
+                return Err(StartFailure::Other(format!(
+                    "the proxy never listened; log:\n{log}"
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
-        proxy
     }
 
     fn log(&self) -> String {
@@ -283,9 +392,15 @@ impl Proxy {
     }
 
     /// The value of `zentinel_upstream_retries_refused_total` for `reason`, 0
-    /// if there is no such series.
+    /// if there is no such series. The metrics answer must be a 200: a failed
+    /// read is not a 0.
     fn retries_refused(&self, reason: &str) -> u64 {
-        let mut stream = TcpStream::connect(("127.0.0.1", self.metrics_port)).unwrap();
+        let mut stream = TcpStream::connect(("127.0.0.1", self.metrics_port)).unwrap_or_else(|e| {
+            panic!(
+                "no connection to the metrics port: {e}; log:\n{}",
+                self.log()
+            )
+        });
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
@@ -295,10 +410,18 @@ impl Proxy {
         )
         .unwrap();
         let mut raw = Vec::new();
-        let _ = stream.read_to_end(&mut raw);
+        if let Err(e) = stream.read_to_end(&mut raw) {
+            panic!("reading the metrics failed: {e}; log:\n{}", self.log());
+        }
+        let raw = String::from_utf8_lossy(&raw);
+        assert!(
+            raw.starts_with("HTTP/1.1 200"),
+            "the metrics answer was {:?}; log:\n{}",
+            raw.lines().next(),
+            self.log()
+        );
         let series = format!("zentinel_upstream_retries_refused_total{{reason=\"{reason}\"}}");
-        String::from_utf8_lossy(&raw)
-            .lines()
+        raw.lines()
             .find_map(|line| line.strip_prefix(series.as_str()))
             .and_then(|value| value.trim().parse::<f64>().ok())
             .map_or(0, |value| value as u64)
@@ -312,7 +435,7 @@ impl Drop for Proxy {
     }
 }
 
-fn config(port: u16, metrics_port: u16, backend: u16) -> String {
+fn config(port: u16, metrics_port: u16, backend: u16, retry_policy: &str) -> String {
     format!(
         r#"
 system {{ worker-threads 2 }}
@@ -326,12 +449,19 @@ upstreams {{
     upstream "backend" {{
         target "127.0.0.1:{backend}"
         h2c #true
+        // The breaker must not open before max-attempts stops the retries.
+        circuit-breaker {{
+            failure-threshold 1000
+            success-threshold 1
+            timeout-seconds 300
+        }}
     }}
 }}
 routes {{
     route "all" {{
         matches {{ path-prefix "/" }}
         upstream "backend"
+        {retry_policy}
     }}
 }}
 observability {{
@@ -342,6 +472,17 @@ observability {{
     }}
 }}
 "#
+    )
+}
+
+/// A `retry-policy` with `max_attempts` and a short backoff.
+fn retry_policy(max_attempts: u32) -> String {
+    format!(
+        r#"retry-policy {{
+            max-attempts {max_attempts}
+            backoff "1ms"
+            max-backoff "1ms"
+        }}"#
     )
 }
 
@@ -462,4 +603,67 @@ fn a_refused_post_whose_body_exceeded_the_retry_buffer_is_not_sent_again() {
     proxy.wait_for_log("retry_buffer_truncated");
     assert_eq!(proxy.retries_refused("retry_buffer_truncated"), 1);
     assert_eq!(proxy.retries_refused("non_idempotent_method"), 0);
+}
+
+/// The route's `max-attempts` bounds the retries of a request the upstream
+/// did not process, as it does the others, although the method is not looked
+/// at for them. The backend refuses every stream, so each attempt is sent
+/// again until `max-attempts` stops it.
+fn check_refused_post_stops_at_max_attempts(max_attempts: u32) {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = spawn_backend(Fault::RefuseEveryStream);
+    let proxy = Proxy::start_with(dir.path(), &backend, &retry_policy(max_attempts));
+
+    let (status, _) = send(proxy.port, "POST", 6);
+
+    assert_eq!(
+        backend.accepted(),
+        max_attempts as usize,
+        "with max-attempts {max_attempts} the upstream was sent a POST it kept refusing a \
+         different number of times; log:\n{}",
+        proxy.log()
+    );
+    assert_eq!(status, 502, "log:\n{}", proxy.log());
+    assert!(backend.answered().is_empty());
+    proxy.wait_for_log("Not retrying a request that may have been sent to the upstream");
+    assert_eq!(
+        proxy.retries_refused("max_attempts"),
+        1,
+        "log:\n{}",
+        proxy.log()
+    );
+    assert_eq!(proxy.retries_refused("non_idempotent_method"), 0);
+    assert_eq!(proxy.retries_refused("retry_buffer_truncated"), 0);
+}
+
+#[test]
+fn a_refused_post_is_sent_again_until_the_route_max_attempts() {
+    check_refused_post_stops_at_max_attempts(3);
+}
+
+/// `max-attempts 1` asks for no retry at all, for a refused stream too.
+#[test]
+fn a_refused_post_is_not_sent_again_when_the_route_max_attempts_is_1() {
+    check_refused_post_stops_at_max_attempts(1);
+}
+
+/// The limit does not stop a retry before it is reached: the backend refuses
+/// the first stream only, and the second attempt is the last one allowed.
+#[test]
+fn a_refused_post_is_sent_again_when_the_route_has_an_attempt_left() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = spawn_backend(Fault::RefuseStream);
+    let proxy = Proxy::start_with(dir.path(), &backend, &retry_policy(2));
+
+    let (status, body) = send(proxy.port, "POST", 6);
+
+    assert_eq!(
+        (status, body.as_str()),
+        (200, "ok"),
+        "a refused POST was not sent again with an attempt left; log:\n{}",
+        proxy.log()
+    );
+    assert_eq!(backend.accepted(), 2);
+    assert_eq!(backend.answered(), vec![6]);
+    assert_eq!(proxy.retries_refused("max_attempts"), 0);
 }
