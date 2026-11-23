@@ -18,6 +18,7 @@ for details.
 
 | CalVer | Crate Version | Date | Highlights |
 |--------|---------------|------|------------|
+| [26.11_5](#26115---2026-11-23) | 0.6.59 | 2026-11-23 | **Wrong-typed values, `tls` on an `http` listener, unknown TLS versions, out-of-range integers and unresolvable upstream/agent references are configuration errors** (**read the upgrade notes**); **a TLS listener or geo database that cannot be loaded stops startup**; **non-idempotent requests are not retried after an upstream error, and `max-attempts` bounds every retry**; **compressed request bodies are decoded for agents by default**; **filters on builtin routes apply**; **the inference prompt check runs**; geo filters read every country and follow reloads; ACME issues for `h2` listeners; **an undecodable WebSocket frame on an inspected route closes the connection**; the response cache key includes route and host (the cache starts cold); the access log records the query string and HTTP version; a certificate whose key does not match is refused; the Helm charts pull a published image, their config parses and the probes reach a health listener; systemd restarts back off to 120 s |
 | [26.11_4](#26114---2026-11-22) | 0.6.58 | 2026-11-22 | **Security: request bodies whose `Content-Type` has a byte outside visible ASCII are inspected** (they bypassed body agents with the default `waf` allowlist); **duplicate config nodes, wrong-typed values and repeated ids are errors** (**read the upgrade notes**); metrics and health only on the admin listener; bodies over `max-inspection-bytes` hit the filter's failure-mode; IPv6 clients grouped by /64; caching honours `Authorization`, `Set-Cookie` and `Vary`; forwarding headers from untrusted peers stripped; `query-param` route matches work; agents get a proxy-generated correlation id |
 | [26.11_3](#26113---2026-11-14) | 0.6.57 | 2026-11-14 | **Agent gRPC TLS options are applied** (`ca-cert`, `client-cert`/`client-key`; TLS options on a non-`https://` agent and `tls-insecure` are now configuration errors, **read the upgrade notes**); agents receive `RequestComplete` at the end of every request; **Hetzner DNS-01 works again** on the Hetzner Cloud API (**needs a new token**); WAF body-inspection content types matched case-insensitively; release binaries no longer report `-dirty`; Gateway API controller on kube 5 / gateway-api 0.23 |
 | [26.11_2](#26112---2026-11-12) | 0.6.56 | 2026-11-12 | Pingora fork rebased on upstream **Pingora 0.9.1** (`zentinel-pingora-core` 0.9.3); no behaviour or configuration change |
@@ -97,6 +98,298 @@ for details.
 ---
 
 ## [Unreleased]
+
+---
+
+## [26.11_5] - 2026-11-23
+
+**Crate version:** 0.6.59
+
+Correctness release. Most of the changes come from the same contributor review
+as 26.11_4 and fix settings that were accepted and then misread, or features
+that did not do what their configuration said: values of the wrong type or out
+of range were loaded as some other value, the inference prompt check never ran,
+the response cache shared entries between hosts, a `POST` could reach the
+upstream up to 16 times, a TLS listener or geo filter that failed to load was
+skipped silently, and agents were sent compressed bodies. Several of them reject
+configurations that used to load, and some change what reaches the upstream,
+the agents and the logs: **read the upgrade notes before upgrading**, and run
+`zentinel test --strict` against your configuration.
+
+### Upgrade notes
+- **Values of the wrong type are an error (#713).** A setting written with a
+  value of another type than it takes (`max-connections-per-client "100"`,
+  `client-auth "true"`, `min-version 1.3`, `timeout-secs "30"`, a header value
+  that is not a string), with no value, or as `name=value` where it takes an
+  argument (`failure-mode mode="closed"`) used to load with the setting's
+  default; it now fails at load and on reload, naming the setting and the type
+  it takes. A `tls { }` block on a listener with `protocol "http"`, or with no
+  `protocol`, used to be dropped (plain HTTP was served); it is now an error.
+  Add the quotes, remove them, or add `protocol "https"`. Three values now take
+  effect where the default applied: `expected-status` written as a number
+  (`expected-status 204` meant 200), a fractional `max-decompression-ratio`,
+  and `cookie-ttl` as a numeric string (`"7200"` meant 3600).
+- **TLS versions are checked (#750).** `min-version`/`max-version` accept only
+  `1.2`, `tls1.2`, `tlsv1.2`, `1.3`, `tls1.3`, `tlsv1.3` (any case); anything
+  else (`"TLS 1.3"`, `"tls13"`, `"1.0"`, `""`) was read as TLS 1.2 and is now an
+  error. A `min-version` above `max-version` used to enable both versions with
+  a warning and is now an error. Write `"1.2"` to keep what an unrecognised
+  value did.
+- **Integers outside their setting's range are an error (#777).** They were
+  narrowed or clamped silently (`default-ttl-secs -1` became 2^64-1, `port 70000`
+  became 4464). Status-code settings (`status-code`, `block-status`,
+  `cacheable-status-codes`, `on-error-codes`, `expected-status`) take 100-599;
+  `stale-while-revalidate-secs` and `stale-if-error-secs` take at most
+  4294967295. Negative or overlong duration strings (`cookie-ttl "-1h"`,
+  `reload-interval "-1h"`) are errors as well.
+- **Upstream and agent references are checked by kind and scope (#762).**
+  `shadow` upstream, `fallback-upstream`, `mcp` `upstreams`, `model-routing`
+  upstreams and `default-upstream`, enabled `guardrails` agents, and the agent
+  of an agent filter in a namespace or service are now checked, and a qualified
+  id (`ns:name`) must name a resource of the right kind. Such a reference that
+  does not resolve used to load and fail at request time (500, 502, 503, or a
+  shadow that mirrored nothing); the configuration is now rejected and a
+  reload of it refused.
+- **`client-ipv6-prefix-length` written twice in `system` is an error** (the
+  second copy was ignored) (#802).
+- **Certificate and key pairs are checked (#806).** A `cert-file`/`key-file`
+  pair whose key does not belong to the certificate used to load and fail every
+  handshake; the listener now fails to start (or the reload is refused) with an
+  error naming both files. Such a pair in a scanned certificate folder is
+  skipped with a warning. A reload also refuses an expired ACME certificate and
+  keeps the pair it serves; at startup an expired ACME certificate is still
+  loaded so the listener can start and renew it.
+- **Inference prompt check (#764).** On an inference route with an enabled
+  `prompt-injection` block, the check never ran. It now does: the whole request
+  body is read (up to the route's `max-body-size`, 413 above it, also under
+  `failure-mode "open"`) and the agent answers before the request is
+  forwarded. Flagged content is refused with `block-status`, and with
+  `failure-mode "closed"` a body whose text cannot be extracted, or a check that
+  fails or times out, is refused too. Such refusals are counted under
+  `zentinel_blocked_requests_total{reason="prompt_check_failed"}`. Set
+  `enabled #false` to keep forwarding as before.
+- **WebSocket inspection (#742).** On a route with `websocket-inspection #true`,
+  a frame larger than the new `websocket-max-frame-size` (default 1MB, the
+  previous fixed limit) or with an RSV bit set used to be forwarded without
+  inspection; it now closes the connection with 1009 or 1002 under either
+  `failure-mode`, counted as `websocket_frame_undecodable` in
+  `zentinel_blocked_requests_total`. `Sec-WebSocket-Extensions` is removed from
+  the upgrade request on such routes, so `permessage-deflate` is no longer
+  negotiated (an offer of it used to turn inspection off for that connection).
+  Raise `websocket-max-frame-size` (up to 16MB) for routes that carry larger
+  frames.
+- **Agents built on `zentinel-agent-protocol` (#723).** `UdsAgentServerV2`
+  answered an event it could not decode with `Allow`. It now logs an error and
+  closes the connection, so the proxy sees a failed call and the filter's
+  `failure-mode` applies (`closed`: 503/504, or close code 1011 for a WebSocket
+  frame); an undecodable `Configure` is no longer taken as accepted.
+  `RequestComplete` is the exception: logged, connection kept. Agents that
+  decode every event are not affected. The change is in the agent-side
+  server, so an agent picks it up when it is rebuilt against
+  `zentinel-agent-protocol` 0.6.59.
+- **Response cache key (#687).** The key now includes the route, method and
+  normalised host, so two hosts or two routes no longer share an entry. Entries
+  written before the upgrade are not found: the cache starts cold, and old
+  disk entries age out through eviction. Purge still matches by path for every
+  host and route.
+- **Metric label (#695).** Requests whose method is not one of `GET`, `HEAD`,
+  `POST`, `PUT`, `DELETE`, `CONNECT`, `OPTIONS`, `TRACE`, `PATCH` are counted
+  under `method="<other>"` in `zentinel_requests_total`,
+  `zentinel_request_duration_seconds` and the `zentinel_scoped_*` equivalents.
+  Methods are case-sensitive, so `get` is `<other>`. Dashboards that select a
+  non-standard method need `method="<other>"`; the access log keeps the method
+  as received.
+- **Access log (#780).** Entries now include the query string (`query` in JSON,
+  `?query` in the combined request line), as sent by the client; set
+  `access-log { fields { query #false } }` to leave it out. The combined format
+  shows `HTTP/1.0` and `HTTP/2.0` where it always showed `HTTP/1.1`. The
+  `fields` block is now read: a key set to `#false` is left out, and a value
+  that is not `#true`/`#false`, a `fields` that is not a block, a repeated
+  key, or `include-trace-id` disagreeing with `fields { trace-id }` fails the
+  load.
+- **More forwarding headers are removed from untrusted peers (#803):**
+  `X-Forwarded-Client-Cert`, `X-Forwarded`, `Forwarded-For`,
+  `X-Original-Forwarded-For` and `X-Host` (and their `_` spellings). A backend
+  that reads one of them from a proxy in front of Zentinel needs that proxy in
+  `trusted-proxies`.
+- **Circuit breaker counting (#715).** An upstream error after the connection
+  was established was reported twice, so the default `failure-threshold` of 5
+  opened the breaker after about three requests that failed with an error that
+  is not retried; it now takes five. Lower `failure-threshold` to keep the
+  earlier sensitivity.
+- **Retries after an upstream error (#738, #766).** A request that failed
+  after it may have reached the upstream (the upstream closed the connection
+  without answering, or a reused connection turned out to be closed) was sent
+  again whatever its method, up to Pingora's limit of 16 attempts. A
+  non-idempotent request (`POST`, `PATCH`, ...) is now sent again only with
+  `retry-policy { retry-non-idempotent #true }`, and a body larger than the
+  retry buffer is not sent again at all. An HTTP/2 upstream that says it did
+  not process the request (`REFUSED_STREAM`, `GOAWAY` not covering the stream)
+  still gets it again whatever the method. Every retry after an error now
+  counts against the route's `max-attempts` (with `max-attempts 3` and an
+  upstream that drops every request, a `GET` reached it 16 times). Refused
+  retries are counted in `zentinel_upstream_retries_refused_total`.
+- **TLS listeners that cannot be built stop startup (#740, #772).** An `https`
+  or `h2` listener whose certificate or key file is missing or not PEM, whose
+  `sni` certificate cannot be loaded, or whose `ca-file` cannot be read used
+  to be skipped while the process kept running without that port; startup
+  now exits non-zero, and `zentinel test` fails for such a configuration.
+  The example configurations that name placeholder paths under
+  `/etc/zentinel/certs` stop too until they point at real files. ACME now
+  also issues and renews certificates for `h2` listeners with an `acme`
+  block; before, that block was ignored.
+- **Geo filters (#748, #754).** `countries "RU" "CN" "KP"` applied only to the
+  first country; it now applies to all of them, so a `block` filter refuses,
+  and an `allow` filter admits, every country listed. These used to load and
+  are now errors: an unknown `action`, `on-failure` or `database-type`;
+  `action "allow"` with no `countries`; a country that is not two letters
+  (JSON and TOML: lower-case `"us"` too); a `database-path` that ends in
+  neither `.mmdb` nor `.bin` without `database-type`. A geo database that
+  cannot be opened stops startup (the filter used to be skipped), and
+  `zentinel test` and `zentinel validate` now open the databases, so a
+  pipeline that validates configurations without the database files present
+  now fails at that step. A `.MMDB` file is read as MaxMind. A configuration
+  reload now adds, changes and removes geo filters and refuses a reload whose
+  geo database does not open; with large MaxMind City databases a reload takes
+  longer, since each database is read when the new configuration is checked.
+- **Compressed request bodies sent to agents (#752).** `body-inspection {
+  decompress }` now defaults to `#true`: a `gzip`, `deflate` or `br` body is
+  decoded for the agents instead of reaching them compressed. A body that is
+  not decoded (a coding that is not supported, several codings, `decompress
+  #false`, or `request-body-mode "stream"`) is refused with 415 by an agent
+  filter that fails `closed` (the default) and is no longer sent to an `open`
+  one. A body that decodes to more than `max-inspection-bytes` is refused with
+  413 by a `closed` agent (it used to be decoded up to ten times that), and one
+  that reaches `max-decompression-ratio` with 400. The `encoding` label of
+  `zentinel_decompression_total` and `zentinel_decompression_ratio` is now
+  `gzip`, `deflate`, `br` or `other`.
+- **Body inspection content types (#756).** With a `waf` block, request bodies
+  of a `+json`/`+xml` type of a listed entry (`application/vnd.api+json`,
+  `application/soap+xml`, ...) and bodies with no `Content-Type` are now sent
+  to the agents. With a `closed` agent, an upload with no `Content-Type` that
+  is over `max-inspection-bytes` (`buffer` mode) or the agent's
+  `max-request-body-bytes` is now refused with 413, and one in an encoding that
+  is not decoded with 415. Set `body-inspection { inspect-untyped-bodies
+  #false }` to leave bodies with no `Content-Type` to the list again.
+- **Builtin routes with `filters` (#770).** The `filters` of a
+  `service-type "builtin"` route were not applied. A builtin route with
+  `filters` now passes the same checks as a proxied route: rate limits
+  (including `rate-limits { global }` and `default-rps`), agents, geo,
+  `redirect` and CORS preflight filters, the body-size and WebSocket upgrade
+  checks, and the header limits. Remove `filters` from health or readiness
+  routes that load balancers probe. A builtin route without `filters` is
+  unchanged. `max-header-count` and `max-header-size` now also apply to static
+  routes. For a request with no trace header, a builtin route's
+  `X-Request-Id` is now the id the request's log lines carry.
+- **Gateway API health checks (#729).** In the sidecar setup (controller
+  writing a config file), the generated HTTP health check now probes `/`, as
+  the controller sets it, instead of the parser default `/health`. A backend
+  that answers 200 on `/health` but not on `/` leaves the rotation; check `/`
+  on each backend before upgrading.
+- **systemd restart backoff (#808).** The shipped proxy, echo, rate limit and
+  WAF agent units and the units written by `zentinel bundle install` restart
+  after about 5, 9, 18, 34, 64 s, then every 120 s (`RestartSteps=5`,
+  `RestartMaxDelaySec=120s`), instead of every 5 s. Units from
+  `bundle install` also get `StartLimitIntervalSec=0`. systemd before 254 logs
+  `Unknown key name` for the two keys and keeps 5 s. Installed units change
+  only after reinstall.
+- **Helm chart (#809).** The chart's default `proxy.config.kdl` did not parse
+  and its probes asked the metrics port, which answered 404. The default
+  config is rewritten (one HTTP listener on 8080, one route, one upstream with
+  a TCP health check; the `https` listener is no longer in it) and adds a
+  `probes` namespace with a listener on `0.0.0.0:9091` serving `/health`,
+  `/healthz` and `/ready`. Both probes now use the new container port `health`
+  (`proxy.service.healthPort`, 9091). A release with its own
+  `proxy.config.kdl` must add such a listener on that port or override the
+  probes. The container command is `/zentinel` (the image's binary) instead of
+  `/usr/local/bin/zentinel-proxy`.
+- **Helm chart images (#811).** Both charts take their default image tag from
+  `appVersion`, which named images that were never published (`zentinel:0.1.3`,
+  `zentinel-gateway:0.6.1`), so a default install could not pull them.
+  `appVersion` is now `26.11_5` in both charts and their versions are 0.2.0.
+  A release that sets `image.tag` itself is not affected.
+- **Docker Compose (#809).** The proxy `healthcheck` is removed from
+  `docker-compose.yml` and `docker-compose.test.yml`; it could not pass (no
+  `curl` in the distroless image, and `:9090` does not serve `/health`).
+- **Library API (`zentinel-proxy` crate).** `ProcessResult` gains
+  `Undecodable { reason, forward }` and `WebSocketCodec::decode_frame` returns
+  `FrameError` (#742); `ScopedCircuitBreakerManager::is_allowed` is replaced by
+  `admit()` and `release_half_open_slot()` (#805).
+
+### Added
+- Route setting `websocket-max-frame-size` (byte count or size string, default
+  1MB, 1 byte to 16MB); `zentinel lint` warns when it is set without
+  `websocket-inspection` (#742).
+- `access-log { fields { ... } }` selects the fields of an entry (#780).
+- The Gateway API controller writes `client-ipv6-prefix-length` into the
+  generated configuration, from `CLIENT_IPV6_PREFIX_LENGTH` (default 64). A
+  value outside 1-128 stops the controller at startup (#810).
+
+- `body-inspection { inspect-untyped-bodies }` (default `#true`) (#756).
+- Loading, `zentinel lint` and `zentinel test --strict` warn about settings
+  that are read and not applied (`waf-enabled`, `ca-cert` in an upstream's
+  `tls`, `connection-pool { max-connections max-idle max-lifetime-secs }`,
+  `max-concurrent-streams`, `observability { logging { level format } }`,
+  route `cache { vary-headers ignore-query-params }`, a `cache` block inside
+  `policies`, and inference keys the parser does not read). An upstream used
+  only as a fallback is no longer reported as unused (#768).
+
+### Fixed
+- A `Cache-Control` `max-age`/`s-maxage`, or a `default-ttl-secs`, too large
+  for the system clock no longer aborts the process; the lifetime is capped
+  (#733).
+- `zentinel bundle install --skip-verify` prints a warning on stderr for each
+  agent installed without a checksum check, and its help says what the option
+  skips; the install script's errors show `sh -s -- --skip-verify` for
+  `curl | sh` (#815).
+- A reload adds rate limiters, starts health checks and installs upstream
+  pools before it swaps the routes, and removes the old ones after it, so a
+  route added or changed by the reload no longer runs briefly without its
+  limiter or pool. The pool timeout warning now reads `Upstream pool update
+  timed out after 10s; the new routes still go live and the previous pools
+  stay`, and a new `Upstream pools reloaded` line gives added, replaced and
+  removed counts (#775).
+- The load balancer no longer records a health entry under the upstream's id,
+  so a route with an `on-health-failure` fallback falls back once every target
+  fails its health check, instead of answering 503 (#715).
+- An agent call admitted as a half-open circuit-breaker trial holds its slot
+  for the length of the call and gives it back when the call ends without a
+  result, instead of keeping it until the breaker's timeout (#805).
+- Agent filters on a static route receive `X-Correlation-Id`, as on a proxied
+  route; the warnings for a body over `max-inspection-bytes` carry the agent
+  correlation id like the rest of the request's agent lines (#804).
+- ACME certificates, keys and metadata are written to a temporary file and
+  renamed into place; the key is created with mode 0600 and written first, and
+  the metadata last, so an interrupted save is renewed again (#806).
+- The Gateway API controller leaves out an HTTPRoute whose header modifier
+  names one header twice in different case, with a warning, instead of
+  generating a configuration the proxy refuses as a whole (#807).
+- The Gateway API controller writes a health check's `path`, `expected-status`,
+  `host` and gRPC `service` inside the `type` node, where the proxy reads them
+  (#729).
+- The prompt check reads the `text` parts of a message whose `content` is an
+  array, and an `input` that is an array of strings; its refusal body is valid
+  JSON whatever the `block-message` contains (#764).
+- Four ACME examples gain `protocol "https"` and `cors-headers.kdl` writes
+  `websocket #true` (#713).
+
+### Dependencies
+- `url` 2.5.8 → 2.5.9 for RUSTSEC-2026-0592, a stack overflow in
+  `Url::origin()` on nested `blob:` URLs (#817).
+- `chacha20` 0.10.0 → 0.10.2 in `Cargo.lock` (0.10.0 is yanked) (#801).
+- Minor and patch updates: `bytes`, `uuid`, `regex`, `brotli`, `clap`, `rand`,
+  `redis`, `xxhash-rust`, `smallvec`, `sysinfo` (#812); `wasmtime-wasi`
+  50.0.3 (#813); `async-memcached` 0.11 (#814).
+
+### Documentation
+- The agent protocol docs say a non-UTF-8 header value sent to an agent does
+  not round-trip, and that a value an agent writes back is sent as UTF-8;
+  tests pin this (#800).
+- `acme.md` says one ACME `sni` certificate that can no longer be read fails
+  the reload of every certificate on that listener; the embedded default
+  configuration's observability comment is corrected (#810).
+- `schema.md` describes TLS `session-resumption` and drops the out-of-date
+  "parsed but not yet applied" notes on listener TLS settings (#750).
 
 ---
 
