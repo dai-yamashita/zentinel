@@ -2,8 +2,9 @@ apiVersion: v2
 name: zentinel-gateway
 description: Zentinel Gateway API Controller — Kubernetes Gateway API implementation powered by the Zentinel reverse proxy
 type: application
-version: 0.1.0
-appVersion: "0.6.1"
+version: 0.2.0
+# The Zentinel release (CalVer) whose images the chart runs by default.
+appVersion: "26.11_5"
 keywords:
   - gateway-api
   - ingress
