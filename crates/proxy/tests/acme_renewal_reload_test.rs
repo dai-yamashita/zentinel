@@ -385,6 +385,80 @@ fn failed_reload_after_renewal_keeps_the_previous_certificate_and_is_counted() {
     );
 }
 
+/// A renewal whose key does not belong to its certificate (as a reload that
+/// reads the files between the two writes of a save would see) is not
+/// swapped in: the listener keeps serving the previous pair.
+#[test]
+fn renewed_pair_with_a_mismatched_key_keeps_the_previous_certificate() {
+    install_crypto_provider();
+    init_tls_metrics_once();
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let reloader = Arc::new(CertificateReloader::new());
+
+    let acme = AcmeCertificate::new(dir.path(), "a.example", &reloader);
+    store_certificate(&acme.storage, &["a.example"], "server-default");
+    let listener_id = "https-mismatched-renewal";
+    let server_config = start_listener(
+        &reloader,
+        listener_id,
+        &tls_config(Some(acme.config.clone())),
+    );
+    let failures_before = reload_count(listener_id, "failure");
+
+    // The new certificate, next to the previous key.
+    let cert_pem = std::fs::read_to_string(fixtures_path().join("server-api.crt")).unwrap();
+    std::fs::write(dir.path().join("domains/a.example/cert.pem"), cert_pem).unwrap();
+    acme.scheduler.apply_renewed_certificate();
+
+    assert_serves(
+        &server_config,
+        "localhost",
+        "server-default",
+        "a mismatched pair must not replace the served certificate",
+    );
+    assert_eq!(reload_count(listener_id, "failure"), failures_before + 1);
+
+    // Once the key is written too, the next reload takes the new pair.
+    store_certificate(&acme.storage, &["a.example"], "server-api");
+    acme.scheduler.apply_renewed_certificate();
+    assert_serves(
+        &server_config,
+        "localhost",
+        "server-api",
+        "the complete pair is served",
+    );
+}
+
+/// A renewal that left an expired certificate is not swapped in.
+#[test]
+fn renewed_expired_certificate_keeps_the_previous_certificate() {
+    install_crypto_provider();
+    init_tls_metrics_once();
+    let dir = tempfile::tempdir().expect("creating temp dir");
+    let reloader = Arc::new(CertificateReloader::new());
+
+    let acme = AcmeCertificate::new(dir.path(), "a.example", &reloader);
+    store_certificate(&acme.storage, &["a.example"], "server-default");
+    let listener_id = "https-expired-renewal";
+    let server_config = start_listener(
+        &reloader,
+        listener_id,
+        &tls_config(Some(acme.config.clone())),
+    );
+    let failures_before = reload_count(listener_id, "failure");
+
+    store_certificate(&acme.storage, &["a.example"], "expired");
+    acme.scheduler.apply_renewed_certificate();
+
+    assert_serves(
+        &server_config,
+        "localhost",
+        "server-default",
+        "an expired certificate must not replace the served one",
+    );
+    assert_eq!(reload_count(listener_id, "failure"), failures_before + 1);
+}
+
 /// A listener serving an ACME `sni` certificate must not drop that name to the
 /// default certificate because the renewed files cannot be read: the reload
 /// fails, the previous certificates stay in use, and the failure is counted.

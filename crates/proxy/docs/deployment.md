@@ -79,11 +79,15 @@ journalctl -u zentinel -f
 
 ### Restart after a failure
 
-The unit has `Restart=on-failure` and `RestartSec=5s`, and no start rate limit (`StartLimitIntervalSec=0`). When the process exits with a non-zero status or is killed by a signal such as SIGABRT or SIGKILL, systemd starts it again 5 s later, and it keeps doing so for as long as the process keeps failing. It does not give up on its own. The echo and rate limit agent units in `deploy/` use the same settings.
+The unit has `Restart=on-failure`, `RestartSec=5s`, `RestartSteps=5` and `RestartMaxDelaySec=120s`, and no start rate limit (`StartLimitIntervalSec=0`). When the process exits with a non-zero status or is killed by a signal such as SIGABRT or SIGKILL, systemd starts it again, and it keeps doing so for as long as the process keeps failing. It does not give up on its own. The delay grows with each consecutive automatic restart: about 5, 9, 18, 34 and 64 s, then 120 s for every restart after that. The echo, rate limit and WAF agent units in `deploy/` use the same restart settings, as do the agent units written by `zentinel bundle install`.
 
-A process that fails on every start, for example because the configuration is invalid, is therefore started every 5 s and never reaches the `failed` state. `systemctl status zentinel` shows `activating (auto-restart)` and `systemctl show zentinel --property=NRestarts` (systemd 235 and later) counts the automatic restarts, so alert on those rather than on the `failed` state. The reason for each exit is in `journalctl -u zentinel`; `zentinel test --config /etc/zentinel/zentinel.kdl` checks the configuration. Once the cause is fixed, `sudo systemctl restart zentinel` starts the proxy at once instead of waiting for the next automatic restart.
+`RestartSteps=` and `RestartMaxDelaySec=` need systemd 254 or later. Older versions log `Unknown key name` for them when the unit is loaded, ignore them, and restart every 5 s.
 
-Keep local changes in a drop-in (`sudo systemctl edit zentinel`) rather than in the unit file, because running the installer again replaces `/etc/systemd/system/zentinel.service`. A drop-in can lengthen the delay with `RestartSec=`, or bring a limit back:
+A process that fails on every start, for example because the configuration is invalid, is therefore started again and again, at most every 120 s, and never reaches the `failed` state. `systemctl status zentinel` shows `activating (auto-restart)` and `systemctl show zentinel --property=NRestarts` (systemd 235 and later) counts the automatic restarts, so alert on those rather than on the `failed` state. The reason for each exit is in `journalctl -u zentinel`; `zentinel test --config /etc/zentinel/zentinel.kdl` checks the configuration. Once the cause is fixed, `sudo systemctl restart zentinel` starts the proxy at once instead of waiting for the next automatic restart.
+
+The proxy exits with status 1 for an invalid configuration and for other startup failures alike, so the unit has no `RestartPreventExitStatus=`: it could not tell a configuration error, which a restart does not fix, from a failure that a restart does.
+
+Keep local changes in a drop-in (`sudo systemctl edit zentinel`) rather than in the unit file, because running the installer again replaces `/etc/systemd/system/zentinel.service`. A drop-in can change the delay with `RestartSec=`, `RestartSteps=` and `RestartMaxDelaySec=` (`RestartSteps=0` restarts every `RestartSec=`), or bring a limit back:
 
 ```ini
 [Unit]

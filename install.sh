@@ -179,13 +179,13 @@ download_binary() {
             warn "Skipping verification - binary integrity cannot be confirmed"
             warn "Consider installing coreutils for checksum verification"
         else
-            error "No checksum tool available (sha256sum or shasum), so ${artifact} cannot be verified. Install one, or re-run with --skip-verify to install without verification."
+            error "No checksum tool available (sha256sum or shasum), so ${artifact} cannot be verified. Install one, or re-run with --skip-verify to install without verification (when piping the script to sh: curl -fsSL https://get.zentinelproxy.io | sh -s -- --skip-verify)."
         fi
         cd - >/dev/null
     elif [ "$SKIP_VERIFY" = 1 ]; then
         warn "Checksum file not available, skipping verification"
     else
-        error "Could not download the checksum file ${checksum_url}, so ${artifact} cannot be verified. Re-run with --skip-verify to install without verification."
+        error "Could not download the checksum file ${checksum_url}, so ${artifact} cannot be verified. Re-run with --skip-verify to install without verification (when piping the script to sh: curl -fsSL https://get.zentinelproxy.io | sh -s -- --skip-verify)."
     fi
 
     # Extract the tarball

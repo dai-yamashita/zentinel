@@ -65,6 +65,7 @@ expected, and so on, is an error and not the setting's default. See
 | `upstream` | Must reference existing upstream (unless builtin/static) |
 | `filters` | All filter IDs must exist |
 | `builtin-handler` | Required when `service-type` is `builtin` |
+| `websocket-max-frame-size` | A byte count or size (`"4MB"`), from 1 byte to 16MB |
 | `static-files.root` | Required when `service-type` is `static` |
 
 ### Upstreams

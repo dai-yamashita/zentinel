@@ -215,6 +215,16 @@ fn a_route_with_two_websocket_nodes_is_an_error() {
 }
 
 #[test]
+fn a_route_with_two_websocket_max_frame_size_nodes_is_an_error() {
+    assert_duplicate(
+        Ctx::Route,
+        "websocket-max-frame-size 65536",
+        "websocket-max-frame-size 131072",
+        "websocket-max-frame-size",
+    );
+}
+
+#[test]
 fn a_route_with_two_waf_enabled_nodes_is_an_error() {
     assert_duplicate(
         Ctx::Route,
@@ -953,6 +963,36 @@ fn a_logging_block_with_two_access_logs_is_an_error() {
         "logging {\naccess-log {\nenabled #true\n}\naccess-log {\nenabled #false\n}\n}",
         "logging {\naccess-log {\nenabled #true\n}\n}",
         "access-log",
+    );
+}
+
+#[test]
+fn an_access_log_with_two_fields_blocks_is_an_error() {
+    assert_duplicate_within(
+        Ctx::Observability,
+        "logging {\naccess-log {\nfields {\nquery #false\n}\nfields {\nlatency-ms #false\n}\n}\n}",
+        "logging {\naccess-log {\nfields {\nquery #false\n}\n}\n}",
+        "fields",
+    );
+}
+
+#[test]
+fn an_access_log_field_written_twice_is_an_error() {
+    assert_duplicate_within(
+        Ctx::Observability,
+        "logging {\naccess-log {\nfields {\nquery #true\nquery #false\n}\n}\n}",
+        "logging {\naccess-log {\nfields {\nquery #false\n}\n}\n}",
+        "query",
+    );
+}
+
+#[test]
+fn an_access_log_with_include_trace_id_written_twice_is_an_error() {
+    assert_duplicate_within(
+        Ctx::Observability,
+        "logging {\naccess-log {\ninclude-trace-id #true\ninclude-trace-id #false\n}\n}",
+        "logging {\naccess-log {\ninclude-trace-id #true\n}\n}",
+        "include-trace-id",
     );
 }
 

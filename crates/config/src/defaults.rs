@@ -98,8 +98,9 @@ limits {
     max-body-size 10485760  // 10MB default
 }
 
-// Observability uses defaults:
-// - Metrics enabled at /metrics
+// Observability:
+// - /metrics is served by the "metrics" route on the admin listener
+//   (127.0.0.1:9090); the standalone metrics server is off (see below)
 // - JSON logging at info level to stdout/stderr
 //
 // File logging is left disabled in the embedded default so `zentinel` with no
@@ -165,6 +166,7 @@ fn builtin_route(
         websocket_inspection: false,
         shadow: None,
         fallback: None,
+        websocket_max_frame_size: crate::routes::DEFAULT_WEBSOCKET_MAX_FRAME_SIZE,
     }
 }
 

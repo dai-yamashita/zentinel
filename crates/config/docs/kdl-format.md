@@ -430,6 +430,20 @@ routes {
         }
     }
 
+    // WebSocket route whose frames are inspected by agents. No WebSocket
+    // extension is negotiated on it, and a frame larger than
+    // websocket-max-frame-size (default 1MB) closes the connection.
+    route "chat" {
+        matches {
+            path-prefix "/chat"
+        }
+        upstream "chat-backend"
+        websocket #true
+        websocket-inspection #true
+        websocket-max-frame-size "4MB"
+        filters "ws-filter"
+    }
+
     // Route with policies
     route "api-protected" {
         matches {
@@ -818,6 +832,8 @@ The response cache is shared by every client of a route, so it follows the share
 Each `Vary` variant is a separate entry, bounded by the cache's size and eviction limits like any other. Header values are compared as sent, after joining repeated lines with `, `: `Accept-Encoding: gzip, br` and `Accept-Encoding: br, gzip` are different variants. A request without a named header shares a variant only with requests that send it empty.
 
 To have a response to a request with `Authorization` stored, the upstream returns `Cache-Control: public` (or `s-maxage`). To have a response that sets a cookie stored, it must not send `Set-Cookie` on that response. A request with a `Cookie` header is cached like any other: if the response depends on the cookie, the upstream returns `Vary: Cookie`, or the route excludes the path with `exclude-paths`. To avoid per-value entries on a path, the upstream can stop sending `Vary` on it, but only if the response does not depend on that header.
+
+A response stays fresh for the `max-age` (or `s-maxage`) of its `Cache-Control`, or for `default-ttl-secs` when it has neither. A lifetime longer than 2147483648 seconds (2^31, about 68 years), including a `max-age` that is a number too large for 64 bits, is applied as 2147483648 seconds. That is the value [RFC 9111](https://www.rfc-editor.org/rfc/rfc9111) section 1.2.2 allows for a delta-seconds value a cache cannot represent; Zentinel uses it as the limit for every lifetime. A `default-ttl-secs` above it is logged at startup (`default-ttl-secs is longer than the cache applies`), with the value applied.
 
 Entries that an earlier version wrote to a `disk` or `hybrid` cache are still served until they expire. To stop that, stop Zentinel and empty `disk-path`.
 

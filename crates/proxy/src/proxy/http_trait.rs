@@ -574,6 +574,7 @@ impl ProxyHttp for ZentinelProxy {
 
         ctx.method = method.to_string();
         ctx.path = path.to_string();
+        ctx.query = req_header.uri.query().map(str::to_string);
         ctx.host = Some(host.to_string());
 
         // Assign the trace id before route matching, not after it succeeds: a
@@ -729,13 +730,6 @@ impl ProxyHttp for ZentinelProxy {
 
         let req_header = session.req_header();
 
-        // Cache request info for access logging if not already set
-        if ctx.method.is_empty() {
-            ctx.method = req_header.method.to_string();
-            ctx.path = req_header.uri.path().to_string();
-            ctx.query = req_header.uri.query().map(|q| q.to_string());
-            ctx.host = Some(crate::http_helpers::extract_request_host(req_header).to_string());
-        }
         ctx.user_agent = req_header
             .headers
             .get("user-agent")
@@ -1875,33 +1869,37 @@ impl ProxyHttp for ZentinelProxy {
 
                 // Check for WebSocket frame inspection
                 if route_config.websocket_inspection {
-                    // Check for compression negotiation - skip inspection if permessage-deflate
-                    let has_compression = session
-                        .req_header()
-                        .headers
-                        .get("Sec-WebSocket-Extensions")
-                        .and_then(|v| v.to_str().ok())
-                        .map(|s| s.contains("permessage-deflate"))
-                        .unwrap_or(false);
-
-                    if has_compression {
+                    // The proxy decodes the frames it inspects and implements
+                    // no WebSocket extension. An extension that was
+                    // negotiated would change what the frames look like (a
+                    // compressed frame sets RSV1 and carries compressed
+                    // payload), so none is offered to the upstream: the
+                    // whole header goes, whatever the extension, in however
+                    // many lines.
+                    if session
+                        .req_header_mut()
+                        .remove_header("Sec-WebSocket-Extensions")
+                        .is_some()
+                    {
                         debug!(
                             correlation_id = %ctx.trace_id,
                             route_id = ctx.route_id.as_deref().unwrap_or("unknown"),
-                            "WebSocket inspection skipped: permessage-deflate negotiated"
-                        );
-                        ctx.websocket_skip_inspection = true;
-                    } else {
-                        // Which agents see the frames is decided at the
-                        // upgrade, from the route's filter chain (#586).
-                        ctx.websocket_inspection_enabled = true;
-
-                        debug!(
-                            correlation_id = %ctx.trace_id,
-                            route_id = ctx.route_id.as_deref().unwrap_or("unknown"),
-                            "WebSocket frame inspection enabled"
+                            "WebSocket extensions not offered to the upstream: \
+                             the route inspects frames"
                         );
                     }
+
+                    // Which agents see the frames is decided at the
+                    // upgrade, from the route's filter chain (#586).
+                    ctx.websocket_inspection_enabled = true;
+                    ctx.websocket_max_frame_size = route_config.websocket_max_frame_size;
+
+                    debug!(
+                        correlation_id = %ctx.trace_id,
+                        route_id = ctx.route_id.as_deref().unwrap_or("unknown"),
+                        max_frame_size = ctx.websocket_max_frame_size,
+                        "WebSocket frame inspection enabled"
+                    );
                 }
             }
         }
@@ -1920,6 +1918,9 @@ impl ProxyHttp for ZentinelProxy {
                 // are sent: the route serves GET and HEAD, and its body is
                 // never read. A route without filters pays nothing.
                 if !route_config.filters.is_empty() {
+                    // Agents see the trace ID in `X-Correlation-Id`, as on a
+                    // proxied route.
+                    set_correlation_header(session.req_header_mut(), &ctx.trace_id);
                     let (client_addr, client_port) = Self::agent_client(session, ctx);
                     if let Err(e) = self
                         .process_agents(session, ctx, &client_addr, client_port)
@@ -1985,9 +1986,7 @@ impl ProxyHttp for ZentinelProxy {
         let req_header = session.req_header_mut();
 
         // Add correlation ID header
-        req_header
-            .insert_header("X-Correlation-Id", &ctx.trace_id)
-            .ok();
+        set_correlation_header(req_header, &ctx.trace_id);
         req_header.insert_header("X-Forwarded-By", "Zentinel").ok();
 
         // Use cached config (set in upstream_peer, or fetch now if needed)
@@ -2150,6 +2149,52 @@ impl ProxyHttp for ZentinelProxy {
                             ErrorType::InternalError,
                             format!("WebSocket closed: {} {}", reason.code, reason.reason),
                         ));
+                    }
+                    crate::websocket::ProcessResult::Undecodable { reason, forward } => {
+                        // A frame the proxy cannot decode is not forwarded.
+                        // The client is told why with a close frame, which
+                        // is written to it directly: what this filter
+                        // returns goes to the upstream. Then the connection
+                        // ends.
+                        if !ctx.websocket_closed_by_proxy {
+                            ctx.websocket_closed_by_proxy = true;
+                            self.metrics
+                                .record_blocked_request("websocket_frame_undecodable");
+                            match handler.close_frame(&reason, false) {
+                                Ok(frame) => {
+                                    if let Err(e) = session
+                                        .write_response_body(Some(Bytes::from(frame)), false)
+                                        .await
+                                    {
+                                        debug!(
+                                            correlation_id = %ctx.trace_id,
+                                            error = %e,
+                                            "Could not send the WebSocket close frame to the client"
+                                        );
+                                    }
+                                }
+                                Err(e) => debug!(
+                                    correlation_id = %ctx.trace_id,
+                                    error = %e,
+                                    "Could not encode the WebSocket close frame"
+                                ),
+                            }
+                        }
+                        if forward.is_empty() {
+                            return Err(Error::explain(
+                                ErrorType::InternalError,
+                                format!("WebSocket closed: {} {}", reason.code, reason.reason),
+                            ));
+                        }
+                        // The frames that came before it in the same data
+                        // were allowed, and go to the upstream first. The
+                        // connection ends with the client's answer to the
+                        // close frame, or its next data, or the next data
+                        // from the upstream: if one of them is read before
+                        // those frames have been written to the upstream,
+                        // it ends the connection first and they are not
+                        // delivered.
+                        *body = Some(forward);
                     }
                 }
             }
@@ -2372,7 +2417,7 @@ impl ProxyHttp for ZentinelProxy {
         if status == 101 && ctx.is_websocket_upgrade {
             // The route's agents that subscribe to frames: only they see
             // them, each under its filter's failure mode and timeout (#586).
-            if ctx.websocket_inspection_enabled && !ctx.websocket_skip_inspection {
+            if ctx.websocket_inspection_enabled {
                 ctx.websocket_inspection_agents = self
                     .agent_manager
                     .route_agents_for_event(
@@ -2381,10 +2426,7 @@ impl ProxyHttp for ZentinelProxy {
                     )
                     .await;
             }
-            if ctx.websocket_inspection_enabled
-                && !ctx.websocket_skip_inspection
-                && !ctx.websocket_inspection_agents.is_empty()
-            {
+            if ctx.websocket_inspection_enabled && !ctx.websocket_inspection_agents.is_empty() {
                 // Create WebSocket inspector and handler with metrics
                 let inspector = crate::websocket::WebSocketInspector::with_metrics(
                     self.agent_manager.clone(),
@@ -2399,7 +2441,7 @@ impl ProxyHttp for ZentinelProxy {
 
                 let handler = crate::websocket::WebSocketHandler::new(
                     std::sync::Arc::new(inspector),
-                    1024 * 1024, // 1MB max frame size
+                    ctx.websocket_max_frame_size,
                 );
 
                 ctx.websocket_handler = Some(std::sync::Arc::new(handler));
@@ -2409,13 +2451,8 @@ impl ProxyHttp for ZentinelProxy {
                     agent_correlation_id = %ctx.agent_correlation_id(),
                     route_id = ctx.route_id.as_deref().unwrap_or("unknown"),
                     agent_count = ctx.websocket_inspection_agents.len(),
+                    max_frame_size = ctx.websocket_max_frame_size,
                     "WebSocket upgrade successful, frame inspection enabled"
-                );
-            } else if ctx.websocket_skip_inspection {
-                debug!(
-                    correlation_id = %ctx.trace_id,
-                    route_id = ctx.route_id.as_deref().unwrap_or("unknown"),
-                    "WebSocket upgrade successful, inspection skipped (compression negotiated)"
                 );
             } else {
                 debug!(
@@ -3170,12 +3207,31 @@ impl ProxyHttp for ZentinelProxy {
                         );
                         // For sync filter, we can't return an error that closes the connection
                         // Instead, inject a close frame
-                        let close_frame =
-                            crate::websocket::WebSocketFrame::close(reason.code, &reason.reason);
-                        let codec = crate::websocket::WebSocketCodec::new(1024 * 1024);
-                        if let Ok(encoded) = codec.encode_frame(&close_frame, false) {
+                        if let Ok(encoded) = handler.close_frame(&reason, false) {
                             *body = Some(Bytes::from(encoded));
                         }
+                    }
+                    crate::websocket::ProcessResult::Undecodable { reason, forward } => {
+                        // A frame the proxy cannot decode is not forwarded,
+                        // and nor is anything the upstream sends after it.
+                        // The client gets the frames that came before it in
+                        // the same data, which were allowed, and then a
+                        // close frame, once; its answer, or the next data
+                        // from the upstream, ends the connection.
+                        if ctx.websocket_closed_by_proxy {
+                            return Err(Error::explain(
+                                ErrorType::InternalError,
+                                format!("WebSocket closed: {} {}", reason.code, reason.reason),
+                            ));
+                        }
+                        ctx.websocket_closed_by_proxy = true;
+                        self.metrics
+                            .record_blocked_request("websocket_frame_undecodable");
+                        let mut data = forward.to_vec();
+                        if let Ok(close) = handler.close_frame(&reason, false) {
+                            data.extend_from_slice(&close);
+                        }
+                        *body = (!data.is_empty()).then(|| Bytes::from(data));
                     }
                 }
             }
@@ -3859,7 +3915,16 @@ impl ProxyHttp for ZentinelProxy {
 
         // Create timestamps for cache metadata
         let now = std::time::SystemTime::now();
-        let fresh_until = now + ttl;
+        // `calculate_ttl` caps the lifetime, so the sum fits on any real clock.
+        let Some(fresh_until) = now.checked_add(ttl) else {
+            warn!(
+                correlation_id = %ctx.trace_id,
+                route_id = %route_id,
+                ttl_secs = ttl.as_secs(),
+                "Freshness lifetime does not fit after the current time, not caching"
+            );
+            return Ok(RespCacheable::Uncacheable(NoCacheReason::OriginNotCache));
+        };
 
         // Clone the response header for storage
         let header = resp.clone();
@@ -4028,6 +4093,12 @@ impl ProxyHttp for ZentinelProxy {
         range_type
     }
 
+    fn suppress_error_log(&self, _session: &Session, ctx: &Self::CTX, _error: &Error) -> bool {
+        // A WebSocket the proxy closed itself, for a frame it could not
+        // decode, was logged where it happened.
+        ctx.websocket_closed_by_proxy
+    }
+
     /// Handle fatal proxy errors by generating custom error pages.
     /// Called when the proxy itself fails to process the request.
     async fn fail_to_proxy(
@@ -4039,6 +4110,17 @@ impl ProxyHttp for ZentinelProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // A WebSocket the proxy closed because a frame could not be decoded
+        // has its close frame sent and nothing more to say: an HTTP error
+        // written now would land in the WebSocket stream, after the close
+        // frame. The connection just ends.
+        if ctx.websocket_closed_by_proxy {
+            return pingora_proxy::FailToProxy {
+                error_code: 101,
+                can_reuse_downstream: false,
+            };
+        }
+
         let error_code = match e.etype() {
             // Connection errors
             ErrorType::ConnectRefused => 503,
@@ -4707,7 +4789,8 @@ impl ProxyHttp for ZentinelProxy {
                 method: ctx.method.clone(),
                 path: ctx.path.clone(),
                 query: ctx.query.clone(),
-                protocol: "HTTP/1.1".to_string(),
+                protocol: crate::http_helpers::protocol_label(session.req_header().version)
+                    .to_string(),
                 status,
                 body_bytes: ctx.response_bytes,
                 duration_ms: duration.as_millis() as u64,
@@ -6359,9 +6442,10 @@ impl ZentinelProxy {
         ctx: &mut RequestContext,
         max_inspection_bytes: u64,
     ) -> Result<(), Box<Error>> {
-        // No agent is called, so the request's id, for the logs, is all that
-        // is needed.
-        let correlation_id = zentinel_common::CorrelationId::from_string(&ctx.trace_id);
+        // No agent is called; the id is for the logs, and is the one the
+        // agent calls and refusals of this request are logged with.
+        let correlation_id =
+            zentinel_common::CorrelationId::from_string(ctx.agent_correlation_id());
         let decision = self
             .agent_manager
             .process_request_body_over_inspection_limit(
@@ -6563,6 +6647,41 @@ impl ZentinelProxy {
         }
 
         Ok(())
+    }
+}
+
+/// Put the request's trace ID in its `X-Correlation-Id` header, replacing
+/// every value the client sent, so agents (and the upstream) see the ID the
+/// proxy logs the request with.
+fn set_correlation_header(req_header: &mut pingora::http::RequestHeader, trace_id: &str) {
+    req_header.insert_header("X-Correlation-Id", trace_id).ok();
+}
+
+#[cfg(test)]
+mod correlation_header_tests {
+    use super::set_correlation_header;
+    use pingora::http::RequestHeader;
+
+    fn values(req: &RequestHeader) -> Vec<&str> {
+        req.headers
+            .get_all("x-correlation-id")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn the_trace_id_is_the_only_correlation_header() {
+        let mut req = RequestHeader::build("GET", b"/index.html", None).unwrap();
+        set_correlation_header(&mut req, "trace-1");
+        assert_eq!(values(&req), ["trace-1"]);
+
+        // Lines the client sent are replaced, not added to.
+        let mut req = RequestHeader::build("GET", b"/index.html", None).unwrap();
+        req.append_header("X-Correlation-Id", "client-a").unwrap();
+        req.append_header("x-correlation-id", "client-b").unwrap();
+        set_correlation_header(&mut req, "trace-2");
+        assert_eq!(values(&req), ["trace-2"]);
     }
 }
 
