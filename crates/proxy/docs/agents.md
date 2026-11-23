@@ -76,6 +76,12 @@ agents {
     // mode the same holds for a request body longer than the waf block's
     // body-inspection max-inspection-bytes: an agent is sent the whole body
     // or none of it, never the buffered start of a longer one.
+    // A request body in a Content-Encoding is sent decoded when it is in one
+    // supported coding and body-inspection decompress (on by default) is on;
+    // any other coded body follows the filter's failure-mode too: "closed"
+    // refuses it with 415, "open" sends the agent none of the body. A body
+    // that decodes to more than max-inspection-bytes is handled as one
+    // longer than it as received (413 or skipped).
 
     // gRPC transport
     agent "auth-agent" {
@@ -151,6 +157,24 @@ sent; and there is no upstream response, so `response-headers` and
 request-header changes are applied to the request, but the route reads only
 its method and URI to find the file, so they do not change the file that is
 served. A static route without `filters` calls no agent.
+
+### Builtin Routes
+
+A route with `service-type "builtin"` that has `filters` runs them, agents
+included, before its handler answers, in the same order as a proxied route.
+The agents' decisions apply as they do on a static route: `Block`,
+`Redirect` and `Challenge` answer the request instead of the handler's
+response, an `Allow` decision's response-header changes are applied to the
+handler's response, and a filter's `failure-mode` decides what happens when
+its agent cannot be reached or does not answer in time. Only the
+`request-headers` event and the request-complete notice are sent.
+
+A builtin route with `filters` passes every check a proxied route passes
+before its agents run; see [Built-in Handlers](modules.md#built-in-handlers).
+A builtin route without `filters` is answered first, before any of them, and
+calls no agent. No builtin route is counted against
+`limits { max-in-flight-requests }`: a health check is not refused because
+the proxy is busy.
 
 ## Event Model
 
@@ -329,12 +353,15 @@ the audit log as an agent decision with `phase` `response_headers` or
 
 A failed call -- the agent is not loaded, unreachable, behind an open
 circuit breaker, too slow, or the body is over its inspection limit (the
-agent's own, or `max-inspection-bytes` for a request body in buffer mode) --
+agent's own, or `max-inspection-bytes` for a request body in buffer mode, and
+for a coded one that decodes to more than it) --
 follows the **filter's** `failure-mode`, else the route's `policies
 { failure-mode }` (closed by default). This holds on every path: request
 headers and body, response headers and body. On the request side a
 fail-closed failure answers 503 (504 for a timeout, 413 for a body over the
-limit); on response headers the upstream response is replaced by that
+limit, 415 for a body in a content coding that is not decoded, see
+[Content-coded request bodies](../../config/docs/schema.md#content-coded-request-bodies));
+on response headers the upstream response is replaced by that
 refusal; on the response body the response is aborted as above. WebSocket
 frames follow the same rule: only the route's agents see them, and a
 fail-closed failure closes the connection with 1011 (#586).

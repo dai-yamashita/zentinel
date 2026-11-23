@@ -755,6 +755,16 @@ fn a_waf_ruleset_written_twice_is_an_error() {
 }
 
 #[test]
+fn a_body_inspection_block_with_two_inspect_untyped_bodies_nodes_is_an_error() {
+    assert_duplicate_within(
+        Ctx::Waf,
+        "body-inspection {\ninspect-untyped-bodies #true\ninspect-untyped-bodies #false\n}",
+        "body-inspection {\ninspect-untyped-bodies #true\n}",
+        "inspect-untyped-bodies",
+    );
+}
+
+#[test]
 fn an_observability_block_with_two_logging_blocks_is_an_error() {
     let kdl = r#"
 system { worker-threads 1 }

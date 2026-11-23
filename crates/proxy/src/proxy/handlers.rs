@@ -118,8 +118,14 @@ impl ZentinelProxy {
         let route_id = route_match.route_id.as_str();
 
         if let Some(handler) = route_match.config.builtin_handler {
-            let request_id = self.get_trace_id(session);
-            ctx.trace_id = request_id.clone();
+            // The id the request got in `early_request_filter` stays: the
+            // logs of the route's agent calls carry it, and a request without
+            // a trace header would otherwise get a new one here, in the
+            // handler's `X-Request-Id` and the logs that follow.
+            if ctx.trace_id.is_empty() {
+                ctx.trace_id = self.get_trace_id(session);
+            }
+            let request_id = ctx.trace_id.clone();
 
             // Get current config for config dump handler
             let config = Some(self.config_manager.current());
@@ -473,6 +479,19 @@ impl ZentinelProxy {
                 .cloned()
                 .unwrap_or_default();
 
+            // Whether there is a body to inspect at all, as Pingora decides
+            // it: from the framing of an HTTP/1 request, from the stream of an
+            // HTTP/2 one.
+            let has_body = !session.is_body_empty();
+            // `body-inspection { inspect-untyped-bodies }`: whether a body
+            // with no Content-Type (absent or blank) is inspected whatever the
+            // list says.
+            let inspect_untyped_bodies = config
+                .waf
+                .as_ref()
+                .map(|w| w.body_inspection.inspect_untyped_bodies)
+                .unwrap_or(zentinel_config::waf::DEFAULT_INSPECT_UNTYPED_BODIES);
+
             // Every Content-Type header counts: with two of them, the one that
             // is not allowlisted must not hide the one that is. The values are
             // read as bytes: a value with a byte outside visible ASCII is
@@ -488,8 +507,11 @@ impl ZentinelProxy {
             let content_type =
                 String::from_utf8_lossy(content_types.first().copied().unwrap_or(b""));
 
-            let is_allowed_type =
-                content_type_is_inspected(content_types.iter().copied(), &allowed_types);
+            let is_allowed_type = request_body_is_inspected(
+                content_types.iter().copied(),
+                &allowed_types,
+                has_body && inspect_untyped_bodies,
+            );
 
             if is_allowed_type || allowed_types.is_empty() {
                 ctx.body_inspection_enabled = true;
@@ -500,46 +522,68 @@ impl ZentinelProxy {
                     self.agent_manager.request_body_mode(&body_agents).await;
                 ctx.body_inspection_agents = body_agents;
 
-                // Set up decompression if enabled in WAF config
+                // How the body is coded. Every `Content-Encoding` header is
+                // read, each as a list (RFC 9110 section 8.4): a body in one
+                // supported coding is decoded for the agents when
+                // `decompress` is on; any other coded body cannot be
+                // inspected as sent, and the agents' `failure-mode` decides
+                // when it arrives (`body_not_decoded`).
                 let decompress_enabled = config
                     .waf
                     .as_ref()
                     .map(|w| w.body_inspection.decompress)
-                    .unwrap_or(false);
+                    .unwrap_or(zentinel_config::waf::DEFAULT_DECOMPRESS);
 
-                if decompress_enabled {
-                    // Get Content-Encoding header
-                    let content_encoding = session
+                // Chunks that are sent as they arrive cannot be decoded.
+                let can_decode = decompress_enabled
+                    && ctx.request_body_streaming_mode
+                        != zentinel_config::BodyStreamingMode::Stream;
+
+                let coding = crate::decompression::BodyCoding::classify(
+                    session
                         .req_header()
                         .headers
-                        .get("content-encoding")
-                        .and_then(|v| v.to_str().ok())
-                        .map(|s| s.to_string());
+                        .get_all("content-encoding")
+                        .iter()
+                        .map(|v| v.as_bytes()),
+                    can_decode,
+                );
 
-                    if let Some(ref encoding) = content_encoding {
-                        if crate::decompression::is_supported_encoding(encoding) {
-                            ctx.decompression_enabled = true;
-                            ctx.body_content_encoding = Some(encoding.clone());
-                            ctx.max_decompression_ratio = config
-                                .waf
-                                .as_ref()
-                                .map(|w| w.body_inspection.max_decompression_ratio as f64)
-                                .unwrap_or(100.0);
-                            // Use 10x max inspection bytes as decompression limit
-                            ctx.max_decompression_bytes = config
-                                .waf
-                                .as_ref()
-                                .map(|w| w.body_inspection.max_inspection_bytes * 10)
-                                .unwrap_or(10 * 1024 * 1024);
+                match coding {
+                    crate::decompression::BodyCoding::Identity => {}
+                    crate::decompression::BodyCoding::Decode(encoding) => {
+                        ctx.decompression_enabled = true;
+                        ctx.body_content_encoding = Some(encoding);
+                        ctx.max_decompression_ratio = config
+                            .waf
+                            .as_ref()
+                            .map(|w| w.body_inspection.max_decompression_ratio as f64)
+                            .unwrap_or(100.0);
+                        // A decoded body is held to the limit a body as
+                        // received is: `max-inspection-bytes`.
+                        ctx.max_decompression_bytes = config
+                            .waf
+                            .as_ref()
+                            .map(|w| w.body_inspection.max_inspection_bytes)
+                            .unwrap_or(zentinel_config::waf::DEFAULT_MAX_INSPECTION_BYTES);
 
-                            debug!(
-                                correlation_id = %ctx.trace_id,
-                                encoding = %encoding,
-                                max_ratio = ctx.max_decompression_ratio,
-                                max_bytes = ctx.max_decompression_bytes,
-                                "Decompression enabled for body inspection"
-                            );
-                        }
+                        debug!(
+                            correlation_id = %ctx.trace_id,
+                            encoding = %encoding,
+                            max_ratio = ctx.max_decompression_ratio,
+                            max_bytes = ctx.max_decompression_bytes,
+                            "Decompression enabled for body inspection"
+                        );
+                    }
+                    crate::decompression::BodyCoding::NotDecoded(undecoded) => {
+                        debug!(
+                            correlation_id = %ctx.trace_id,
+                            encoding = %undecoded.declared,
+                            decompress = decompress_enabled,
+                            streaming_mode = ?ctx.request_body_streaming_mode,
+                            "Request body is content-coded and will not be decoded for inspection"
+                        );
+                        ctx.body_not_decoded = Some(undecoded);
                     }
                 }
 
@@ -1358,9 +1402,13 @@ pub(super) fn apply_agent_response_header_ops(
 ///
 /// Media types are case-insensitive (RFC 9110 section 8.3.1), so `APPLICATION/JSON`
 /// is `application/json`. An entry matches as a prefix, so `application/json`
-/// also covers `application/json; charset=utf-8`. A request without a
-/// `Content-Type` is matched as the empty string. The request is inspected if
-/// any of its `Content-Type` values matches.
+/// also covers `application/json; charset=utf-8`. An entry `type/subtype` also
+/// matches a structured-syntax media type (RFC 6839) of the same top-level
+/// type, `type/<name>+subtype`, so `application/json` covers
+/// `application/vnd.api+json`; for that rule the entry is read without its own
+/// parameters. A request without a `Content-Type` is matched as the empty
+/// string. The request is inspected if any of its `Content-Type` values
+/// matches.
 ///
 /// Values are compared as bytes, so a byte outside visible ASCII (which
 /// `HeaderValue::to_str` refuses) does not make a value disappear: an entry
@@ -1375,11 +1423,11 @@ where
     T: AsRef<[u8]> + ?Sized + 'a,
 {
     let matches = |content_type: &[u8]| {
-        let content_type = content_type.trim_ascii_start();
+        let prefixed = content_type.trim_ascii_start();
         allowed.iter().any(|allowed| {
-            let allowed = allowed.as_bytes();
-            content_type.len() >= allowed.len()
-                && content_type[..allowed.len()].eq_ignore_ascii_case(allowed)
+            let entry = allowed.as_bytes();
+            (prefixed.len() >= entry.len() && prefixed[..entry.len()].eq_ignore_ascii_case(entry))
+                || is_structured_suffix_type(content_type, allowed)
         })
     };
     let mut seen = false;
@@ -1399,6 +1447,67 @@ fn is_visible_header_text(value: &[u8]) -> bool {
     value
         .iter()
         .all(|&b| b == b'\t' || (0x20..0x7f).contains(&b))
+}
+
+/// Whether `content_type` is `type/<name>+subtype` for the allowlist entry
+/// `type/subtype`, ignoring case and the parameters of both. The top-level
+/// type has to be the same, and `<name>` cannot be empty.
+///
+/// Read as bytes, like the rest of the match: a byte outside visible ASCII in
+/// a parameter does not hide the media type.
+fn is_structured_suffix_type(content_type: &[u8], entry: &str) -> bool {
+    fn essence(value: &[u8]) -> &[u8] {
+        value
+            .split(|&b| b == b';')
+            .next()
+            .unwrap_or_default()
+            .trim_ascii()
+    }
+    fn split_media_type(value: &[u8]) -> Option<(&[u8], &[u8])> {
+        let slash = value.iter().position(|&b| b == b'/')?;
+        Some((&value[..slash], &value[slash + 1..]))
+    }
+    let (content_type, entry) = (essence(content_type), essence(entry.as_bytes()));
+    let (Some((top, subtype)), Some((entry_top, suffix))) =
+        (split_media_type(content_type), split_media_type(entry))
+    else {
+        return false;
+    };
+    if entry_top.is_empty() || suffix.is_empty() || !top.eq_ignore_ascii_case(entry_top) {
+        return false;
+    }
+    subtype.len() > suffix.len() + 1
+        && subtype[subtype.len() - suffix.len() - 1] == b'+'
+        && subtype[subtype.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+}
+
+/// Whether a request's body goes to the agents, given the values of its
+/// `Content-Type` headers (as bytes) and whether a request with none is
+/// inspected whatever the allowlist says (`untyped_is_inspected`: it has a
+/// body, and `body-inspection { inspect-untyped-bodies }` is on).
+///
+/// A body with no `Content-Type` is inspected then, as the proxy cannot tell
+/// how the upstream will read it. A blank value counts as no `Content-Type`.
+/// A value with a byte outside visible ASCII does not: it is a `Content-Type`
+/// the upstream may act on, and [`content_type_is_inspected`] inspects it
+/// whatever the allowlist and `untyped_is_inspected` say. Otherwise the
+/// allowlist decides, as there.
+fn request_body_is_inspected<'a, T>(
+    content_types: impl IntoIterator<Item = &'a T>,
+    allowed: &[String],
+    untyped_is_inspected: bool,
+) -> bool
+where
+    T: AsRef<[u8]> + ?Sized + 'a,
+{
+    let mut content_types = content_types
+        .into_iter()
+        .filter(|content_type| !content_type.as_ref().trim_ascii().is_empty())
+        .peekable();
+    if untyped_is_inspected && content_types.peek().is_none() {
+        return true;
+    }
+    content_type_is_inspected(content_types, allowed)
 }
 
 #[cfg(test)]
@@ -1583,6 +1692,247 @@ mod tests {
                 "byte {byte:#04x}"
             );
         }
+    }
+
+    #[test]
+    fn content_type_allowlist_covers_structured_syntax_suffix_types() {
+        let allowed = allowlist(&[
+            "application/x-www-form-urlencoded",
+            "multipart/form-data",
+            "application/json",
+            "application/xml",
+            "text/xml",
+        ]);
+        for content_type in [
+            "application/vnd.api+json",
+            "application/problem+json",
+            "application/merge-patch+json",
+            "application/soap+xml",
+            "application/atom+xml",
+            "text/foo+xml",
+            "application/vnd.api+json; charset=utf-8",
+            "application/vnd.api+json;charset=utf-8",
+            "application/vnd.api+json ; charset=utf-8",
+            "  application/vnd.api+json",
+            "APPLICATION/VND.API+JSON",
+            "Application/Problem+Json; Charset=UTF-8",
+            "application/soap+xml; action=\"urn:example\"",
+        ] {
+            assert!(
+                content_type_is_inspected([content_type], &allowed),
+                "{content_type:?} must be inspected"
+            );
+        }
+    }
+
+    #[test]
+    fn content_type_allowlist_suffix_is_matched_within_the_same_top_level_type() {
+        let allowed = allowlist(&["application/json", "application/xml", "text/xml"]);
+        for content_type in [
+            "text/vnd.api+json",
+            "image/svg+xml",
+            "text/foo+json",
+            "application/foo+xml-patch",
+            "application/foo+jsonx",
+            "application/vnd.api+yaml",
+            "application/x-ndjson",
+            "application/vndjson",
+            "application/+json",
+            "application/+xml",
+            "application/foo+",
+            "foo+json",
+            "+json",
+        ] {
+            assert!(
+                !content_type_is_inspected([content_type], &allowed),
+                "{content_type:?} is not on the allowlist"
+            );
+        }
+    }
+
+    #[test]
+    fn content_type_allowlist_suffix_rule_reads_the_entry_without_its_parameters() {
+        let allowed = allowlist(&["application/json; charset=utf-8"]);
+        assert!(content_type_is_inspected(
+            ["application/vnd.api+json"],
+            &allowed
+        ));
+        assert!(content_type_is_inspected(
+            ["application/json; charset=utf-8"],
+            &allowed
+        ));
+        assert!(!content_type_is_inspected(["text/plain"], &allowed));
+    }
+
+    #[test]
+    fn content_type_allowlist_suffix_rule_ignores_the_case_of_the_entry_too() {
+        let allowed = allowlist(&["Application/JSON", "TEXT/Xml"]);
+        for content_type in [
+            "application/vnd.api+json",
+            "APPLICATION/VND.API+JSON",
+            "text/foo+xml",
+            "Text/Foo+XML; charset=utf-8",
+        ] {
+            assert!(
+                content_type_is_inspected([content_type], &allowed),
+                "{content_type:?} must be inspected"
+            );
+        }
+        assert!(!content_type_is_inspected(["image/svg+xml"], &allowed));
+    }
+
+    #[test]
+    fn content_type_allowlist_suffix_rule_adds_nothing_for_multipart_and_form_entries() {
+        let allowed = allowlist(&["multipart/form-data", "application/x-www-form-urlencoded"]);
+        for content_type in [
+            "multipart/mixed; boundary=x",
+            "multipart/related; boundary=x",
+            "multipart/form",
+            "application/x-www-form",
+            "application/form-data",
+        ] {
+            assert!(
+                !content_type_is_inspected([content_type], &allowed),
+                "{content_type:?} is not on the allowlist"
+            );
+        }
+    }
+
+    #[test]
+    fn content_type_allowlist_suffix_applies_to_any_of_several_headers() {
+        let allowed = allowlist(&["application/json"]);
+        assert!(content_type_is_inspected(
+            ["text/plain", "application/vnd.api+json"],
+            &allowed
+        ));
+        assert!(!content_type_is_inspected(
+            ["text/plain", "text/vnd.api+json"],
+            &allowed
+        ));
+    }
+
+    #[test]
+    fn untyped_body_is_inspected_whatever_the_allowlist_says() {
+        let none: [&str; 0] = [];
+        for allowed in [
+            allowlist(&["application/json"]),
+            allowlist(&["application/json", "application/xml"]),
+            allowlist(&[""]),
+        ] {
+            assert!(request_body_is_inspected(none, &allowed, true));
+        }
+    }
+
+    #[test]
+    fn blank_content_type_counts_as_none() {
+        let allowed = allowlist(&["application/json"]);
+        for blank in ["", " ", "\t"] {
+            assert!(
+                request_body_is_inspected([blank], &allowed, true),
+                "{blank:?} must be inspected"
+            );
+        }
+        assert!(request_body_is_inspected(["", ""], &allowed, true));
+    }
+
+    #[test]
+    fn untyped_request_that_is_not_inspected_is_matched_as_before() {
+        let none: [&str; 0] = [];
+        assert!(!request_body_is_inspected(
+            none,
+            &allowlist(&["application/json"]),
+            false
+        ));
+        assert!(!request_body_is_inspected(
+            [" "],
+            &allowlist(&["application/json"]),
+            false
+        ));
+        assert!(request_body_is_inspected(none, &allowlist(&[""]), false));
+    }
+
+    #[test]
+    fn typed_request_follows_the_allowlist_alone() {
+        let allowed = allowlist(&["application/json"]);
+        for untyped_is_inspected in [false, true] {
+            assert!(request_body_is_inspected(
+                ["application/json"],
+                &allowed,
+                untyped_is_inspected
+            ));
+            assert!(request_body_is_inspected(
+                ["application/vnd.api+json"],
+                &allowed,
+                untyped_is_inspected
+            ));
+            assert!(!request_body_is_inspected(
+                ["text/plain"],
+                &allowed,
+                untyped_is_inspected
+            ));
+            assert!(!request_body_is_inspected(
+                ["application/octet-stream", "text/plain"],
+                &allowed,
+                untyped_is_inspected
+            ));
+        }
+    }
+
+    #[test]
+    fn suffix_rule_reads_header_bytes() {
+        for (content_type, entry) in [
+            (&b"application/vnd.api+json; x=\xff"[..], "application/json"),
+            (b"APPLICATION/PROBLEM+JSON;charset=\xe9", "application/json"),
+            (b"  application/soap+xml ; a=caf\xc3\xa9", "application/xml"),
+        ] {
+            assert!(
+                is_structured_suffix_type(content_type, entry),
+                "{content_type:?} is a +suffix type of {entry:?}"
+            );
+        }
+        for content_type in [
+            &b"text/vnd.api+json; x=\xff"[..],
+            b"application/vnd.api+yaml; x=\xff",
+            b"application/+json; x=\xff",
+        ] {
+            assert!(
+                !is_structured_suffix_type(content_type, "application/json"),
+                "{content_type:?} is not a +suffix type of application/json"
+            );
+        }
+    }
+
+    #[test]
+    fn unreadable_content_type_is_not_untyped() {
+        // A byte outside visible ASCII makes a value neither blank nor
+        // absent: it is inspected whatever the list says, and whether or not
+        // `inspect-untyped-bodies` is on.
+        let allowed = allowlist(&["application/json"]);
+        let unreadable = header_bytes(b"text/plain; name=caf\xc3\xa9");
+        let blank = &b"  "[..];
+        for untyped_is_inspected in [false, true] {
+            assert!(
+                request_body_is_inspected([unreadable.as_bytes()], &allowed, untyped_is_inspected),
+                "untyped_is_inspected={untyped_is_inspected}"
+            );
+            assert!(
+                request_body_is_inspected(
+                    [blank, unreadable.as_bytes()],
+                    &allowed,
+                    untyped_is_inspected
+                ),
+                "untyped_is_inspected={untyped_is_inspected}, after a blank value"
+            );
+        }
+        // A readable value that is not listed still is not, and a blank one
+        // is no `Content-Type`.
+        assert!(!request_body_is_inspected(
+            [&b"text/plain"[..]],
+            &allowed,
+            false
+        ));
+        assert!(!request_body_is_inspected([blank], &allowed, false));
+        assert!(request_body_is_inspected([blank], &allowed, true));
     }
 
     fn upstream_error(status: u16, content_type: &str, body: &str) -> ResponseHeader {

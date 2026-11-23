@@ -109,10 +109,10 @@ impl ZentinelProxy {
     /// is one second, since in-flight requests usually finish quicker than
     /// that.
     ///
-    /// Called from `request_filter`, so builtin handlers (health, status,
-    /// metrics), which are answered in `early_request_filter`, are never
-    /// refused: a health check failing because the proxy is busy would take
-    /// a working proxy out of its load balancer.
+    /// Called from `request_filter` for every route except a builtin one, so
+    /// builtin handlers (health, status, metrics) are never refused, with
+    /// `filters` or without: a health check failing because the proxy is busy
+    /// would take a working proxy out of its load balancer.
     async fn refuse_over_in_flight_limit(
         &self,
         session: &mut Session,
@@ -294,6 +294,76 @@ impl ZentinelProxy {
             .map(|p| p.port())
             .unwrap_or(0);
         (client_addr, client_port)
+    }
+
+    /// Refuse a request with more headers than `max-header-count`, or with
+    /// more header bytes than `max-header-size` (the namespace's or service's
+    /// limit, where smaller), by returning the error to answer it with.
+    ///
+    /// A proxied route runs this after the proxy has added its own
+    /// `X-Correlation-Id` and `X-Forwarded-By` to the request, so they are
+    /// counted; a static or builtin route runs it on the client's headers.
+    fn enforce_header_limits(
+        &self,
+        session: &Session,
+        ctx: &mut RequestContext,
+    ) -> Result<(), Box<Error>> {
+        let req_header = session.req_header();
+
+        // Use cached config (set in upstream_peer, or fetch now if needed)
+        let config = ctx
+            .config
+            .get_or_insert_with(|| self.config_manager.current());
+        let (global_header_count, global_header_size) = (
+            config.limits.max_header_count,
+            config.limits.max_header_size_bytes,
+        );
+        // The namespace's limits, where smaller, apply instead (#542).
+        let max_header_count = ctx.max_header_count(global_header_count);
+        let max_header_size = ctx.max_header_size(global_header_size);
+
+        // Enforce header limits (fast path: skip if limits are very high)
+        const HEADER_LIMIT_THRESHOLD: usize = 1024 * 1024; // 1MB = effectively unlimited
+
+        // Header count check - O(1)
+        let header_count = req_header.headers.len();
+        if max_header_count < HEADER_LIMIT_THRESHOLD && header_count > max_header_count {
+            warn!(
+                correlation_id = %ctx.trace_id,
+                header_count = header_count,
+                limit = max_header_count,
+                "Request blocked: exceeds header count limit"
+            );
+
+            self.metrics.record_blocked_request("header_count_exceeded");
+            return Err(Error::explain(ErrorType::InternalError, "Too many headers"));
+        }
+
+        // Header size check - O(n), skip if limit is very high
+        if max_header_size < HEADER_LIMIT_THRESHOLD {
+            let total_header_size: usize = req_header
+                .headers
+                .iter()
+                .map(|(k, v)| k.as_str().len() + v.len())
+                .sum();
+
+            if total_header_size > max_header_size {
+                warn!(
+                    correlation_id = %ctx.trace_id,
+                    header_size = total_header_size,
+                    limit = max_header_size,
+                    "Request blocked: exceeds header size limit"
+                );
+
+                self.metrics.record_blocked_request("header_size_exceeded");
+                return Err(Error::explain(
+                    ErrorType::InternalError,
+                    "Headers too large",
+                ));
+            }
+        }
+
+        Ok(())
     }
 
     /// Answer a request an agent filter stopped, with an error from
@@ -666,8 +736,12 @@ impl ProxyHttp for ZentinelProxy {
             ctx.otel_span = Some(tracer.start_span(method, path, ctx.trace_context.as_ref()));
         }
 
-        // Check if this is a builtin handler route
-        if route_match.config.service_type == zentinel_config::ServiceType::Builtin {
+        // A builtin handler route without `filters` is answered here, ahead
+        // of `request_filter`. One with `filters` is answered in
+        // `request_filter`, after the route's filters have run.
+        if route_match.config.service_type == zentinel_config::ServiceType::Builtin
+            && route_match.config.filters.is_empty()
+        {
             trace!(
                 correlation_id = %ctx.trace_id,
                 route_id = %route_match.route_id,
@@ -1413,7 +1487,12 @@ impl ProxyHttp for ZentinelProxy {
             }
         }
 
-        if self.refuse_over_in_flight_limit(session, ctx).await? {
+        // Builtin routes are not counted: see `refuse_over_in_flight_limit`.
+        let is_builtin = ctx
+            .route_config
+            .as_ref()
+            .is_some_and(|r| r.service_type == zentinel_config::ServiceType::Builtin);
+        if !is_builtin && self.refuse_over_in_flight_limit(session, ctx).await? {
             return Ok(true);
         }
 
@@ -1931,6 +2010,14 @@ impl ProxyHttp for ZentinelProxy {
         // Use cached route config from upstream_peer (avoids duplicate route matching)
         // Handle static file and builtin routes
         if let Some(route_config) = ctx.route_config.clone() {
+            // The header limits apply to a request these routes answer as they
+            // do to one that is proxied, before any agent is called.
+            if matches!(
+                route_config.service_type,
+                zentinel_config::ServiceType::Static | zentinel_config::ServiceType::Builtin
+            ) {
+                self.enforce_header_limits(session, ctx)?;
+            }
             if route_config.service_type == zentinel_config::ServiceType::Static {
                 trace!(
                     correlation_id = %ctx.trace_id,
@@ -1966,6 +2053,18 @@ impl ProxyHttp for ZentinelProxy {
                     builtin_handler = ?route_config.builtin_handler,
                     "Handling builtin route"
                 );
+                // The route's agent filters decide before the handler
+                // answers, as they do before a request is proxied: only
+                // request headers are sent, as on a static route.
+                if !route_config.filters.is_empty() {
+                    let (client_addr, client_port) = Self::agent_client(session, ctx);
+                    if let Err(e) = self
+                        .process_agents(session, ctx, &client_addr, client_port)
+                        .await
+                    {
+                        return self.answer_agent_refusal(session, ctx, e).await;
+                    }
+                }
                 // Create a minimal RouteMatch for the handler
                 let route_match = crate::routing::RouteMatch {
                     route_id: zentinel_common::RouteId::new(ctx.route_id.as_deref().unwrap_or("")),
@@ -2013,58 +2112,7 @@ impl ProxyHttp for ZentinelProxy {
         set_correlation_header(req_header, &ctx.trace_id);
         req_header.insert_header("X-Forwarded-By", "Zentinel").ok();
 
-        // Use cached config (set in upstream_peer, or fetch now if needed)
-        let config = ctx
-            .config
-            .get_or_insert_with(|| self.config_manager.current());
-        let (global_header_count, global_header_size) = (
-            config.limits.max_header_count,
-            config.limits.max_header_size_bytes,
-        );
-        // The namespace's limits, where smaller, apply instead (#542).
-        let max_header_count = ctx.max_header_count(global_header_count);
-        let max_header_size = ctx.max_header_size(global_header_size);
-
-        // Enforce header limits (fast path: skip if limits are very high)
-        const HEADER_LIMIT_THRESHOLD: usize = 1024 * 1024; // 1MB = effectively unlimited
-
-        // Header count check - O(1)
-        let header_count = req_header.headers.len();
-        if max_header_count < HEADER_LIMIT_THRESHOLD && header_count > max_header_count {
-            warn!(
-                correlation_id = %ctx.trace_id,
-                header_count = header_count,
-                limit = max_header_count,
-                "Request blocked: exceeds header count limit"
-            );
-
-            self.metrics.record_blocked_request("header_count_exceeded");
-            return Err(Error::explain(ErrorType::InternalError, "Too many headers"));
-        }
-
-        // Header size check - O(n), skip if limit is very high
-        if max_header_size < HEADER_LIMIT_THRESHOLD {
-            let total_header_size: usize = req_header
-                .headers
-                .iter()
-                .map(|(k, v)| k.as_str().len() + v.len())
-                .sum();
-
-            if total_header_size > max_header_size {
-                warn!(
-                    correlation_id = %ctx.trace_id,
-                    header_size = total_header_size,
-                    limit = max_header_size,
-                    "Request blocked: exceeds header size limit"
-                );
-
-                self.metrics.record_blocked_request("header_size_exceeded");
-                return Err(Error::explain(
-                    ErrorType::InternalError,
-                    "Headers too large",
-                ));
-            }
-        }
+        self.enforce_header_limits(session, ctx)?;
 
         // Process through external agents
         trace!(
@@ -2271,7 +2319,7 @@ impl ProxyHttp for ZentinelProxy {
                 .waf
                 .as_ref()
                 .map(|w| w.body_inspection.max_inspection_bytes as u64)
-                .unwrap_or(1024 * 1024);
+                .unwrap_or(zentinel_config::waf::DEFAULT_MAX_INSPECTION_BYTES as u64);
 
             match ctx.request_body_streaming_mode {
                 BodyStreamingMode::Stream => {
@@ -3512,7 +3560,7 @@ impl ProxyHttp for ZentinelProxy {
                     .waf
                     .as_ref()
                     .map(|w| w.body_inspection.max_inspection_bytes as u64)
-                    .unwrap_or(1024 * 1024);
+                    .unwrap_or(zentinel_config::waf::DEFAULT_MAX_INSPECTION_BYTES as u64);
 
                 if ctx.response_body_bytes_inspected < max_inspection_bytes {
                     let bytes_to_inspect = std::cmp::min(
@@ -5078,6 +5126,17 @@ fn has_content_encoding(headers: &http::HeaderMap) -> bool {
         })
 }
 
+/// A request body in a content coding the proxy does not decode for the
+/// agents, refused because they `fail closed`. Downstream, like
+/// [`body_too_large`]: it is the client's request that is refused.
+fn body_coding_not_decoded() -> Box<Error> {
+    Error::explain(
+        ErrorType::HTTPStatus(415),
+        "Request body content coding is not decoded for inspection",
+    )
+    .into_down()
+}
+
 /// The JSON body `fail_to_proxy` answers with: `{"error":"<code> <reason>",
 /// "trace_id":"..."}`.
 ///
@@ -5998,6 +6057,18 @@ impl ZentinelProxy {
     ) -> Result<(), Box<Error>> {
         // Clone the chunk data to avoid borrowing issues when mutating body later
         let chunk_data: Vec<u8> = body.as_ref().map(|b| b.to_vec()).unwrap_or_default();
+        // Chunks cannot be decoded.
+        ctx.body_goes_in_pieces();
+        if ctx.body_not_decoded.is_some() {
+            if !chunk_data.is_empty() {
+                self.apply_body_not_decoded(ctx)?;
+            }
+            if ctx.body_not_decoded_applied {
+                // Allowed (`open`): the agents are sent none of the body,
+                // and the chunk goes on as it is.
+                return Ok(());
+            }
+        }
         let chunk_index = ctx.request_body_chunk_index;
         ctx.request_body_chunk_index += 1;
         ctx.body_bytes_inspected += chunk_data.len() as u64;
@@ -6484,6 +6555,10 @@ impl ZentinelProxy {
     /// one refuses the request with 413 and an `open` one is skipped, with
     /// a warning and a metric.
     ///
+    /// A content-coded body that decodes to more than `max_inspection_bytes`
+    /// is handled the same way, in every mode that decodes it (buffer,
+    /// `hybrid` within its threshold, `inspect-first`).
+    ///
     /// Before, the agents were sent the buffered start of the body as if it
     /// were the body, and the size check that applies the failure mode saw
     /// only that part's length, so it never found the body over the limit.
@@ -6515,11 +6590,63 @@ impl ZentinelProxy {
         )
     }
 
+    /// A request body that is content-coded and is not decoded for the body
+    /// agents (`RequestContext::body_not_decoded`) cannot be inspected as
+    /// sent. Called when the first of its bytes is about to go to them: the
+    /// body agents' filters decide, as for a body that cannot be
+    /// decompressed. `closed` refuses the request with 415, before any of
+    /// the body reaches the upstream. `open` goes on, with a warning and a
+    /// `zentinel_decompression_total` count with the reason `not_decoded`;
+    /// the agents are sent none of the body, as for a body over
+    /// `max-inspection-bytes`, and the caller checks
+    /// `body_not_decoded_applied` to skip them.
+    ///
+    /// Decided once per request.
+    fn apply_body_not_decoded(&self, ctx: &mut RequestContext) -> Result<(), Box<Error>> {
+        if ctx.body_not_decoded_applied {
+            return Ok(());
+        }
+        let Some(undecoded) = ctx.body_not_decoded.clone() else {
+            return Ok(());
+        };
+        ctx.body_not_decoded_applied = true;
+        self.metrics
+            .record_decompression_failure(undecoded.label, "not_decoded");
+
+        if ctx.request_body_agents_fail_closed() {
+            error!(
+                correlation_id = %ctx.trace_id,
+                encoding = %undecoded.declared,
+                "Request body is not decoded for inspection, blocking (fail-closed)"
+            );
+            Err(body_coding_not_decoded())
+        } else {
+            warn!(
+                correlation_id = %ctx.trace_id,
+                encoding = %undecoded.declared,
+                "Request body is not decoded for inspection, not sending it to the agents (fail-open)"
+            );
+            Ok(())
+        }
+    }
+
     async fn send_buffered_body_to_agents(
         &self,
         end_of_stream: bool,
         ctx: &mut RequestContext,
     ) -> Result<(), Box<Error>> {
+        // Only a body that is whole can be decoded. `hybrid` mode sends
+        // what it has buffered when it reaches its threshold, with more to
+        // come: a start that is cut short is not decoded.
+        if !end_of_stream {
+            ctx.body_goes_in_pieces();
+        }
+        if ctx.body_not_decoded.is_some() && !ctx.body_buffer.is_empty() {
+            self.apply_body_not_decoded(ctx)?;
+            // Allowed (`open`): the agents are sent none of it.
+            return Ok(());
+        }
+
         debug!(
             correlation_id = %ctx.trace_id,
             agent_correlation_id = %ctx.agent_correlation_id(),
@@ -6532,7 +6659,7 @@ impl ZentinelProxy {
 
         // Decompress body if enabled and we have a supported encoding
         let body_for_inspection = if ctx.decompression_enabled {
-            if let Some(ref encoding) = ctx.body_content_encoding {
+            if let Some(encoding) = ctx.body_content_encoding {
                 let config = crate::decompression::DecompressionConfig {
                     max_ratio: ctx.max_decompression_ratio,
                     max_output_bytes: ctx.max_decompression_bytes,
@@ -6573,6 +6700,18 @@ impl ZentinelProxy {
                         self.metrics
                             .record_decompression_failure(encoding, failure_reason);
 
+                        // Decoded, the body is longer than
+                        // `max-inspection-bytes`: it is handled as a body
+                        // that is over it as received, whichever mode it
+                        // is held whole in.
+                        if matches!(
+                            e,
+                            crate::decompression::DecompressionError::SizeExceeded { .. }
+                        ) {
+                            let limit = ctx.max_decompression_bytes as u64;
+                            return self.request_body_over_inspection_limit(ctx, limit).await;
+                        }
+
                         // The body cannot be inspected as sent. Decided by
                         // the body agents' filters, else the route, as any
                         // failure on the body is (#597); it used to be the
@@ -6591,13 +6730,15 @@ impl ZentinelProxy {
                                 "Invalid compressed body",
                             ));
                         } else {
+                            // The agents are sent none of the body, as for
+                            // a body over `max-inspection-bytes`.
                             warn!(
                                 correlation_id = %ctx.trace_id,
                                 error = %e,
                                 encoding = %encoding,
-                                "Decompression failed, sending compressed body (fail-open)"
+                                "Decompression failed, not sending the body to the agents (fail-open)"
                             );
-                            ctx.body_buffer.clone()
+                            return Ok(());
                         }
                     }
                 }

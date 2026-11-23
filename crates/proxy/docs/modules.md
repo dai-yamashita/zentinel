@@ -349,6 +349,9 @@ impl StaticFileServer {
 - Directory listing
 - SPA fallback routing
 
+A static route's request is checked against `max-header-count` and
+`max-header-size` before the file is served, as a proxied request is.
+
 **Configuration:**
 
 ```kdl
@@ -647,9 +650,24 @@ file is re-read on its own.
 Safe decompression with zip bomb protection.
 
 **Supported Encodings:**
-- gzip
-- deflate
-- brotli
+- gzip (`gzip`, `x-gzip`)
+- deflate (the zlib format of RFC 9110, or a raw deflate stream)
+- brotli (`br`; `brotli` is accepted for it too)
+
+**Request `Content-Encoding`:** `content_codings` reads every
+`Content-Encoding` header of a request as a comma-separated list, without
+regard to case or to spaces around a name, leaving out `identity`, and
+`BodyCoding::classify` decides what is done with the body. One supported
+coding is decoded for the body agents (`body-inspection { decompress }`),
+within `max-decompression-ratio` and `max-inspection-bytes` of
+`waf { body-inspection }`. A body that decodes to more than
+`max-inspection-bytes` is handled as one longer than it as received (413
+for `closed`, the agent skipped for `open`); one that reaches
+`max-decompression-ratio` first fails to decode (400 for `closed`).
+Anything else, several codings included, is not decoded, and the agents'
+`failure-mode` decides (415 for `closed`). `is_supported_encoding` and
+`parse_content_encoding` are not used for this. See
+[Content-coded request bodies](../../config/docs/schema.md#content-coded-request-bodies).
 
 **Key Function:**
 
@@ -666,7 +684,8 @@ pub fn decompress_body(
 ```rust
 DecompressionConfig {
     max_ratio: 100.0,    // Max expansion ratio
-    max_output_bytes: 10 * 1024 * 1024,  // 10MB limit
+    max_output_bytes: 10 * 1024 * 1024,  // 10MB limit (a request body: the
+                                         // `waf` `max-inspection-bytes`)
 }
 ```
 
@@ -871,6 +890,28 @@ embedded default configuration therefore declares `/metrics` and the
 listener is bound to `127.0.0.1:9090`, and only the status page on the main
 listener. See `crates/config/docs/kdl-format.md` (Builtin routes and
 listeners).
+
+**Route filters:** A builtin route with `filters` goes through
+`request_filter` like a proxied route, and every check there applies to it,
+even when its only filter is a response-header one:
+
+- rate limits: the route's own (a `rate-limit` filter or `policies { rate-limit }`),
+  `rate-limits { global }`, and `rate-limits { default-rps }` for a route with
+  no limit of its own;
+- geo, `redirect` and `cors` (preflight) filters, and agent filters (see
+  [Builtin Routes](agents.md#builtin-routes));
+- the declared request-body limit (413), the WebSocket upgrade check (403), and
+  `max-header-count` and `max-header-size`.
+
+Its response-header policy and response filters apply to the response. A
+builtin route a load balancer or orchestrator probes (health, ready) should
+have no `filters`, so none of this can refuse the probe.
+
+A builtin route without `filters` is answered first, before any of these
+checks, so none of them applies to it: not `policies { rate-limit }` or
+`max-body-size` on the route, nor `rate-limits { global }` or `default-rps`.
+No builtin route is refused by `limits { max-in-flight-requests }`, with
+`filters` or without.
 
 **Key Struct:** `BuiltinHandlerState`
 
