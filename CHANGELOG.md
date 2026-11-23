@@ -18,6 +18,7 @@ for details.
 
 | CalVer | Crate Version | Date | Highlights |
 |--------|---------------|------|------------|
+| [26.11_6](#26116---2026-11-23) | 0.6.60 | 2026-11-23 | Geo filter lookup cache and inference rate limit buckets are bounded; stale `cargo audit` ignores removed |
 | [26.11_5](#26115---2026-11-23) | 0.6.59 | 2026-11-23 | **Wrong-typed values, `tls` on an `http` listener, unknown TLS versions, out-of-range integers and unresolvable upstream/agent references are configuration errors** (**read the upgrade notes**); **a TLS listener or geo database that cannot be loaded stops startup**; **non-idempotent requests are not retried after an upstream error, and `max-attempts` bounds every retry**; **compressed request bodies are decoded for agents by default**; **filters on builtin routes apply**; **the inference prompt check runs**; geo filters read every country and follow reloads; ACME issues for `h2` listeners; **an undecodable WebSocket frame on an inspected route closes the connection**; the response cache key includes route and host (the cache starts cold); the access log records the query string and HTTP version; a certificate whose key does not match is refused; the Helm charts pull a published image, their config parses and the probes reach a health listener; systemd restarts back off to 120 s |
 | [26.11_4](#26114---2026-11-22) | 0.6.58 | 2026-11-22 | **Security: request bodies whose `Content-Type` has a byte outside visible ASCII are inspected** (they bypassed body agents with the default `waf` allowlist); **duplicate config nodes, wrong-typed values and repeated ids are errors** (**read the upgrade notes**); metrics and health only on the admin listener; bodies over `max-inspection-bytes` hit the filter's failure-mode; IPv6 clients grouped by /64; caching honours `Authorization`, `Set-Cookie` and `Vary`; forwarding headers from untrusted peers stripped; `query-param` route matches work; agents get a proxy-generated correlation id |
 | [26.11_3](#26113---2026-11-14) | 0.6.57 | 2026-11-14 | **Agent gRPC TLS options are applied** (`ca-cert`, `client-cert`/`client-key`; TLS options on a non-`https://` agent and `tls-insecure` are now configuration errors, **read the upgrade notes**); agents receive `RequestComplete` at the end of every request; **Hetzner DNS-01 works again** on the Hetzner Cloud API (**needs a new token**); WAF body-inspection content types matched case-insensitively; release binaries no longer report `-dirty`; Gateway API controller on kube 5 / gateway-api 0.23 |
@@ -98,6 +99,28 @@ for details.
 ---
 
 ## [Unreleased]
+
+---
+
+## [26.11_6] - 2026-11-23
+
+**Crate version:** 0.6.60
+
+Maintenance release on top of 26.11_5.
+
+### Fixed
+- The geo filter lookup cache keeps at most 100,000 results per filter. When
+  it is full, expired entries are removed first, and a result that still finds
+  no room is not cached; the lookup itself is unchanged (#822).
+- The inference rate limiter (`inference { rate-limit }`) drops the buckets of
+  idle clients every 5 minutes and keeps at most 100,000 per kind; its cleanup
+  was never run before. A client that finds no room is checked against a
+  bucket that is not kept, so one request still cannot take more than
+  `burst-tokens` (#822).
+
+### Dependencies
+- Two `.cargo/audit.toml` ignore entries that no longer matched any crate are
+  removed (RUSTSEC-2025-0069, RUSTSEC-2025-0057) (#819).
 
 ---
 
