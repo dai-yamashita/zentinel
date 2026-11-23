@@ -81,6 +81,15 @@ async fn main() -> Result<()> {
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
 
+    // Checked here so that a bad value stops the controller at startup; each
+    // rebuild reads it again and fails the same way.
+    let client_ipv6_prefix_length =
+        zentinel_gateway::translator::client_ipv6_prefix_length_from_env()?;
+    info!(
+        bits = client_ipv6_prefix_length.get(),
+        "IPv6 clients are counted by prefix for per-client limits"
+    );
+
     let mut controller = GatewayController::new().await?;
 
     // Enable config file output for proxy sidecar

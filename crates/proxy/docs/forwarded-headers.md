@@ -97,9 +97,10 @@ respect, so this also has effects beyond the chain:
 
 | Group | Headers |
 |-------|---------|
-| Client address | `Forwarded`, `X-Real-IP`, `X-Client-IP`, `X-Cluster-Client-IP`, `True-Client-IP`, `CF-Connecting-IP`, `Fastly-Client-IP`, `Client-IP`, `X-Originating-IP`, `X-Envoy-External-Address`, `X-Azure-ClientIP`, `X-Appengine-User-IP` |
+| Client address | `Forwarded`, `X-Real-IP`, `X-Client-IP`, `X-Cluster-Client-IP`, `True-Client-IP`, `CF-Connecting-IP`, `Fastly-Client-IP`, `Client-IP`, `X-Originating-IP`, `X-Envoy-External-Address`, `X-Azure-ClientIP`, `X-Appengine-User-IP`, `X-Forwarded`, `Forwarded-For`, `X-Original-Forwarded-For` |
 | Scheme and port | `X-Forwarded-Port`, `X-Forwarded-Ssl`, `X-Forwarded-Scheme`, `X-Forwarded-Protocol`, `X-Scheme`, `X-Url-Scheme`, `Front-End-Https`, `CF-Visitor` |
-| Original URL, host and prefix | `X-Forwarded-Prefix`, `X-Forwarded-Server`, `X-Forwarded-Uri`, `X-Forwarded-Path`, `X-Original-URL`, `X-Original-URI`, `X-Original-Host`, `X-Rewrite-URL` |
+| Original URL, host and prefix | `X-Forwarded-Prefix`, `X-Forwarded-Server`, `X-Forwarded-Uri`, `X-Forwarded-Path`, `X-Original-URL`, `X-Original-URI`, `X-Original-Host`, `X-Rewrite-URL`, `X-Host` |
+| Client certificate | `X-Forwarded-Client-Cert` (read by backends behind Envoy or Istio as the client's mTLS identity) |
 
 Zentinel writes none of these. They are removed rather than rebuilt so that
 Zentinel does not invent headers a backend never asked for; a backend that

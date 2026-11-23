@@ -5,9 +5,9 @@ After=network-online.target
 Wants=network-online.target
 # No start rate limit. With one, a process that fails a few times in a row would
 # leave the unit in the failed state and systemd would stop restarting it until
-# someone started it by hand. Restarts are spaced by RestartSec= instead. To
-# bring a limit back, set StartLimitIntervalSec= and StartLimitBurst= in a
-# drop-in.
+# someone started it by hand. Restarts are spaced by RestartSec= instead, with a
+# growing delay (RestartSteps=, below). To bring a limit back, set
+# StartLimitIntervalSec= and StartLimitBurst= in a drop-in.
 StartLimitIntervalSec=0
 
 [Service]
@@ -15,7 +15,14 @@ Type=simple
 ExecStart=/usr/local/bin/zentinel --config /etc/zentinel/zentinel.kdl
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
+# The first automatic restart comes 5 s after a failure; each further one waits
+# longer, in 5 steps up to 120 s (about 5, 9, 18, 34, 64, then 120 s), so a
+# proxy that fails on every start is not restarted every 5 s forever.
+# RestartSteps= and RestartMaxDelaySec= need systemd 254 or later; older
+# versions log "Unknown key name" for them, ignore them, and restart every 5 s.
 RestartSec=5s
+RestartSteps=5
+RestartMaxDelaySec=120s
 TimeoutStartSec=10
 # Longer than graceful-shutdown-timeout-secs (default 30): the proxy waits that
 # long for open connections to finish, and systemd must not kill it first. Its

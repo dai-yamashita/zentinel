@@ -27,8 +27,10 @@
 //! * Every header in [`REMOVED_FROM_UNTRUSTED_PEERS`] is **removed**:
 //!   `Forwarded` (RFC 7239), `X-Real-IP`, the other client-address headers
 //!   (`True-Client-IP`, `CF-Connecting-IP`, ...), the other scheme and port
-//!   headers (`X-Forwarded-Port`, `X-Forwarded-Ssl`, ...) and the original-URL
-//!   and host headers (`X-Original-URL`, `X-Forwarded-Prefix`, ...). Zentinel
+//!   headers (`X-Forwarded-Port`, `X-Forwarded-Ssl`, ...), the original-URL
+//!   and host headers (`X-Original-URL`, `X-Forwarded-Prefix`, ...) and
+//!   `X-Forwarded-Client-Cert`, which backends behind Envoy or Istio read as
+//!   the client's mTLS identity. Zentinel
 //!   produces none of them, so a value from the client would be the only one
 //!   a backend sees. Removing them, rather than writing values of our own,
 //!   keeps Zentinel from inventing headers a backend never asked for: the
@@ -86,7 +88,8 @@ pub(crate) const X_FORWARDED_HOST: &str = "X-Forwarded-Host";
 const X_REAL_IP: &str = "X-Real-IP";
 /// Headers removed from a request whose peer is not in `trusted-proxies`; see
 /// the module docs. They say where a request came from, which scheme and port
-/// it used, or which URL and host it was first sent to. The three that
+/// it used, which URL and host it was first sent to, or which client
+/// certificate it presented. The three that
 /// Zentinel writes itself are not listed: they are rebuilt, not removed.
 ///
 /// Names are matched whole, ignoring case and treating `-` and `_` as the same
@@ -107,6 +110,9 @@ pub(crate) const REMOVED_FROM_UNTRUSTED_PEERS: &[&str] = &[
     "X-Envoy-External-Address",
     "X-Azure-ClientIP",
     "X-Appengine-User-IP",
+    "X-Forwarded",
+    "Forwarded-For",
+    "X-Original-Forwarded-For",
     // Scheme and port.
     "X-Forwarded-Port",
     "X-Forwarded-Ssl",
@@ -125,6 +131,9 @@ pub(crate) const REMOVED_FROM_UNTRUSTED_PEERS: &[&str] = &[
     "X-Original-URI",
     "X-Original-Host",
     "X-Rewrite-URL",
+    "X-Host",
+    // Client certificate (Envoy and Istio mTLS identity).
+    "X-Forwarded-Client-Cert",
 ];
 
 /// The three headers Zentinel writes for an untrusted peer. A copy of one
@@ -529,7 +538,8 @@ mod tests {
     }
 
     /// Headers that say where a request came from, which scheme and port it
-    /// used, or which URL and host it was first sent to. Listed by hand, and
+    /// used, which URL and host it was first sent to, or which client
+    /// certificate it presented. Listed by hand, and
     /// not from `REMOVED_FROM_UNTRUSTED_PEERS`, so a name dropped from that
     /// list fails here.
     const FORWARDING_HEADERS: &[&str] = &[
@@ -545,6 +555,9 @@ mod tests {
         "X-Envoy-External-Address",
         "X-Azure-ClientIP",
         "X-Appengine-User-IP",
+        "X-Forwarded",
+        "Forwarded-For",
+        "X-Original-Forwarded-For",
         "X-Forwarded-Port",
         "X-Forwarded-Ssl",
         "X-Forwarded-Scheme",
@@ -561,6 +574,8 @@ mod tests {
         "X-Original-URI",
         "X-Original-Host",
         "X-Rewrite-URL",
+        "X-Host",
+        "X-Forwarded-Client-Cert",
     ];
 
     /// A request from a peer outside `trusted-proxies` reaches the upstream
@@ -583,6 +598,40 @@ mod tests {
         assert_eq!(get(&r, "x-forwarded-for").as_deref(), Some("203.0.113.9"));
         assert_eq!(get(&r, "x-forwarded-proto").as_deref(), Some("http"));
         assert_eq!(get(&r, "x-forwarded-host").as_deref(), Some("a.example"));
+    }
+
+    /// A client cannot claim an mTLS identity or a forwarding chain through
+    /// the less common spellings, while a name that only starts like one of
+    /// them is left alone.
+    #[test]
+    fn untrusted_peer_loses_client_cert_and_alternative_forwarding_spellings() {
+        let mut r = req(&[
+            ("Host", "a.example"),
+            (
+                "X-Forwarded-Client-Cert",
+                "By=spiffe://cluster.local/ns/a/sa/b;Hash=abc;URI=spiffe://evil",
+            ),
+            ("x-forwarded", "for=6.6.6.6"),
+            ("Forwarded-For", "6.6.6.6"),
+            ("X-Original-Forwarded-For", "6.6.6.6"),
+            ("X_Host", "admin.internal"),
+            ("X-Forwarded-Client-Cert-Extra", "kept"),
+        ]);
+        apply_forwarded_headers(&mut r, ip("203.0.113.9"), false, &[]);
+        for name in [
+            "x-forwarded-client-cert",
+            "x-forwarded",
+            "forwarded-for",
+            "x-original-forwarded-for",
+            "x_host",
+        ] {
+            assert_eq!(get(&r, name), None, "{name} was passed on");
+        }
+        assert_eq!(
+            get(&r, "x-forwarded-client-cert-extra").as_deref(),
+            Some("kept")
+        );
+        assert_eq!(get(&r, "x-forwarded-for").as_deref(), Some("203.0.113.9"));
     }
 
     /// Names are case-insensitive (HTTP/2 sends them lowercase) and a header

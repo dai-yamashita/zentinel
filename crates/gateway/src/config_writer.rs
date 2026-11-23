@@ -94,6 +94,12 @@ impl ConfigWriter {
         if config.server.auto_reload {
             out.push_str("    auto-reload #true\n");
         }
+        // Written always, so the file says how IPv6 clients are counted for
+        // the per-client limits rather than leaving it to the default.
+        out.push_str(&format!(
+            "    client-ipv6-prefix-length {}\n",
+            config.server.client_ipv6_prefix_length.get()
+        ));
         out.push_str("}\n\n");
 
         // Listeners
@@ -499,6 +505,16 @@ impl<'a> Field<'a> {
 /// configuration, and the reason names the field. A control character is a
 /// Unicode control character (U+0000 to U+001F and U+007F to U+009F). A
 /// horizontal tab is accepted in a header value, where HTTP allows it.
+///
+/// A header name given twice in one `set` or `add` of a route's
+/// `request-headers` or `response-headers`, in spellings that differ only in
+/// case (`X-A` and `x-a`), is rejected too. Header names are
+/// case-insensitive, and the proxy refuses a configuration that writes one
+/// twice in such a block, which would refuse every resource with it rather
+/// than this one. The Gateway API CRDs key these lists by the exact name, so
+/// the API server accepts both spellings. The resource is rejected rather
+/// than one of the two kept, because which value it meant is not known.
+///
 /// `resource` names the Kubernetes resource the items came from, for the
 /// error.
 ///
@@ -513,7 +529,7 @@ impl<'a> Field<'a> {
 /// # Errors
 ///
 /// Returns [`GatewayError::InvalidResource`] for the first value that contains
-/// a control character.
+/// a control character, or for a header name given twice as described above.
 pub fn check_values(
     resource: &str,
     routes: &[RouteConfig],
@@ -547,7 +563,43 @@ pub fn check_values(
             });
         }
     }
+
+    for route in routes {
+        for (direction, mods) in [
+            ("request-headers", &route.policies.request_headers),
+            ("response-headers", &route.policies.response_headers),
+        ] {
+            for (block, names) in [("set", &mods.set), ("add", &mods.add)] {
+                if let Some((first, second)) = repeated_header_name(names.keys()) {
+                    return Err(GatewayError::InvalidResource {
+                        name: resource.to_string(),
+                        reason: format!(
+                            "route '{}' {direction} {block} names the header '{first}' twice, \
+                             as '{first}' and '{second}' (header names are case-insensitive)",
+                            route.id
+                        ),
+                    });
+                }
+            }
+        }
+    }
     Ok(())
+}
+
+/// Two of `names` that are the same header name, compared without regard to
+/// ASCII case, as the proxy compares them. The pair reported is the same
+/// whatever order `names` comes in.
+fn repeated_header_name<'a>(names: impl Iterator<Item = &'a String>) -> Option<(&'a str, &'a str)> {
+    let mut names: Vec<&str> = names.map(String::as_str).collect();
+    names.sort_unstable_by(|a, b| {
+        a.to_ascii_lowercase()
+            .cmp(&b.to_ascii_lowercase())
+            .then_with(|| a.cmp(b))
+    });
+    names
+        .windows(2)
+        .find(|pair| pair[0].eq_ignore_ascii_case(pair[1]))
+        .map(|pair| (pair[0], pair[1]))
 }
 
 /// Collect the text values `render_kdl` writes for a route.
@@ -916,6 +968,7 @@ mod tests {
                 error_pages: None,
                 websocket: false,
                 websocket_inspection: false,
+                websocket_max_frame_size: zentinel_config::DEFAULT_WEBSOCKET_MAX_FRAME_SIZE,
                 shadow: None,
                 fallback: None,
             }],
@@ -1144,6 +1197,7 @@ mod tests {
             websocket_inspection: false,
             shadow: None,
             fallback: None,
+            websocket_max_frame_size: zentinel_config::DEFAULT_WEBSOCKET_MAX_FRAME_SIZE,
         }
     }
 
@@ -1766,6 +1820,138 @@ mod tests {
             let result = check_values("HTTPRoute default/one", &routes, &upstreams, &filters);
 
             assert_eq!(result.is_ok(), name == "header value", "field {key}");
+        }
+    }
+
+    /// A route whose `request-headers` or `response-headers` block `block`
+    /// (`set` or `add`) names the headers `names`.
+    fn route_with_headers(response: bool, block: &str, names: &[&str]) -> RouteConfig {
+        let map: HashMap<String, String> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.to_string(), format!("v{i}")))
+            .collect();
+        let mut mods = HeaderModifications::default();
+        match block {
+            "set" => mods.set = map,
+            "add" => mods.add = map,
+            _ => unreachable!("{block}"),
+        }
+        let mut policies = RoutePolicies::default();
+        if response {
+            policies.response_headers = mods;
+        } else {
+            policies.request_headers = mods;
+        }
+        test_route(
+            "one",
+            vec![MatchCondition::PathPrefix("/".to_string())],
+            None,
+            vec![],
+            policies,
+        )
+    }
+
+    /// #703 makes the proxy refuse a header block that names one header
+    /// twice in different case, and the refusal is of the whole generated
+    /// file. Such a route is what the resource check has to keep out.
+    #[test]
+    fn the_proxy_refuses_a_header_named_twice_in_different_case() {
+        let config = test_config(
+            vec![test_listener("http", "0.0.0.0:8080", None)],
+            vec![route_with_headers(false, "add", &["X-A", "x-a"])],
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let kdl = ConfigWriter::new(PathBuf::from("/tmp/test.kdl")).render_kdl(&config);
+
+        let err = zentinel_config::Config::from_kdl(&kdl)
+            .expect_err("the proxy refuses the header named twice");
+        assert!(format!("{err:#}").contains("Duplicate"), "{err:#}");
+    }
+
+    #[test]
+    fn check_values_rejects_a_header_named_twice_in_different_case() {
+        for response in [false, true] {
+            for block in ["set", "add"] {
+                let route = route_with_headers(response, block, &["x-a", "X-B", "X-A"]);
+
+                let err = check_values(
+                    "HTTPRoute default/one",
+                    &[route],
+                    &HashMap::new(),
+                    &HashMap::new(),
+                )
+                .expect_err(block);
+
+                let direction = if response {
+                    "response-headers"
+                } else {
+                    "request-headers"
+                };
+                assert_eq!(
+                    err.to_string(),
+                    format!(
+                        "Invalid Gateway API resource 'HTTPRoute default/one': route 'one' \
+                         {direction} {block} names the header 'X-A' twice, as 'X-A' and 'x-a' \
+                         (header names are case-insensitive)"
+                    )
+                );
+            }
+        }
+    }
+
+    /// The same name in `set` and in `add`, or in the request and the
+    /// response, is not repeated: the proxy checks each block on its own.
+    #[test]
+    fn check_values_accepts_one_header_in_different_blocks() {
+        let mut route = route_with_headers(false, "set", &["X-A", "X-B"]);
+        route.policies.request_headers.add = HashMap::from([("x-a".into(), "1".into())]);
+        route.policies.response_headers.set = HashMap::from([("x-a".into(), "2".into())]);
+
+        check_values(
+            "HTTPRoute default/one",
+            std::slice::from_ref(&route),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .expect("each block names a header once");
+
+        let config = test_config(
+            vec![test_listener("http", "0.0.0.0:8080", None)],
+            vec![route],
+            HashMap::new(),
+            HashMap::new(),
+        );
+        render_and_parse(&config);
+    }
+
+    /// #760: the writer used to drop the prefix length, so a Gateway
+    /// deployment always counted IPv6 clients per /64.
+    #[test]
+    fn client_ipv6_prefix_length_is_written_and_read_back() {
+        for bits in [48u8, 64, 128] {
+            let mut config = test_config(
+                vec![test_listener("http", "0.0.0.0:8080", None)],
+                vec![],
+                HashMap::new(),
+                HashMap::new(),
+            );
+            config.server.client_ipv6_prefix_length =
+                zentinel_common::limits::Ipv6PrefixLen::new(bits).unwrap();
+
+            let kdl = ConfigWriter::new(PathBuf::from("/tmp/test.kdl")).render_kdl(&config);
+            assert!(
+                kdl.contains(&format!("    client-ipv6-prefix-length {bits}\n")),
+                "{kdl}"
+            );
+            assert_eq!(
+                render_and_parse(&config)
+                    .server
+                    .client_ipv6_prefix_length
+                    .get(),
+                bits
+            );
         }
     }
 }

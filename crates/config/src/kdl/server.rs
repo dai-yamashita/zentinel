@@ -163,10 +163,11 @@ pub(crate) fn parse_trusted_proxies(
 ///
 /// A value that is not an integer, or is out of range, is an error and not
 /// the default: a prefix length read as some other length would count
-/// clients differently than the file says.
+/// clients differently than the file says. Writing the key twice is an error
+/// too, like every other key a block takes once.
 fn parse_client_ipv6_prefix_length(node: &kdl::KdlNode) -> Result<Ipv6PrefixLen> {
     const KEY: &str = "client-ipv6-prefix-length";
-    let Some(child) = node.children().and_then(|children| children.get(KEY)) else {
+    let Some(child) = get_unique_child(node, KEY)? else {
         return Ok(Ipv6PrefixLen::DEFAULT);
     };
     let block = node.name().value();
@@ -1364,5 +1365,16 @@ mod tests {
                 "{bad}: {err}"
             );
         }
+    }
+
+    /// The key is read once; a second copy is refused instead of silently
+    /// losing to the first.
+    #[test]
+    fn client_ipv6_prefix_length_written_twice_is_an_error() {
+        let err =
+            parse_system("system { client-ipv6-prefix-length 64; client-ipv6-prefix-length 200 }")
+                .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("client-ipv6-prefix-length"), "{message}");
     }
 }

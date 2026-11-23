@@ -4,10 +4,12 @@ description: A production-grade reverse proxy platform with WAF, rate limiting, 
 type: application
 
 # Chart version - follows SemVer
-version: 0.1.3
+version: 0.2.0
 
-# Application version
-appVersion: "0.1.3"
+# Application version: the Zentinel release (CalVer) whose image the chart
+# runs by default, since images are tagged ghcr.io/zentinelproxy/zentinel:<CalVer>.
+# Set it to the release being cut.
+appVersion: "26.11_5"
 
 # Keywords for searching
 keywords:

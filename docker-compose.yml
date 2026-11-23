@@ -10,7 +10,7 @@ services:
     ports:
       - "8080:8080"   # HTTP
       - "8443:8443"   # HTTPS
-      - "9090:9090"   # Health/Metrics
+      - "9090:9090"   # Metrics (/metrics only; /health is on 8080)
     volumes:
       - ./config/docker/proxy.kdl:/etc/zentinel/zentinel.kdl:ro
       - proxy-data:/var/lib/zentinel
@@ -33,12 +33,12 @@ services:
         condition: service_completed_successfully
       echo:
         condition: service_started
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9090/health"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
-      start_period: 30s
+    # No healthcheck. /health is the `health` route on the HTTP listener
+    # (:8080, config/docker/proxy.kdl); :9090 is the metrics server, which
+    # serves /metrics only and answers 404 to /health. The image is
+    # distroless, so there is no curl or shell in it to run an HTTP check
+    # with: a `curl` healthcheck can never pass. tests/integration_test.sh
+    # waits for http://localhost:8080/health from the host instead.
     restart: unless-stopped
 
   # Prepares the shared agent-socket volume.

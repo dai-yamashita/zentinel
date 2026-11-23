@@ -11,7 +11,10 @@ NotifyAccess=main
 ExecStart=/usr/local/bin/zentinel-waf-agent
 ExecReload=/bin/kill -USR1 $MAINPID
 Restart=on-failure
+# Growing delay, 5 s up to 120 s (systemd 254+). See zentinel.service.
 RestartSec=5s
+RestartSteps=5
+RestartMaxDelaySec=120s
 TimeoutStartSec=30s
 TimeoutStopSec=30s
 KillMode=mixed

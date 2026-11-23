@@ -117,6 +117,15 @@ accepted in a header value. The `Accepted` condition of an HTTPRoute, GRPCRoute
 or TLSRoute is not changed for such a resource, and an Ingress has no status, so
 the log is the only place the reason appears.
 
+Header names are case-insensitive. An HTTPRoute whose `RequestHeaderModifier`
+or `ResponseHeaderModifier` lists one header twice in `set`, or twice in `add`,
+in spellings that differ only in case (`X-Api-Key` and `x-api-key`), is left
+out in the same way. The Gateway API CRDs key these lists by the exact name, so
+the API server accepts both entries; the proxy refuses a configuration that
+names one header twice in such a list, and that refusal would hold back every
+resource, not only this one. The controller does not pick one of the two
+values, since it cannot know which was meant.
+
 ## Reporting Conformance
 
 Once all core tests pass, conformance can be reported upstream:

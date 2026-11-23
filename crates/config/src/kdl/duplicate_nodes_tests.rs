@@ -215,6 +215,16 @@ fn a_route_with_two_websocket_nodes_is_an_error() {
 }
 
 #[test]
+fn a_route_with_two_websocket_max_frame_size_nodes_is_an_error() {
+    assert_duplicate(
+        Ctx::Route,
+        "websocket-max-frame-size 65536",
+        "websocket-max-frame-size 131072",
+        "websocket-max-frame-size",
+    );
+}
+
+#[test]
 fn a_route_with_two_waf_enabled_nodes_is_an_error() {
     assert_duplicate(
         Ctx::Route,

@@ -23,7 +23,7 @@ Zentinel has been deployed successfully!
 {{- end }}
 
   Metrics endpoint: http://<proxy-ip>:{{ .Values.proxy.service.metricsPort }}/metrics
-  Health endpoint:  http://<proxy-ip>:{{ .Values.proxy.service.metricsPort }}/health
+  Health endpoint:  http://<pod-ip>:{{ .Values.proxy.service.healthPort }}/health (pod only, not on the Service)
 {{- end }}
 
 {{- if .Values.proxy.ingress.enabled }}

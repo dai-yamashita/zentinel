@@ -147,7 +147,9 @@ routes {
 
         // max-attempts counts request retries, not peer selections. Nothing is
         // retried on a status code unless retryable-status-codes says so, and
-        // POST is never replayed without retry-non-idempotent.
+        // POST is not replayed without retry-non-idempotent, except when an
+        // HTTP/2 upstream says it did not process the request (REFUSED_STREAM,
+        // GOAWAY).
         retry-policy {
             max-attempts 3
         }

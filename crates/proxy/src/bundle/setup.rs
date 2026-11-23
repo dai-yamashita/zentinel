@@ -146,13 +146,20 @@ pub fn generate_systemd_unit(agent: &AgentInfo, paths: &InstallPaths) -> String 
          Documentation=https://zentinelproxy.io/docs/agents/{name}\n\
          # Start before the proxy, which connects to its agents at startup.\n\
          Before=zentinel.service\n\
+         # No start rate limit, as in deploy/zentinel.service: restarts are\n\
+         # spaced by RestartSec= and grow to RestartMaxDelaySec= instead.\n\
+         StartLimitIntervalSec=0\n\
          {condition}\
          \n\
          [Service]\n\
          Type=simple\n\
          ExecStart={exec}\n\
          Restart=on-failure\n\
+         # 5 s, growing in 5 steps to 120 s (systemd 254+; older ones ignore\n\
+         # the last two keys and restart every 5 s).\n\
          RestartSec=5s\n\
+         RestartSteps=5\n\
+         RestartMaxDelaySec=120s\n\
          Environment=RUST_LOG=info\n\
          NoNewPrivileges=true\n"
     );
@@ -410,6 +417,34 @@ mod tests {
         // The old unit bound the agent to the proxy and started it after.
         assert!(!unit.contains("BindsTo="));
         assert!(!unit.contains("After=zentinel"));
+    }
+
+    /// Both kinds of unit restart a failing agent with a growing delay and
+    /// never give up, as the units in `deploy/` do.
+    #[test]
+    fn units_restart_with_backoff_and_no_start_limit() {
+        for system_wide in [true, false] {
+            let unit =
+                generate_systemd_unit(&agent("waf", Transport::Uds, None), &paths(system_wide));
+            let (unit_section, service_section) = unit
+                .split_once("[Service]\n")
+                .expect("the unit has a [Service] section");
+            assert!(
+                unit_section.contains("\nStartLimitIntervalSec=0\n"),
+                "{unit}"
+            );
+            for line in [
+                "Restart=on-failure\n",
+                "RestartSec=5s\n",
+                "RestartSteps=5\n",
+                "RestartMaxDelaySec=120s\n",
+            ] {
+                assert!(
+                    service_section.contains(line),
+                    "missing {line:?} in [Service] of\n{unit}"
+                );
+            }
+        }
     }
 
     /// A user manager cannot switch users, and ProtectHome= hides ~/.local/bin:

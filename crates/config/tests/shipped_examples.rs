@@ -283,17 +283,254 @@ fn container_configurations_name_a_metrics_address_other_than_loopback() {
     );
 }
 
-/// The chart is scraped through the pod IP, so its configuration names the
-/// metrics address.
+/// The chart's values file.
+fn helm_values() -> String {
+    std::fs::read_to_string(repo_root().join("deploy/helm/zentinel/values.yaml"))
+        .expect("the chart's values are readable")
+}
+
+/// The block scalar `key: |` of `values`, dedented.
 ///
-/// The chart's `kdl` value is not parsed here, so this is a text search: it
-/// also passes when the line is inside a comment.
+/// The config crate has no YAML parser, and the chart's values only need a
+/// literal block read back, so this reads it as text: the lines after the
+/// first `key: |` that are blank or indented deeper than the key.
+fn yaml_block(values: &str, key: &str) -> String {
+    let header = format!("{key}: |");
+    let mut lines = values.lines();
+    let indent = lines
+        .by_ref()
+        .find_map(|line| (line.trim() == header).then(|| line.len() - line.trim_start().len()))
+        .unwrap_or_else(|| panic!("no `{header}` block in the chart's values"));
+    let body: Vec<&str> = lines
+        .take_while(|line| line.trim().is_empty() || line.len() - line.trim_start().len() > indent)
+        .collect();
+    let strip = body
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.len() - line.trim_start().len())
+        .min()
+        .unwrap_or(0);
+    body.iter()
+        .map(|line| line.get(strip..).unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The integer value of the first `key: <n>` line of `values`.
+fn yaml_port(values: &str, key: &str) -> u16 {
+    let prefix = format!("{key}:");
+    values
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(prefix.as_str()))
+        .unwrap_or_else(|| panic!("no `{key}` in the chart's values"))
+        .trim()
+        .parse()
+        .unwrap_or_else(|e| panic!("`{key}` in the chart's values is not a port: {e}"))
+}
+
+/// The chart's `proxy.config.kdl`, parsed as the proxy parses it.
+fn helm_chart_config() -> Config {
+    Config::from_kdl(&yaml_block(&helm_values(), "kdl"))
+        .unwrap_or_else(|e| panic!("the chart's proxy.config.kdl does not parse: {e:#}"))
+}
+
+/// The chart ships a configuration in `proxy.config.kdl`, and nothing parsed
+/// it: it was written in a syntax the parser has not accepted for a long
+/// time (top-level `listener`, `upstream` and `route`, `matches { all true
+/// }`), so every install with the default values failed to start.
 #[test]
-fn helm_chart_names_the_metrics_address() {
-    let values = std::fs::read_to_string(repo_root().join("deploy/helm/zentinel/values.yaml"))
-        .expect("the chart's values are readable");
-    assert!(
-        values.contains("address \"0.0.0.0:9090\""),
-        "deploy/helm/zentinel/values.yaml does not name the metrics address"
+fn helm_chart_configuration_loads_and_validates() {
+    let kdl = yaml_block(&helm_values(), "kdl");
+    let config = helm_chart_config();
+    config
+        .validate()
+        .unwrap_or_else(|e| panic!("the chart's proxy.config.kdl does not validate: {e}"));
+
+    // `zentinel test --strict`: nothing in it is silently ignored.
+    let mut result = zentinel_config::validate::ValidationResult::new();
+    zentinel_config::validate::unknown_keys::check_unknown_keys_in_files(
+        &[(PathBuf::from("values.yaml#proxy.config.kdl"), kdl)],
+        &mut result,
     );
+    assert!(result.warnings.is_empty(), "{:#?}", result.warnings);
+
+    assert!(
+        !config.routes.is_empty(),
+        "the chart's config has no routes"
+    );
+    assert!(
+        !config.upstreams.is_empty(),
+        "the chart's config has no upstreams"
+    );
+}
+
+/// The chart is scraped through the pod IP, so its metrics server is not on
+/// loopback, and it is on the port the pod and the Service expose as
+/// `metrics`.
+#[test]
+fn helm_chart_metrics_server_is_on_the_metrics_port() {
+    let config = helm_chart_config();
+    let metrics = &config.observability.metrics;
+    assert!(metrics.enabled, "the chart's metrics server is disabled");
+    let address: std::net::SocketAddr = metrics
+        .address
+        .parse()
+        .expect("the chart's metrics address is a socket address");
+    assert!(
+        !address.ip().is_loopback(),
+        "the chart's metrics server is on loopback: {address}"
+    );
+    assert_eq!(
+        address.port(),
+        yaml_port(&helm_values(), "metricsPort"),
+        "the chart's metrics address and proxy.service.metricsPort disagree"
+    );
+}
+
+/// The pod's liveness and readiness probes ask for /health and /ready on the
+/// container port `health`, proxy.service.healthPort. The metrics server
+/// answers 404 to both, so they must be served by a listener of the chart's
+/// configuration on that port, reachable from the kubelet (not loopback),
+/// with the health builtin.
+#[test]
+fn helm_chart_probes_reach_the_health_handler() {
+    let values = helm_values();
+    let health_port = yaml_port(&values, "healthPort");
+    assert_ne!(
+        health_port,
+        yaml_port(&values, "metricsPort"),
+        "the health listener and the metrics server cannot share a port"
+    );
+
+    // Both probes name the `health` port, and the deployment defines it.
+    for probe in ["livenessProbe", "readinessProbe"] {
+        let block = yaml_block_lines(&values, probe);
+        assert!(
+            block.iter().any(|line| line.trim() == "port: health"),
+            "{probe} does not use the `health` port: {block:#?}"
+        );
+    }
+    let deployment = std::fs::read_to_string(
+        repo_root().join("deploy/helm/zentinel/templates/proxy-deployment.yaml"),
+    )
+    .expect("the chart's deployment template is readable");
+    assert!(
+        deployment.contains(
+            "- name: health\n          containerPort: {{ .Values.proxy.service.healthPort }}"
+        ),
+        "the deployment does not define container port `health` from proxy.service.healthPort"
+    );
+
+    let config = helm_chart_config().lower_scopes();
+    let listener = config
+        .listeners
+        .iter()
+        .find(|listener| {
+            listener
+                .address
+                .parse::<std::net::SocketAddr>()
+                .is_ok_and(|addr| addr.port() == health_port)
+        })
+        .unwrap_or_else(|| panic!("no listener of the chart's config is on port {health_port}"));
+    let address: std::net::SocketAddr = listener.address.parse().unwrap();
+    assert!(
+        !address.ip().is_loopback(),
+        "the kubelet probes the pod IP, but the health listener is on {address}"
+    );
+
+    let routes = config.routes_served_on(&listener.scope());
+    let health = routes
+        .iter()
+        .find(|route| route.builtin_handler == Some(zentinel_config::BuiltinHandler::Health))
+        .unwrap_or_else(|| {
+            panic!(
+                "listener '{}' does not serve the health handler",
+                listener.id
+            )
+        });
+    // The same condition as the starter's admin listener, whose matching is
+    // checked against the proxy's route matcher in zentinel-proxy's
+    // `default_configuration_routes` tests.
+    assert!(
+        health.matches.iter().any(|m| matches!(
+            m,
+            zentinel_config::MatchCondition::PathRegex(re) if re == "^/(health|healthz|ready)$"
+        )),
+        "the health route does not match /health and /ready: {:?}",
+        health.matches
+    );
+    // Not an admin surface: the probe listener is reachable from the cluster.
+    for route in &routes {
+        assert!(
+            route.builtin_handler == Some(zentinel_config::BuiltinHandler::Health),
+            "route '{}' is served on the probe listener",
+            route.id
+        );
+    }
+}
+
+/// The lines of the YAML mapping under the first `key:` line.
+fn yaml_block_lines<'a>(values: &'a str, key: &str) -> Vec<&'a str> {
+    let header = format!("{key}:");
+    let mut lines = values.lines();
+    let indent = lines
+        .by_ref()
+        .find_map(|line| (line.trim() == header).then(|| line.len() - line.trim_start().len()))
+        .unwrap_or_else(|| panic!("no `{header}` in the chart's values"));
+    lines
+        .take_while(|line| line.trim().is_empty() || line.len() - line.trim_start().len() > indent)
+        .collect()
+}
+
+/// The configurations the container images and compose stacks run and the
+/// starter, loaded and validated like the examples. (The chart's is checked
+/// above.)
+///
+/// Validation also checks that the directory of each agent's Unix socket
+/// exists, which holds inside the container the configuration is written for
+/// (`/var/run/zentinel` in config/docker/proxy.kdl) but not on the machine
+/// running the tests, so that one error is not counted here.
+#[test]
+fn deployment_configurations_load_and_validate() {
+    let root = repo_root();
+    let mut failures = Vec::new();
+    for path in shipped_configurations() {
+        let name = path
+            .strip_prefix(&root)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        match Config::from_file(&path) {
+            Ok(config) => {
+                if let Err(e) = config.validate() {
+                    let message = e.to_string();
+                    if !message.contains("unix socket path parent directory doesn't exist") {
+                        failures.push(format!("{name}: validation failed: {message}"));
+                    }
+                }
+            }
+            Err(e) => failures.push(format!("{name}: failed to load: {e:#}")),
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "deployment configurations must load and validate, but {} failed:\n  {}",
+        failures.len(),
+        failures.join("\n  ")
+    );
+}
+
+/// The compose stacks mount config/docker/proxy.kdl, whose /health is on the
+/// HTTP listener; :9090 is the metrics server and answers 404 to /health.
+/// The proxy image is distroless, so a `curl` healthcheck cannot run at all.
+#[test]
+fn compose_files_do_not_probe_health_on_the_metrics_port() {
+    for file in ["docker-compose.yml", "docker-compose.test.yml"] {
+        let text = std::fs::read_to_string(repo_root().join(file))
+            .unwrap_or_else(|e| panic!("{file} should be readable: {e}"));
+        assert!(
+            !text.contains(":9090/health") && !text.contains(":9090/ready"),
+            "{file} asks the metrics port for a health path"
+        );
+    }
 }
