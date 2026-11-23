@@ -3,20 +3,10 @@
 
 [advisories]
 ignore = [
-    # daemonize 0.5.0 — unmaintained (RUSTSEC-2025-0069)
-    # Transitive: pingora-core 0.7 (via our fork)
-    # Blocked on: Pingora upstream — deeply integrated into daemon module
-    "RUSTSEC-2025-0069",
-
     # derivative 2.2.0 — unmaintained (RUSTSEC-2024-0388)
     # Transitive: pingora-core 0.7, pingora-load-balancing 0.7 (via our fork)
     # Blocked on: Pingora upstream — educe can't handle Ord(ignore) pattern
     "RUSTSEC-2024-0388",
-
-    # fxhash 0.2.1 — unmaintained (RUSTSEC-2025-0057)
-    # Transitive: async-memcached 0.6 (only with distributed-rate-limit-memcached feature)
-    # Blocked on: async-memcached upstream
-    "RUSTSEC-2025-0057",
 
     # rustls-pemfile — unmaintained (RUSTSEC-2025-0134)
     # Direct dep (v2.2) + transitive via pingora-rustls 0.7.
