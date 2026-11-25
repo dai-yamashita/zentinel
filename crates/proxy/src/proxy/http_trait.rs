@@ -298,7 +298,7 @@ impl ZentinelProxy {
 
     /// Refuse a request with more headers than `max-header-count`, or with
     /// more header bytes than `max-header-size` (the namespace's or service's
-    /// limit, where smaller), by returning the error to answer it with.
+    /// limit, where smaller), by returning the error to answer it with (431).
     ///
     /// A proxied route runs this after the proxy has added its own
     /// `X-Correlation-Id` and `X-Forwarded-By` to the request, so they are
@@ -336,7 +336,7 @@ impl ZentinelProxy {
             );
 
             self.metrics.record_blocked_request("header_count_exceeded");
-            return Err(Error::explain(ErrorType::InternalError, "Too many headers"));
+            return Err(header_fields_too_large("Too many headers"));
         }
 
         // Header size check - O(n), skip if limit is very high
@@ -356,10 +356,7 @@ impl ZentinelProxy {
                 );
 
                 self.metrics.record_blocked_request("header_size_exceeded");
-                return Err(Error::explain(
-                    ErrorType::InternalError,
-                    "Headers too large",
-                ));
+                return Err(header_fields_too_large("Headers too large"));
             }
         }
 
@@ -5107,6 +5104,15 @@ fn body_too_large() -> Box<Error> {
         "Request body exceeds the configured limit",
     )
     .into_down()
+}
+
+/// The error for a request over `max-header-count` or `max-header-size`: 431
+/// (Request Header Fields Too Large, RFC 6585), attributed to the client.
+///
+/// It used to be an `InternalError`, so the client got a 500 for its own
+/// request's headers.
+fn header_fields_too_large(reason: &'static str) -> Box<Error> {
+    Error::explain(ErrorType::HTTPStatus(431), reason).into_down()
 }
 
 /// Whether a request declares a `Content-Encoding` other than `identity`.

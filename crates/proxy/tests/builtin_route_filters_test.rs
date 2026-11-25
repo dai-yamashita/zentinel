@@ -12,9 +12,10 @@
 
 #![cfg(unix)]
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -717,15 +718,48 @@ fn builtin_route_with_filters_is_subject_to_the_global_rate_limit() {
     builtin_routes_under_rate_limits("global {\n        max-rps 1\n        burst 1\n    }");
 }
 
-/// `max-header-count` and `max-header-size` refuse a request on a static
-/// route and on a builtin route with `filters`, as they do on a proxied one.
+/// What [`spawn_counting_backend`] answers with.
+const BACKEND_BODY: &str = "FROM-THE-BACKEND";
+
+/// A backend that answers every request with [`BACKEND_BODY`] and counts the
+/// requests it is sent.
+fn spawn_counting_backend(listener: TcpListener, hits: Arc<AtomicUsize>) {
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let hits = Arc::clone(&hits);
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                while reader.read_line(&mut line).is_ok() && line != "\r\n" && !line.is_empty() {
+                    line.clear();
+                }
+                hits.fetch_add(1, Ordering::SeqCst);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{BACKEND_BODY}",
+                    BACKEND_BODY.len()
+                );
+            });
+        }
+    });
+}
+
+/// `max-header-count` and `max-header-size` refuse a request with 431
+/// (Request Header Fields Too Large), the status for a request whose headers
+/// are over a limit: on a proxied route, which does not send it upstream, on a
+/// static route, and on a builtin route with `filters`.
 #[test]
-fn static_and_builtin_routes_refuse_headers_over_the_limits() {
+fn routes_refuse_headers_over_the_limits_with_431() {
     const FILE: &str = "STATIC-FILE-CONTENT";
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("www");
     std::fs::create_dir_all(root.join("static")).unwrap();
     std::fs::write(root.join("static/page.html"), FILE).unwrap();
+    let backend = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let backend_port = backend.local_addr().unwrap().port();
+    let hits = Arc::new(AtomicUsize::new(0));
+    spawn_counting_backend(backend, Arc::clone(&hits));
     let port = free_port();
     let config = format!(
         r#"
@@ -740,6 +774,11 @@ listeners {{
         protocol "http"
     }}
 }}
+upstreams {{
+    upstream "backend" {{
+        target "127.0.0.1:{backend_port}"
+    }}
+}}
 filters {{
     filter "mark" {{
         type "headers"
@@ -750,6 +789,10 @@ filters {{
     }}
 }}
 routes {{
+    route "app" {{
+        matches {{ path-prefix "/app/" }}
+        upstream "backend"
+    }}
     route "static-site" {{
         matches {{ path-prefix "/static/" }}
         service-type "static"
@@ -772,7 +815,11 @@ observability {{
     );
     let _proxy = spawn_proxy(dir, &config, port);
 
-    // Within the limits, both are answered.
+    // Within the limits, each is answered.
+    let resp = get(port, "/app/page");
+    assert_eq!(resp.status, 200, "{resp:?}");
+    assert_eq!(resp.body, BACKEND_BODY, "{resp:?}");
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "requests the backend got");
     let resp = get(port, "/static/page.html");
     assert_eq!(resp.status, 200, "{resp:?}");
     assert_eq!(resp.body, FILE, "{resp:?}");
@@ -783,15 +830,33 @@ observability {{
     let many: String = (0..10).map(|i| format!("X-Pad-{i}: a\r\n")).collect();
     let large = format!("X-Pad: {}\r\n", "a".repeat(1000));
     for (what, extra) in [("count", &many), ("size", &large)] {
-        let resp = get_with(port, "/static/page.html", extra);
-        assert_eq!(resp.status, 500, "static, header {what}: {resp:?}");
-        assert!(!resp.body.contains(FILE), "static, header {what}: {resp:?}");
-
-        let resp = get_with(port, "/marked/page", extra);
-        assert_eq!(resp.status, 500, "builtin, header {what}: {resp:?}");
-        assert!(
-            !resp.body.contains("\"status\": \"ok\""),
-            "builtin, header {what}: {resp:?}"
-        );
+        for (route, path) in [
+            ("proxied", "/app/page"),
+            ("static", "/static/page.html"),
+            ("builtin", "/marked/page"),
+        ] {
+            let resp = get_with(port, path, extra);
+            assert_eq!(resp.status, 431, "{route}, header {what}: {resp:?}");
+            assert_eq!(
+                resp.json()["error"],
+                "431 Request Header Fields Too Large",
+                "{route}, header {what}: {resp:?}"
+            );
+            assert_eq!(
+                resp.header("connection"),
+                Some("close"),
+                "{route}, header {what}: {resp:?}"
+            );
+        }
     }
+
+    // The backend got none of the refused requests, and gets the next one
+    // within the limits.
+    let resp = get(port, "/app/page");
+    assert_eq!(resp.status, 200, "{resp:?}");
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "requests the backend got: a refused request reached it"
+    );
 }

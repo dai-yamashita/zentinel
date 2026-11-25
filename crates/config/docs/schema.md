@@ -1033,7 +1033,8 @@ which a single-file config ignores.
 
 `max-header-size` and `max-header-count` apply to every request that reaches
 the route's filters: proxied routes, `static` routes, and `builtin` routes
-that have `filters`.
+that have `filters`. A request over either is refused with 431 (Request Header
+Fields Too Large).
 
 ---
 
