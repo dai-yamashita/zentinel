@@ -18,6 +18,7 @@ for details.
 
 | CalVer | Crate Version | Date | Highlights |
 |--------|---------------|------|------------|
+| [26.11_8](#26118---2026-11-25) | 0.6.62 | 2026-11-25 | **Requests over the header limits get 431, not 500** (read the upgrade notes); **`bundle install --skip-verify` refuses an archive whose readable checksum does not match**; the ZentinelSec agent is pinned at 0.6.0; geo databases are read off the async workers; the Gateway API controller asks GRPCRoute backends for the whole server's health |
 | [26.11_7](#26117---2026-11-23) | 0.6.61 | 2026-11-23 | **A busy agent can hold a request for at most its `timeout-ms`**; **a geo database cut short or failing its trial lookups stops startup** (read the upgrade notes); replaced geo databases are re-read every time |
 | [26.11_6](#26116---2026-11-23) | 0.6.60 | 2026-11-23 | Geo filter lookup cache and inference rate limit buckets are bounded; stale `cargo audit` ignores removed |
 | [26.11_5](#26115---2026-11-23) | 0.6.59 | 2026-11-23 | **Wrong-typed values, `tls` on an `http` listener, unknown TLS versions, out-of-range integers and unresolvable upstream/agent references are configuration errors** (**read the upgrade notes**); **a TLS listener or geo database that cannot be loaded stops startup**; **non-idempotent requests are not retried after an upstream error, and `max-attempts` bounds every retry**; **compressed request bodies are decoded for agents by default**; **filters on builtin routes apply**; **the inference prompt check runs**; geo filters read every country and follow reloads; ACME issues for `h2` listeners; **an undecodable WebSocket frame on an inspected route closes the connection**; the response cache key includes route and host (the cache starts cold); the access log records the query string and HTTP version; a certificate whose key does not match is refused; the Helm charts pull a published image, their config parses and the probes reach a health listener; systemd restarts back off to 120 s |
@@ -100,6 +101,48 @@ for details.
 ---
 
 ## [Unreleased]
+
+---
+
+## [26.11_8] - 2026-11-25
+
+**Crate version:** 0.6.62
+
+### Upgrade notes
+- **Header limits answer 431 (#832).** A request over `max-header-count` or
+  `max-header-size` was refused with 500; it now gets 431 Request Header
+  Fields Too Large, with the usual JSON error body and `Connection: close`.
+  This applies to proxied routes, static routes and builtin routes with
+  `filters`. The refusal is counted as `proxy_error_431` instead of
+  `proxy_error_500`, and a route's error page for 500 no longer answers these
+  requests; one for 431 does.
+- **`zentinel bundle install --skip-verify` (#829).** The `.sha256` file is
+  always requested now. An archive whose checksum can be read and does not
+  match is no longer installed (it used to be installed and shown as
+  `unverified`); a mirror with out-of-date `.sha256` files has to be
+  corrected. Only when the checksum cannot be fetched or read does
+  `--skip-verify` install anyway, with a warning naming the URL and the
+  reason. Runs without `--skip-verify` are unaffected.
+- **ZentinelSec agent 0.6.0 (#831).** `zentinel bundle install zentinelsec`
+  installs 0.6.0, built on zentinel-modsec 0.13.1: a rule's `status` now sets
+  the response status of a deny. With stock CRS, attacks still answer 403; the
+  configuration checks 901001 and 901500 now answer 500 instead of 403.
+- **Library API (`zentinel-proxy` crate).** `bundle::download_agent` takes a
+  `ChecksumPolicy` instead of a bool and returns `ChecksumOutcome` in
+  `DownloadResult::checksum`; `FetchError::ChecksumMismatch` gains `url` (#829).
+
+### Fixed
+- A changed geo database is read on a blocking thread, so a large MaxMind file
+  no longer holds up the other tasks on the startup runtime (the configuration
+  reload handler, certificate and ACME tasks), and a configuration reload no
+  longer waits for a database read to finish (#830).
+- The Gateway API controller writes `service ""` for a GRPCRoute backend's gRPC
+  health check, which asks for the whole server's health; the proxy used to
+  read the missing line as `grpc.health.v1.Health`, and a backend that reports
+  only overall health was marked unhealthy (#837).
+
+### Dependencies
+- Bundle: `zentinelsec` 0.5.4 → 0.6.0 (#831).
 
 ---
 
