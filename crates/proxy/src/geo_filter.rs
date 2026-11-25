@@ -1038,7 +1038,14 @@ impl GeoFilterManager {
 
     /// Reload a filter's database from disk
     pub fn reload_filter(&self, filter_id: &str) -> Result<(), GeoLookupError> {
-        if let Some(pool) = self.filter_pools.get(filter_id) {
+        // The pool is cloned out of the map: a reference into it holds the
+        // lock of its shard, which would make writes to the map wait for the
+        // read of the database.
+        let pool = self
+            .filter_pools
+            .get(filter_id)
+            .map(|pool| Arc::clone(pool.value()));
+        if let Some(pool) = pool {
             pool.reload_database()
         } else {
             Err(GeoLookupError::LoadError(format!(
@@ -1385,19 +1392,36 @@ impl GeoDatabaseWatcher {
     }
 
     /// Handle a file change event
+    ///
+    /// Reads the databases on the calling thread, which waits for the file
+    /// reads. [`Self::run`] reads them on a thread for blocking work instead.
     pub fn handle_change(&self, path: &Path) {
         // The lock is not held while the databases are read, which takes a
         // while and which `sync_watches` waits for the lock to follow.
         let filter_ids = self.path_to_filters.read().get(path).cloned();
         if let Some(filter_ids) = filter_ids {
-            info!(
-                path = %path.display(),
-                filters = ?filter_ids,
-                "Geo database file changed, reloading"
-            );
+            reload_filters_of_file(&self.manager, path, &filter_ids);
+        }
+    }
 
-            for filter_id in &filter_ids {
-                log_reload(filter_id, self.manager.reload_filter(filter_id));
+    /// Run `work`, which reads databases, on a thread for blocking work, and
+    /// wait for it, so that the worker thread this task runs on is free to run
+    /// other tasks meanwhile. Returns none, after logging it, when `work` does
+    /// not finish: when it panics, in a build where panics unwind, or when the
+    /// runtime is shutting down.
+    async fn blocking<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&GeoFilterManager) -> T + Send + 'static,
+    ) -> Option<T> {
+        let manager = Arc::clone(&self.manager);
+        match tokio::task::spawn_blocking(move || work(&manager)).await {
+            Ok(done) => Some(done),
+            Err(e) => {
+                error!(
+                    error = %e,
+                    "Reading the geo databases did not finish; the watcher goes on"
+                );
+                None
             }
         }
     }
@@ -1414,8 +1438,14 @@ impl GeoDatabaseWatcher {
     /// Every `poll_interval` the files are looked at as well, whether or not
     /// an event came (see [`GeoFilterManager::reload_changed_files`]): a
     /// watch can miss a change, as when the directory itself is replaced or
-    /// the system has no more watches to give. The files are read on this
-    /// task, so a slow read holds up the next.
+    /// the system has no more watches to give.
+    ///
+    /// The databases are read on a thread for blocking work, and this waits
+    /// for it: one batch at a time, either the files of the paths held or the
+    /// files the periodic check finds changed. A slow read holds up the next
+    /// one, and a path that arrives meanwhile waits in `events`, but the other
+    /// tasks of the runtime go on. A read that does not finish (one that
+    /// panics, in a build where panics unwind) is logged, and this goes on.
     ///
     /// # Panics
     ///
@@ -1463,13 +1493,32 @@ impl GeoDatabaseWatcher {
                             _ => break,
                         }
                     }
-                    for path in &changed {
-                        self.handle_change(path);
+                    // Which filters read each file is looked up here, quickly;
+                    // the reading is what waits.
+                    let reloads: Vec<(PathBuf, Vec<String>)> = changed
+                        .into_iter()
+                        .filter_map(|path| {
+                            let filter_ids = self.path_to_filters.read().get(&path).cloned()?;
+                            Some((path, filter_ids))
+                        })
+                        .collect();
+                    if !reloads.is_empty() {
+                        self.blocking(move |manager| {
+                            for (path, filter_ids) in &reloads {
+                                reload_filters_of_file(manager, path, filter_ids);
+                            }
+                        })
+                        .await;
                     }
                 }
                 _ = poll.tick() => {
-                    for (filter_id, result) in self.manager.reload_changed_files() {
-                        log_reload(&filter_id, result);
+                    let reloaded = self
+                        .blocking(|manager| manager.reload_changed_files())
+                        .await;
+                    if let Some(reloaded) = reloaded {
+                        for (filter_id, result) in reloaded {
+                            log_reload(&filter_id, result);
+                        }
                     }
                 }
             }
@@ -1488,6 +1537,20 @@ impl GeoDatabaseWatcher {
 /// How many times `settle` [`GeoDatabaseWatcher::run`] waits at most for the
 /// changes to a database to settle.
 const SETTLE_LIMIT_FACTOR: u32 = 20;
+
+/// Read again the databases of the filters `filter_ids`, which use the file at
+/// `path`, which changed. Waits for the file reads.
+fn reload_filters_of_file(manager: &GeoFilterManager, path: &Path, filter_ids: &[String]) {
+    info!(
+        path = %path.display(),
+        filters = ?filter_ids,
+        "Geo database file changed, reloading"
+    );
+
+    for filter_id in filter_ids {
+        log_reload(filter_id, manager.reload_filter(filter_id));
+    }
+}
 
 /// Log how the reload of a filter's database went.
 fn log_reload(filter_id: &str, result: Result<(), GeoLookupError>) {
@@ -3113,5 +3176,257 @@ mod tests {
             .await
             .expect("the watcher stops when its events end")
             .expect("the watcher does not panic");
+    }
+
+    // =========================================================================
+    // The databases are read off the runtime
+    // =========================================================================
+
+    /// Replace the file at `path` with a FIFO. A FIFO can be opened for
+    /// reading only once something opens it for writing: until then, opening
+    /// the database waits.
+    #[cfg(unix)]
+    fn replace_with_fifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+
+        let next = path.with_file_name("next.fifo");
+        let name = std::ffi::CString::new(next.as_os_str().as_bytes()).expect("a path without nul");
+        // SAFETY: `name` is a nul-terminated path that outlives the call.
+        let made = unsafe { libc::mkfifo(name.as_ptr(), 0o600) };
+        assert_eq!(made, 0, "mkfifo: {}", std::io::Error::last_os_error());
+        std::fs::rename(&next, path).expect("rename over the old file");
+    }
+
+    /// The database of the filter `region`, at `path`, made slow to open, and
+    /// a check of whether the runtime's other tasks run meanwhile.
+    ///
+    /// [`Self::start`] puts a FIFO where the database is. Whatever opens the
+    /// database then waits, until a thread outside the runtime lets it go:
+    /// that thread gives a task of the runtime, started with the FIFO, a few
+    /// seconds to say that it ran once the pool had begun to open the FIFO.
+    /// What the thread then sends through the FIFO is a database that says
+    /// `DE`, so that it shows when the database has been read.
+    ///
+    /// The thread goes on letting go whatever opens the FIFO until
+    /// [`Released::stop`]: a read that comes after the first (the periodic
+    /// check can see the FIFO as changed by what was written to it) would
+    /// otherwise wait for ever.
+    #[cfg(unix)]
+    struct SlowOpen {
+        /// The task of the runtime
+        observer: tokio::task::JoinHandle<()>,
+        /// The thread outside the runtime
+        guard: std::thread::JoinHandle<bool>,
+        /// Set to end the thread
+        stop: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    /// A [`SlowOpen`] whose database has been read, and whose FIFO is still
+    /// let go.
+    #[cfg(unix)]
+    struct Released {
+        guard: std::thread::JoinHandle<bool>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[cfg(unix)]
+    impl SlowOpen {
+        fn start(manager: &Arc<GeoFilterManager>, path: &Path) -> Self {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            use std::sync::atomic::{AtomicBool, Ordering};
+
+            let pool = pool(manager, "region");
+            let database = {
+                let next = path.with_file_name("next.mmdb");
+                test_database::write_country_database(&next, "DE");
+                std::fs::read(&next).expect("read the database")
+            };
+            replace_with_fifo(path);
+            let fifo_stamp = FileStamp::of(path);
+            let ran = Arc::new(AtomicBool::new(false));
+            let stop = Arc::new(AtomicBool::new(false));
+
+            // The pool notes the file it is about to open just before it
+            // opens it, on the thread that goes on to wait for the FIFO. A
+            // task that runs after that, and so after that thread is free,
+            // shows that the runtime is not held up by the wait. (The stamp
+            // of the FIFO is taken before anything is written to it.) It
+            // writes to the map of filters, as a configuration reload does,
+            // which must not wait for the read either.
+            let observer = tokio::spawn({
+                let (ran, manager) = (Arc::clone(&ran), Arc::clone(manager));
+                async move {
+                    let begun = eventually(|| pool.file.lock().tried == fifo_stamp).await;
+                    assert!(begun, "the pool did not begin to open the FIFO");
+                    manager.filter_pools.retain(|_, _| true);
+                    ran.store(true, Ordering::SeqCst);
+                }
+            });
+
+            let guard = std::thread::spawn({
+                let (stop, fifo) = (Arc::clone(&stop), path.to_path_buf());
+                move || {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !ran.load(Ordering::SeqCst) && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    let ran_in_time = ran.load(Ordering::SeqCst);
+
+                    // Let the reader go: open the FIFO for writing, send the
+                    // database the first time, close it. Without waiting,
+                    // opening it fails until the reader has opened its end.
+                    // Some systems do not tell a reader that the writer
+                    // closed before it got to read, so this goes on.
+                    let give_up = Instant::now() + Duration::from_secs(30);
+                    let mut sent = false;
+                    while !stop.load(Ordering::SeqCst) && Instant::now() < give_up {
+                        let opened = std::fs::OpenOptions::new()
+                            .write(true)
+                            .custom_flags(libc::O_NONBLOCK)
+                            .open(&fifo);
+                        if let Ok(mut writer) = opened {
+                            sent = sent || writer.write_all(&database).is_ok();
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    ran_in_time
+                }
+            });
+
+            Self {
+                observer,
+                guard,
+                stop,
+            }
+        }
+
+        /// Wait until the database that was sent has been read.
+        async fn finish(self, manager: &GeoFilterManager) -> Released {
+            self.observer.await.expect("the observer task finishes");
+            let read = eventually(|| region_country(manager).as_deref() == Some("DE")).await;
+            assert!(
+                read,
+                "the database that was read slowly is not the one in use"
+            );
+            Released {
+                guard: self.guard,
+                stop: self.stop,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Released {
+        /// Stop letting the FIFO go. Returns whether the task of the runtime
+        /// ran while the database was being opened.
+        fn stop(self) -> bool {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.guard
+                .join()
+                .expect("the thread outside the runtime finishes")
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_runtime_runs_other_tasks_while_a_changed_database_is_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("country.mmdb");
+        test_database::write_country_database(&path, "US");
+        let manager = region_manager(&path);
+        assert_eq!(region_country(&manager).as_deref(), Some("US"));
+
+        // Nothing is watched: the one event is sent from here.
+        let watcher = Arc::new(GeoDatabaseWatcher::new(Arc::clone(&manager)));
+        *watcher.path_to_filters.write() =
+            HashMap::from([(path.clone(), vec!["region".to_string()])]);
+        let (events, receiver) = mpsc::channel(10);
+        let task = tokio::spawn({
+            let watcher = Arc::clone(&watcher);
+            async move {
+                watcher
+                    .run(
+                        receiver,
+                        Duration::from_millis(10),
+                        Duration::from_secs(3600),
+                    )
+                    .await
+            }
+        });
+
+        let open = SlowOpen::start(&manager, &path);
+        events.send(path.clone()).await.expect("the watcher runs");
+        let released = open.finish(&manager).await;
+
+        // The FIFO is let go until the watcher has stopped: a read that
+        // comes after the first one is let go too.
+        drop(events);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the watcher stops when its events end")
+            .expect("the watcher does not panic");
+        assert!(
+            released.stop(),
+            "no other task of the runtime ran while the watcher read a changed database"
+        );
+        assert_eq!(region_country(&manager).as_deref(), Some("DE"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_runtime_runs_other_tasks_while_the_periodic_check_reads_a_database() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("country.mmdb");
+        test_database::write_country_database(&path, "US");
+        let manager = region_manager(&path);
+        assert_eq!(region_country(&manager).as_deref(), Some("US"));
+
+        // Nothing is watched, so no event comes.
+        let (events, receiver) = mpsc::channel(10);
+        let watcher = Arc::new(GeoDatabaseWatcher::new(Arc::clone(&manager)));
+        let task = tokio::spawn({
+            let watcher = Arc::clone(&watcher);
+            async move {
+                watcher
+                    .run(
+                        receiver,
+                        Duration::from_millis(50),
+                        Duration::from_millis(20),
+                    )
+                    .await
+            }
+        });
+
+        // The FIFO is another file than the one the database was opened
+        // from. The check reads it once it has stayed as it is for an
+        // interval.
+        let open = SlowOpen::start(&manager, &path);
+        let released = open.finish(&manager).await;
+
+        // The FIFO is let go until the watcher has stopped: the check can
+        // see the FIFO as changed by what was written to it, and read it a
+        // second time.
+        drop(events);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the watcher stops when its events end")
+            .expect("the watcher does not panic");
+        assert!(
+            released.stop(),
+            "no other task of the runtime ran while the periodic check read a database"
+        );
+        assert_eq!(region_country(&manager).as_deref(), Some("DE"));
+    }
+
+    #[tokio::test]
+    async fn a_read_that_panics_is_reported_as_not_finished() {
+        let watcher = GeoDatabaseWatcher::new(Arc::new(GeoFilterManager::new()));
+
+        let panicked = watcher
+            .blocking(|_| -> u8 { panic!("a read that fails") })
+            .await;
+        assert_eq!(panicked, None);
+        assert_eq!(watcher.blocking(|_| 1).await, Some(1));
     }
 }
