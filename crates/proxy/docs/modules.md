@@ -350,7 +350,8 @@ impl StaticFileServer {
 - SPA fallback routing
 
 A static route's request is checked against `max-header-count` and
-`max-header-size` before the file is served, as a proxied request is.
+`max-header-size` before the file is served, as a proxied request is (431
+over either).
 
 **Configuration:**
 
@@ -998,7 +999,7 @@ even when its only filter is a response-header one:
 - geo, `redirect` and `cors` (preflight) filters, and agent filters (see
   [Builtin Routes](agents.md#builtin-routes));
 - the declared request-body limit (413), the WebSocket upgrade check (403), and
-  `max-header-count` and `max-header-size`.
+  `max-header-count` and `max-header-size` (431).
 
 Its response-header policy and response filters apply to the response. A
 builtin route a load balancer or orchestrator probes (health, ready) should
