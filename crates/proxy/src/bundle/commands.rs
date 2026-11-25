@@ -2,7 +2,9 @@
 //!
 //! Implements the `zentinel bundle` subcommand and its subcommands.
 
-use crate::bundle::fetch::{detect_arch, detect_os, download_agent};
+use crate::bundle::fetch::{
+    detect_arch, detect_os, download_agent, ChecksumOutcome, ChecksumPolicy,
+};
 use crate::bundle::install::{install_binary, uninstall_binary, InstallPaths};
 use crate::bundle::lock::{retired_reason, AgentInfo, BundleLock};
 use crate::bundle::setup::{
@@ -46,13 +48,15 @@ pub enum BundleCommand {
         #[arg(long)]
         prefix: Option<PathBuf>,
 
-        /// Install without checking the archives' SHA256 checksums
+        /// Install even when an archive's SHA256 checksum cannot be fetched or read
         ///
-        /// The .sha256 files are not downloaded, so an archive that does not
-        /// match its published checksum is installed as well. Each agent
-        /// installed this way is reported as unverified, with a warning on
-        /// stderr. The install script's --skip-verify is different: it still
-        /// checks a checksum it can download and stops on a mismatch.
+        /// The .sha256 file is still requested, and a checksum that can be
+        /// read is compared with the archive: a mismatch stops that agent's
+        /// install, as it does without this option. Only when the file cannot
+        /// be downloaded, or does not start with a SHA256 digest, is the agent
+        /// installed anyway, reported as unverified, with a warning on
+        /// stderr. It never overrides a mismatch with a checksum that can be
+        /// read.
         #[arg(long)]
         skip_verify: bool,
     },
@@ -199,6 +203,14 @@ fn cmd_install(
     // Create async runtime for downloads
     let rt = tokio::runtime::Runtime::new()?;
 
+    // --skip-verify only lets an install go ahead when the checksum cannot be
+    // fetched or read; a checksum that can be read is always compared.
+    let checksum_policy = if skip_verify {
+        ChecksumPolicy::SkipIfUnavailable
+    } else {
+        ChecksumPolicy::Required
+    };
+
     // Install each agent
     let mut installed = 0;
     let mut skipped = 0;
@@ -229,7 +241,7 @@ fn cmd_install(
 
         // Download
         let download_result =
-            rt.block_on(async { download_agent(agent, temp_dir.path(), !skip_verify).await });
+            rt.block_on(async { download_agent(agent, temp_dir.path(), checksum_policy).await });
 
         let download = match download_result {
             Ok(d) => d,
@@ -249,10 +261,9 @@ fn cmd_install(
             continue;
         }
 
-        let checksum_status = if download.checksum_verified {
-            "verified"
-        } else {
-            "unverified"
+        let checksum_status = match download.checksum {
+            ChecksumOutcome::Verified => "verified",
+            ChecksumOutcome::Unavailable { .. } => "unverified",
         };
 
         println!(
@@ -260,10 +271,11 @@ fn cmd_install(
             download.archive_size / 1024,
             checksum_status
         );
-        if !download.checksum_verified {
+        if let ChecksumOutcome::Unavailable { url, reason } = &download.checksum {
             eprintln!(
-                "    Warning: {} {} was installed without checking its SHA256 checksum (--skip-verify)",
-                agent.name, agent.version
+                "    Warning: {} {} was installed without checking its SHA256 checksum: \
+                 the checksum at {} is unavailable ({}) and --skip-verify was given",
+                agent.name, agent.version, url, reason
             );
         }
         installed += 1;

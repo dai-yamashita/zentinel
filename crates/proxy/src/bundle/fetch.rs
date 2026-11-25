@@ -22,8 +22,11 @@ pub enum FetchError {
     #[error("Download failed with status {status}: {url}")]
     DownloadFailed { url: String, status: u16 },
 
-    #[error("Checksum verification failed for {agent}")]
-    ChecksumMismatch { agent: String },
+    #[error(
+        "Checksum verification failed for {agent}: the archive does not match the SHA256 \
+         digest at {url}; --skip-verify does not override a mismatch"
+    )]
+    ChecksumMismatch { agent: String, url: String },
 
     #[error(
         "Cannot verify {agent}: the checksum at {url} is unavailable ({reason}); \
@@ -50,7 +53,38 @@ pub enum FetchError {
     },
 }
 
+/// What `download_agent` does when an archive's checksum cannot be obtained.
+///
+/// A checksum that was fetched and read is always compared with the archive,
+/// and a mismatch always stops the download.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChecksumPolicy {
+    /// The checksum must be fetched and read; otherwise the download fails.
+    Required,
+
+    /// A checksum that cannot be fetched or read is reported in the result
+    /// and the archive is extracted anyway.
+    SkipIfUnavailable,
+}
+
+/// What `download_agent` found out about an archive's checksum.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChecksumOutcome {
+    /// The archive matches the published SHA-256 digest.
+    Verified,
+
+    /// The checksum could not be fetched or read, so the archive was not
+    /// checked.
+    Unavailable {
+        /// Where the checksum was requested.
+        url: String,
+        /// Why it could not be fetched or read.
+        reason: String,
+    },
+}
+
 /// Result of a download operation
+#[derive(Debug)]
 pub struct DownloadResult {
     /// Path to the downloaded and extracted binary
     pub binary_path: PathBuf,
@@ -58,8 +92,9 @@ pub struct DownloadResult {
     /// Size of the downloaded archive in bytes
     pub archive_size: u64,
 
-    /// Whether checksum was verified
-    pub checksum_verified: bool,
+    /// How the check against the published checksum went: verified, or not
+    /// made because the checksum was unavailable (with the URL and why)
+    pub checksum: ChecksumOutcome,
 }
 
 /// Detect the current operating system
@@ -102,20 +137,23 @@ pub fn detect_arch() -> &'static str {
 ///
 /// Returns the path to the extracted binary.
 ///
-/// With `verify_checksum`, the archive is only extracted once it matches the
-/// SHA-256 digest published next to it. A checksum that cannot be fetched or
-/// read stops the download just as a mismatch does; without `verify_checksum`
-/// the checksum is not requested and the result reports it as unverified.
+/// The SHA-256 digest published next to the archive is always requested, and
+/// the archive is only extracted if it matches a digest that could be read.
+/// When the digest cannot be fetched or read, `checksum_policy` decides: with
+/// `ChecksumPolicy::Required` the download stops, with
+/// `ChecksumPolicy::SkipIfUnavailable` the archive is extracted and the result
+/// reports the checksum as unavailable, with the URL and the reason.
 ///
 /// # Errors
 ///
-/// Returns `FetchError::ChecksumUnavailable` when the checksum file cannot be
-/// downloaded or does not start with a SHA-256 digest, and
-/// `FetchError::ChecksumMismatch` when the digest differs from the archive's.
+/// Returns `FetchError::ChecksumMismatch` when the digest differs from the
+/// archive's, whatever the policy, and `FetchError::ChecksumUnavailable` when
+/// the checksum file cannot be downloaded or does not start with a SHA-256
+/// digest and the policy is `ChecksumPolicy::Required`.
 pub async fn download_agent(
     agent: &AgentInfo,
     temp_dir: &Path,
-    verify_checksum: bool,
+    checksum_policy: ChecksumPolicy,
 ) -> Result<DownloadResult, FetchError> {
     let os = detect_os();
     let arch = detect_arch();
@@ -158,26 +196,44 @@ pub async fn download_agent(
     let archive_bytes = response.bytes().await?;
     let archive_size = archive_bytes.len() as u64;
 
-    // Verify checksum if requested. A checksum that cannot be obtained is an
-    // error, not a reason to install the archive unchecked.
-    let checksum_verified = if verify_checksum {
-        let expected = fetch_expected_checksum(&client, &checksum_url)
-            .await
-            .map_err(|reason| FetchError::ChecksumUnavailable {
-                agent: agent.name.clone(),
-                url: checksum_url.clone(),
-                reason,
-            })?;
-        let actual = hex::encode(Sha256::digest(&archive_bytes));
-        if expected != actual {
-            return Err(FetchError::ChecksumMismatch {
-                agent: agent.name.clone(),
-            });
+    // Compare the archive with the published checksum whenever one can be
+    // read. A mismatch always stops the download; a checksum that cannot be
+    // obtained does so only when the policy requires it.
+    let checksum = match fetch_expected_checksum(&client, &checksum_url).await {
+        Ok(expected) => {
+            let actual = hex::encode(Sha256::digest(&archive_bytes));
+            if expected != actual {
+                return Err(FetchError::ChecksumMismatch {
+                    agent: agent.name.clone(),
+                    url: checksum_url,
+                });
+            }
+            tracing::debug!(agent = %agent.name, "Checksum verified");
+            ChecksumOutcome::Verified
         }
-        tracing::debug!(agent = %agent.name, "Checksum verified");
-        true
-    } else {
-        false
+        Err(reason) => match checksum_policy {
+            ChecksumPolicy::Required => {
+                return Err(FetchError::ChecksumUnavailable {
+                    agent: agent.name.clone(),
+                    url: checksum_url,
+                    reason,
+                });
+            }
+            ChecksumPolicy::SkipIfUnavailable => {
+                // The caller reports this to the user, with the URL and the
+                // reason, so it is not logged as a warning here as well.
+                tracing::debug!(
+                    agent = %agent.name,
+                    url = %checksum_url,
+                    reason = %reason,
+                    "Checksum unavailable, installing without checking the archive"
+                );
+                ChecksumOutcome::Unavailable {
+                    url: checksum_url,
+                    reason,
+                }
+            }
+        },
     };
 
     // Extract the archive
@@ -186,7 +242,7 @@ pub async fn download_agent(
     Ok(DownloadResult {
         binary_path,
         archive_size,
-        checksum_verified,
+        checksum,
     })
 }
 
@@ -498,19 +554,29 @@ mod tests {
         let result = DownloadResult {
             binary_path: PathBuf::from("/tmp/test"),
             archive_size: 1024,
-            checksum_verified: true,
+            checksum: ChecksumOutcome::Verified,
         };
 
         assert_eq!(result.archive_size, 1024);
-        assert!(result.checksum_verified);
+        assert_eq!(result.checksum, ChecksumOutcome::Verified);
     }
 
     #[test]
     fn test_fetch_error_display() {
         let err = FetchError::ChecksumMismatch {
             agent: "waf".to_string(),
+            url: "https://example.com/a.tar.gz.sha256".to_string(),
         };
-        assert!(err.to_string().contains("waf"));
+        let message = err.to_string();
+        assert!(message.contains("waf"), "{message}");
+        assert!(
+            message.contains("https://example.com/a.tar.gz.sha256"),
+            "{message}"
+        );
+        assert!(
+            message.contains("--skip-verify does not override"),
+            "{message}"
+        );
 
         let err = FetchError::BinaryNotFound("test".to_string());
         assert!(err.to_string().contains("test"));
@@ -598,12 +664,12 @@ mod tests {
         let (server, agent) = serve_release(archive, checksum).await;
         let temp = tempfile::tempdir().unwrap();
 
-        let result = download_agent(&agent, temp.path(), true).await;
+        let result = download_agent(&agent, temp.path(), ChecksumPolicy::Required).await;
 
         let err = match result {
             Ok(done) => panic!(
-                "download_agent succeeded without a verified checksum (checksum_verified: {})",
-                done.checksum_verified
+                "download_agent succeeded without a verified checksum ({:?})",
+                done.checksum
             ),
             Err(err) => err,
         };
@@ -679,7 +745,7 @@ mod tests {
         .await;
 
         assert!(
-            matches!(err, FetchError::ChecksumMismatch { ref agent } if agent == "waf"),
+            matches!(err, FetchError::ChecksumMismatch { ref agent, .. } if agent == "waf"),
             "{err}"
         );
     }
@@ -696,29 +762,109 @@ mod tests {
         .await;
         let temp = tempfile::tempdir().unwrap();
 
-        let done = download_agent(&agent, temp.path(), true).await.unwrap();
+        let done = download_agent(&agent, temp.path(), ChecksumPolicy::Required)
+            .await
+            .unwrap();
 
-        assert!(done.checksum_verified);
+        assert_eq!(done.checksum, ChecksumOutcome::Verified);
         assert_eq!(done.archive_size, archive.len() as u64);
         assert!(done.binary_path.exists());
     }
 
     #[tokio::test]
-    async fn download_agent_without_verification_does_not_need_a_checksum_file() {
+    async fn download_agent_skip_if_unavailable_rejects_a_checksum_that_does_not_match() {
         let archive = test_archive();
-        let (server, agent) = serve_release(&archive, None).await;
-        // The checksum file must not even be requested.
-        Mock::given(path("/agent.tar.gz.sha256"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(0)
-            .mount(&server)
-            .await;
+        let other = sha256_hex(b"some other archive");
+        let (server, agent) = serve_release(
+            &archive,
+            Some(ResponseTemplate::new(200).set_body_string(format!("{other}  agent.tar.gz\n"))),
+        )
+        .await;
         let temp = tempfile::tempdir().unwrap();
 
-        let done = download_agent(&agent, temp.path(), false).await.unwrap();
+        let result = download_agent(&agent, temp.path(), ChecksumPolicy::SkipIfUnavailable).await;
 
-        assert!(!done.checksum_verified);
+        let err = match result {
+            Err(err) => err,
+            Ok(done) => panic!("a checksum that does not match must stop the install: {done:?}"),
+        };
+        assert!(
+            matches!(err, FetchError::ChecksumMismatch { ref agent, .. } if agent == "waf"),
+            "{err}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!("{}/agent.tar.gz.sha256", server.uri())),
+            "{message}"
+        );
+        assert!(
+            message.contains("--skip-verify does not override"),
+            "{message}"
+        );
+        assert!(
+            !temp.path().join(TEST_BINARY).exists(),
+            "the archive must not be extracted when the checksum does not match"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_agent_skip_if_unavailable_reports_a_matching_checksum_as_verified() {
+        let archive = test_archive();
+        let body = format!("{}  agent.tar.gz\n", sha256_hex(&archive));
+        let (_server, agent) = serve_release(
+            &archive,
+            Some(ResponseTemplate::new(200).set_body_string(body)),
+        )
+        .await;
+        let temp = tempfile::tempdir().unwrap();
+
+        let done = download_agent(&agent, temp.path(), ChecksumPolicy::SkipIfUnavailable)
+            .await
+            .unwrap();
+
+        assert_eq!(done.checksum, ChecksumOutcome::Verified);
         assert!(done.binary_path.exists());
+    }
+
+    #[tokio::test]
+    async fn download_agent_skip_if_unavailable_installs_when_the_checksum_is_unavailable() {
+        let archive = test_archive();
+        let truncated = sha256_hex(&archive)[..63].to_string();
+        let cases = [
+            ("a missing file", None, "404"),
+            ("a failing request", Some(ResponseTemplate::new(500)), "500"),
+            (
+                "an empty file",
+                Some(ResponseTemplate::new(200).set_body_string("")),
+                "empty",
+            ),
+            (
+                "a file without a digest",
+                Some(ResponseTemplate::new(200).set_body_string(truncated)),
+                "64-digit",
+            ),
+        ];
+        for (name, checksum, reason_contains) in cases {
+            let (server, agent) = serve_release(&archive, checksum).await;
+            let temp = tempfile::tempdir().unwrap();
+
+            let done = download_agent(&agent, temp.path(), ChecksumPolicy::SkipIfUnavailable)
+                .await
+                .unwrap();
+
+            match done.checksum {
+                ChecksumOutcome::Unavailable { url, reason } => {
+                    assert_eq!(
+                        url,
+                        format!("{}/agent.tar.gz.sha256", server.uri()),
+                        "{name}"
+                    );
+                    assert!(reason.contains(reason_contains), "{name}: {reason}");
+                }
+                ChecksumOutcome::Verified => panic!("{name}: reported as verified"),
+            }
+            assert!(done.binary_path.exists(), "{name}");
+        }
     }
 
     #[test]

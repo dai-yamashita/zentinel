@@ -66,18 +66,28 @@ zentinel bundle install --prefix /opt/zentinel
 | `--force, -f` | Reinstall even if already up to date |
 | `--systemd` | Also write a systemd unit per agent |
 | `--prefix PATH` | Custom installation prefix |
-| `--skip-verify` | Install without checking the archive's SHA256 checksum |
+| `--skip-verify` | Install even when an archive's SHA256 checksum cannot be fetched or read |
 
 **Checksum verification:** each archive is checked against the SHA256 digest
 published next to it (`<archive>.sha256`) before it is extracted. If that file
 cannot be downloaded, or does not start with a 64-digit hexadecimal digest,
 the agent is not installed and the command exits non-zero, naming the agent
 and the checksum URL. A digest that does not match the archive stops that
-agent's install in the same way. With `--skip-verify` the checksum is not
-requested, so an archive that does not match it is installed as well; the
-agent is reported as `unverified` and a warning is printed on stderr. The
-install script's `--skip-verify` is different: it still checks a checksum it
-can download and stops on a mismatch (see [deployment.md](deployment.md)).
+agent's install in the same way.
+
+`--skip-verify` changes only what happens when that file cannot be
+downloaded or read. The `.sha256` file is still requested, and a digest that
+can be read is still compared with the archive: a match is reported as
+`verified`, and a mismatch stops that agent's install exactly as it does
+without the option. When the file cannot be downloaded or read, the agent is
+installed anyway, reported as `unverified`, and a warning naming the checksum
+URL and the reason is printed on stderr. A mirror whose `.sha256` files do not
+match its archives has to be corrected; `--skip-verify` does not install from
+it. The install script's `--skip-verify` works the same way (see
+[deployment.md](deployment.md)), except for a `.sha256` file that is
+downloaded but does not start with a digest: the script compares it with the
+archive and stops, where `bundle install --skip-verify` counts it as a
+checksum that cannot be read and installs with the warning.
 
 ### `zentinel bundle status`
 

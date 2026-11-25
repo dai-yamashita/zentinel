@@ -18,7 +18,9 @@
 //! - `bundle install ratelimit` explains that rate limiting is built in;
 //! - `bundle install` stops when an archive's `.sha256` cannot be fetched or
 //!   read, and installs it unverified, with a warning on stderr, only with
-//!   `--skip-verify`.
+//!   `--skip-verify`;
+//! - `--skip-verify` still compares a `.sha256` that can be read: a match is
+//!   reported as verified, a mismatch stops the install.
 
 #![cfg(unix)]
 
@@ -415,16 +417,28 @@ observability {{ metrics {{ enabled #false }} }}
     }
 }
 
+/// What a release server answers for an archive's `.sha256` file.
+enum Sha256File<'a> {
+    /// The digest of the archive that is served.
+    Published,
+    /// Not served at all (404).
+    Missing,
+    /// This exact body.
+    Body(&'a str),
+}
+
 /// Run `bundle install waf` against a release server whose `.sha256` files
-/// are replaced by `checksum` (or are not served when it is `None`).
+/// are replaced as `checksum` says.
 fn install_waf(
     platform: &str,
-    checksum: Option<&str>,
+    checksum: Sha256File<'_>,
     extra_args: &[&str],
 ) -> (Output, PathBuf, tempfile::TempDir) {
     let mut files = release_files(platform);
-    files.retain(|path, _| !path.ends_with(".sha256"));
-    if let Some(checksum) = checksum {
+    if !matches!(checksum, Sha256File::Published) {
+        files.retain(|path, _| !path.ends_with(".sha256"));
+    }
+    if let Sha256File::Body(checksum) = checksum {
         let path = format!(
             "/zentinelproxy/zentinel-agent-waf/releases/download/v{}/\
              zentinel-waf-agent-{}-{platform}.tar.gz.sha256",
@@ -457,7 +471,7 @@ fn bundle_install_stops_when_the_checksum_file_is_missing() {
         return;
     };
 
-    let (out, binary, _tmp) = install_waf(platform, None, &[]);
+    let (out, binary, _tmp) = install_waf(platform, Sha256File::Missing, &[]);
 
     assert!(!out.status.success(), "{}", text(&out));
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -476,7 +490,7 @@ fn bundle_install_stops_when_the_checksum_file_is_empty() {
         return;
     };
 
-    let (out, binary, _tmp) = install_waf(platform, Some(""), &[]);
+    let (out, binary, _tmp) = install_waf(platform, Sha256File::Body(""), &[]);
 
     assert!(!out.status.success(), "{}", text(&out));
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -491,7 +505,7 @@ fn bundle_install_skip_verify_installs_without_a_checksum_file() {
         return;
     };
 
-    let (out, binary, _tmp) = install_waf(platform, None, &["--skip-verify"]);
+    let (out, binary, _tmp) = install_waf(platform, Sha256File::Missing, &["--skip-verify"]);
 
     assert!(out.status.success(), "{}", text(&out));
     assert!(
@@ -502,9 +516,69 @@ fn bundle_install_skip_verify_installs_without_a_checksum_file() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains(&format!(
-            "Warning: waf {} was installed without checking its SHA256 checksum (--skip-verify)",
+            "Warning: waf {} was installed without checking its SHA256 checksum",
             PINS.waf
         )),
+        "{}",
+        text(&out)
+    );
+    assert!(
+        stderr.contains(".sha256 is unavailable (HTTP status 404)"),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(
+        format!("{}{}", stderr, String::from_utf8_lossy(&out.stdout))
+            .matches("without checking its SHA256 checksum")
+            .count(),
+        1,
+        "the warning is given once; {}",
+        text(&out)
+    );
+    assert!(binary.exists(), "{}", text(&out));
+}
+
+#[test]
+fn bundle_install_skip_verify_stops_when_the_checksum_does_not_match() {
+    let Some(platform) = platform() else {
+        eprintln!("skipping: no agent release is built for this platform");
+        return;
+    };
+    use sha2::{Digest, Sha256};
+    let other = format!(
+        "{}  agent.tar.gz\n",
+        hex::encode(Sha256::digest(b"another archive"))
+    );
+
+    let (out, binary, _tmp) = install_waf(platform, Sha256File::Body(&other), &["--skip-verify"]);
+
+    assert!(!out.status.success(), "{}", text(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("waf") && stderr.contains("--skip-verify does not override"),
+        "{}",
+        text(&out)
+    );
+    assert!(!binary.exists(), "{}", text(&out));
+}
+
+#[test]
+fn bundle_install_skip_verify_reports_a_matching_checksum_as_verified() {
+    let Some(platform) = platform() else {
+        eprintln!("skipping: no agent release is built for this platform");
+        return;
+    };
+
+    let (out, binary, _tmp) = install_waf(platform, Sha256File::Published, &["--skip-verify"]);
+
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains(", verified)"),
+        "{}",
+        text(&out)
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("without checking its SHA256 checksum"),
         "{}",
         text(&out)
     );
