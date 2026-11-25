@@ -193,16 +193,15 @@ impl ConfigWriter {
                             out.push_str("            type \"tcp\"\n");
                         }
                         zentinel_common::types::HealthCheckType::Grpc { service } => {
-                            if service.is_empty() {
-                                out.push_str("            type \"grpc\"\n");
-                            } else {
-                                out.push_str("            type \"grpc\" {\n");
-                                out.push_str(&format!(
-                                    "                service {}\n",
-                                    kdl_string(service)
-                                ));
-                                out.push_str("            }\n");
-                            }
+                            // Written even when empty: an empty service asks for
+                            // the health of the whole server, and the proxy reads
+                            // a missing one as `grpc.health.v1.Health`.
+                            out.push_str("            type \"grpc\" {\n");
+                            out.push_str(&format!(
+                                "                service {}\n",
+                                kdl_string(service)
+                            ));
+                            out.push_str("            }\n");
                         }
                         _ => {
                             out.push_str("            type \"tcp\"\n");
@@ -1367,6 +1366,21 @@ mod tests {
     fn grpc_health_check_service_is_read_by_the_proxy_parser() {
         let check_type = HealthCheckType::Grpc {
             service: "example.v1.Health".to_string(),
+        };
+        let health_check = health_check_after_round_trip(&check_type);
+        assert_eq!(health_check.check_type, check_type);
+        assert_eq!(health_check.interval_secs, 7);
+        assert_eq!(health_check.timeout_secs, 3);
+    }
+
+    #[test]
+    fn grpc_health_check_with_no_service_asks_for_the_whole_server() {
+        // A GRPCRoute's upstream is checked with an empty service, which asks
+        // for the health of the whole server. The proxy parser reads a
+        // missing `service` as `grpc.health.v1.Health`, so the empty value
+        // has to be written as well.
+        let check_type = HealthCheckType::Grpc {
+            service: String::new(),
         };
         let health_check = health_check_after_round_trip(&check_type);
         assert_eq!(health_check.check_type, check_type);
