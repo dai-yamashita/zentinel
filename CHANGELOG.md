@@ -133,6 +133,8 @@ for details.
 
 ### Dependencies
 - Bundle: `waf` 0.4.1 → 0.5.0, `graphql-security` 0.5.0 → 0.6.0 (#840).
+- `kube` 5.1.0 → 5.2.0 for RUSTSEC-2026-0600 (the Gateway API controller uses
+  `rustls-tls`, not the affected `openssl-tls`) (#845).
 
 ---
 
