@@ -1,7 +1,8 @@
 //! An agent in `request-body-mode "stream"` that replaces a request body
 //! chunk: the upstream gets the replacement's bytes, not the base64 text the
 //! protocol carries them in (#836); a replacement that is not valid base64
-//! follows the body agents' failure mode.
+//! follows the body agents' failure mode, as does one of another length when
+//! the request declared its `Content-Length` (#842).
 //! Runs the real binary with a v2 agent and a backend that records bodies.
 
 #![cfg(unix)]
@@ -42,19 +43,48 @@ fn spawn_backend(port: u16, seen: Arc<Mutex<Vec<String>>>) {
             std::thread::spawn(move || {
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
                 let mut length = 0usize;
+                let mut chunked = false;
                 let mut line = String::new();
                 while reader.read_line(&mut line).is_ok() && line != "\r\n" && !line.is_empty() {
                     if let Some((name, value)) = line.split_once(':') {
                         if name.eq_ignore_ascii_case("content-length") {
                             length = value.trim().parse().unwrap_or(0);
                         }
+                        if name.eq_ignore_ascii_case("transfer-encoding")
+                            && value.to_ascii_lowercase().contains("chunked")
+                        {
+                            chunked = true;
+                        }
                     }
                     line.clear();
                 }
-                let mut body = vec![0; length];
-                if reader.read_exact(&mut body).is_err() {
-                    return;
-                }
+                let body = if chunked {
+                    let mut body = Vec::new();
+                    loop {
+                        let mut size = String::new();
+                        if reader.read_line(&mut size).is_err() {
+                            return;
+                        }
+                        let Ok(size) = usize::from_str_radix(size.trim(), 16) else {
+                            return;
+                        };
+                        let mut chunk = vec![0; size + 2];
+                        if reader.read_exact(&mut chunk).is_err() {
+                            return;
+                        }
+                        if size == 0 {
+                            break;
+                        }
+                        body.extend_from_slice(&chunk[..size]);
+                    }
+                    body
+                } else {
+                    let mut body = vec![0; length];
+                    if reader.read_exact(&mut body).is_err() {
+                        return;
+                    }
+                    body
+                };
                 seen.lock()
                     .unwrap()
                     .push(String::from_utf8_lossy(&body).into_owned());
@@ -102,6 +132,32 @@ fn send(port: u16, method: &str, path: &str, body: &str) -> (u16, String) {
     (status, raw)
 }
 
+/// Status and raw response of a `POST` whose body is sent chunked, so it
+/// declares no length.
+fn send_chunked(port: u16, path: &str, body: &str) -> (u16, String) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    write!(
+        stream,
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
+         Content-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n\
+         {:x}\r\n{body}\r\n0\r\n\r\n",
+        body.len()
+    )
+    .unwrap();
+    let mut raw = Vec::new();
+    let _ = stream.read_to_end(&mut raw);
+    let raw = String::from_utf8_lossy(&raw).into_owned();
+    let status = raw
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    (status, raw)
+}
+
 /// Replaces `secret` with `XXXXXX` (same length, so `Content-Length`
 /// still holds), and answers a chunk containing `garble` with a replacement
 /// that is not base64.
@@ -131,6 +187,12 @@ impl AgentHandlerV2 for Redactor {
         if data.contains("garble") {
             return AgentResponse::default_allow().with_request_body_mutation(
                 BodyMutation::replace(event.chunk_index, "!!! not base64 !!!".to_string()),
+            );
+        }
+        if data.contains("lengthen") {
+            let longer = data.replace("lengthen", "lengthened-by-the-agent");
+            return AgentResponse::default_allow().with_request_body_mutation(
+                BodyMutation::replace(event.chunk_index, engine.encode(longer)),
             );
         }
         if data.contains("secret") {
@@ -252,7 +314,7 @@ observability {{
 /// The upstream gets the replacement's bytes, exactly.
 #[test]
 fn a_replaced_chunk_reaches_the_upstream_as_its_bytes() {
-    let setup = setup(19980..19986);
+    let setup = setup(20300..20306);
     let (status, raw) = send(setup.port, "POST", "/upload", "{\"token\":\"secret\"}");
     assert_eq!(status, 200, "{raw}");
     let seen = setup.seen.lock().unwrap().clone();
@@ -267,10 +329,36 @@ fn a_replaced_chunk_reaches_the_upstream_as_its_bytes() {
 /// original chunk: with a `closed` filter the request gets 503.
 #[test]
 fn a_replacement_that_is_not_base64_fails_closed() {
-    let setup = setup(19986..19992);
+    let setup = setup(20306..20312);
     let (status, raw) = send(setup.port, "POST", "/upload", "{\"token\":\"garble\"}");
     assert_eq!(status, 503, "{raw}");
     let seen = setup.seen.lock().unwrap().clone();
     assert!(!seen.iter().any(|b| b.contains("garble")), "{seen:?}");
     assert!(!seen.iter().any(|b| b.contains("not base64")), "{seen:?}");
+}
+
+/// With a declared `Content-Length`, a replacement of another length cannot
+/// be sent (the upstream already has the length): with a `closed` filter the
+/// request gets 503 and the upstream gets no body (#842).
+#[test]
+fn a_replacement_of_another_length_fails_closed_when_the_length_was_declared() {
+    let setup = setup(20312..20318);
+    let (status, raw) = send(setup.port, "POST", "/upload", "{\"word\":\"lengthen\"}");
+    assert_eq!(status, 503, "{raw}");
+    let seen = setup.seen.lock().unwrap().clone();
+    assert!(!seen.iter().any(|b| b.contains("lengthen")), "{seen:?}");
+}
+
+/// A chunked body declares no length, so a longer replacement is sent whole.
+#[test]
+fn a_replacement_of_another_length_reaches_the_upstream_of_a_chunked_body() {
+    let setup = setup(20318..20324);
+    let (status, raw) = send_chunked(setup.port, "/upload", "{\"word\":\"lengthen\"}");
+    assert_eq!(status, 200, "{raw}");
+    let seen = setup.seen.lock().unwrap().clone();
+    assert!(
+        seen.iter()
+            .any(|b| b == "{\"word\":\"lengthened-by-the-agent\"}"),
+        "the upstream did not get the whole replacement: {seen:?}"
+    );
 }

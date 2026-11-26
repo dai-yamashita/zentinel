@@ -539,6 +539,10 @@ pub struct RequestContext {
     pub(crate) request_body_chunk_index: u32,
     /// Whether agent needs more data (streaming mode)
     pub(crate) agent_needs_more: bool,
+    /// The request's `Content-Length`, when it declared one. The upstream is
+    /// sent that header before any of the body, so a body agent's replacement
+    /// chunk must keep the length then (#842).
+    pub(crate) request_declared_length: Option<u64>,
     /// Body streaming mode for response body inspection
     pub(crate) response_body_streaming_mode: BodyStreamingMode,
     /// Current chunk index for response body streaming
@@ -753,6 +757,7 @@ impl RequestContext {
             request_body_streaming_mode: BodyStreamingMode::Buffer,
             request_body_chunk_index: 0,
             agent_needs_more: false,
+            request_declared_length: None,
             response_body_streaming_mode: BodyStreamingMode::Buffer,
             response_body_chunk_index: 0,
             response_body_bytes_inspected: 0,

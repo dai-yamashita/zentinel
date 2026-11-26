@@ -480,19 +480,37 @@ agent "waf-agent" {
 
 ### Streaming Body Handling
 
-For large bodies, use chunk-based processing:
+For large bodies, an agent can take the request body chunk by chunk, as the
+proxy reads it:
 
 ```kdl
-agent "content-filter" {
-    events "request-headers" "request-body-chunk"
-
-    body-handling {
-        mode "stream"
-        chunk-size 65536  // 64KB chunks
-        chunk-timeout-ms 5000
+agents {
+    agent "content-filter" type="custom" {
+        unix-socket "/var/run/zentinel/content-filter.sock"
+        events "request_headers" "request_body"
+        request-body-mode "stream"
+        max-request-body-bytes 104857600
+        timeout-ms 200
     }
 }
 ```
+
+Each chunk is sent as a `RequestBodyChunk` event and forwarded upstream once
+the agent has answered it. In `stream` mode an agent can answer a chunk with a
+`BodyMutation`:
+
+- **pass through** (no data): the chunk goes upstream unchanged;
+- **drop** (empty data): nothing of the chunk goes upstream;
+- **replace** (base64 data): the decoded bytes go upstream instead.
+
+The upstream is sent the request headers before any of the body. When the
+request declared a `Content-Length`, a replacement must therefore keep the
+chunk's length: one of another length cannot be framed, and is refused like a
+replacement that is not valid base64, by the agent filter's `failure-mode`
+(`closed`: the request gets 503; `open`: the original chunk is forwarded, with
+a warning). A body sent chunked declares no length, so its chunks can be
+replaced with data of any length. Response bodies are always sent to agents
+buffered; see `response-body-mode` in the schema.
 
 ## Connection Pooling
 

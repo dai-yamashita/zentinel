@@ -1502,6 +1502,7 @@ impl ProxyHttp for ZentinelProxy {
             .get(http::header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.trim().parse::<u64>().ok());
+        ctx.request_declared_length = declared_length;
         if let Some(declared) = declared_length {
             let global_limit = ctx
                 .config
@@ -6149,10 +6150,29 @@ impl ZentinelProxy {
                             // protocol carries it base64 encoded (as for a
                             // response body); sending the text as it is put
                             // the base64 itself on the wire (#836).
-                            match base64::Engine::decode(
+                            let replacement = base64::Engine::decode(
                                 &base64::engine::general_purpose::STANDARD,
                                 new_data,
-                            ) {
+                            )
+                            .map_err(|e| format!("is not valid base64: {e}"))
+                            .and_then(|decoded| {
+                                // The upstream was sent the request's
+                                // `Content-Length` before any of the body, so
+                                // a replacement of another length would cut
+                                // the body off or leave the upstream waiting
+                                // (#842). A body that declared no length is
+                                // chunked, and any length goes.
+                                match ctx.request_declared_length {
+                                    Some(_) if decoded.len() != chunk_data.len() => Err(format!(
+                                        "is {} bytes for a chunk of {}, and the request \
+                                         declared its Content-Length",
+                                        decoded.len(),
+                                        chunk_data.len()
+                                    )),
+                                    _ => Ok(decoded),
+                                }
+                            });
+                            match replacement {
                                 Ok(decoded) => {
                                     trace!(
                                         correlation_id = %ctx.trace_id,
@@ -6165,29 +6185,27 @@ impl ZentinelProxy {
                                 }
                                 // An agent that replaces a chunk may be
                                 // redacting it, so a replacement that cannot be
-                                // read is not answered by sending the original:
-                                // it follows the body agents' failure mode, as
-                                // a failed call does.
-                                Err(e) if ctx.request_body_agents_fail_closed() => {
+                                // applied is not answered by sending the
+                                // original: it follows the body agents' failure
+                                // mode, as a failed call does.
+                                Err(reason) if ctx.request_body_agents_fail_closed() => {
                                     error!(
                                         correlation_id = %ctx.trace_id,
                                         agent_correlation_id = %ctx.agent_correlation_id(),
                                         chunk_index = chunk_index,
-                                        error = %e,
-                                        "Agent body chunk replacement is not valid base64, blocking (fail-closed)"
+                                        "Agent body chunk replacement {reason}, blocking (fail-closed)"
                                     );
                                     return Err(Error::explain(
                                         ErrorType::HTTPStatus(503),
                                         "Service unavailable",
                                     ));
                                 }
-                                Err(e) => {
+                                Err(reason) => {
                                     warn!(
                                         correlation_id = %ctx.trace_id,
                                         agent_correlation_id = %ctx.agent_correlation_id(),
                                         chunk_index = chunk_index,
-                                        error = %e,
-                                        "Agent body chunk replacement is not valid base64, forwarding the original chunk (fail-open)"
+                                        "Agent body chunk replacement {reason}, forwarding the original chunk (fail-open)"
                                     );
                                 }
                             }
