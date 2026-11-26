@@ -543,6 +543,12 @@ pub struct RequestContext {
     /// sent that header before any of the body, so a body agent's replacement
     /// chunk must keep the length then (#842).
     pub(crate) request_declared_length: Option<u64>,
+    /// Time the body agents have spent on this request's body chunks so far,
+    /// against their `body-agent-time-ms`.
+    pub(crate) request_body_agent_time: std::time::Duration,
+    /// The body agents' `body-agent-time-ms` was spent and their filters
+    /// fail open: the rest of the body goes on without them.
+    pub(crate) request_body_agent_time_spent: bool,
     /// Body streaming mode for response body inspection
     pub(crate) response_body_streaming_mode: BodyStreamingMode,
     /// Current chunk index for response body streaming
@@ -758,6 +764,8 @@ impl RequestContext {
             request_body_chunk_index: 0,
             agent_needs_more: false,
             request_declared_length: None,
+            request_body_agent_time: std::time::Duration::ZERO,
+            request_body_agent_time_spent: false,
             response_body_streaming_mode: BodyStreamingMode::Buffer,
             response_body_chunk_index: 0,
             response_body_bytes_inspected: 0,

@@ -382,6 +382,7 @@ pub(crate) const RECOGNIZED_AGENT_KEYS: &[&str] = &[
     "request-body-mode",
     "response-body-mode",
     "chunk-timeout-ms",
+    "body-agent-time-ms",
     "config",
     "max-concurrent-calls",
     // Deprecated: parsed, warned about, and otherwise ignored.
@@ -597,6 +598,7 @@ fn parse_single_agent(node: &kdl::KdlNode) -> Result<AgentConfig> {
     let mut request_body_mode = BodyStreamingMode::Buffer;
     let mut response_body_mode = BodyStreamingMode::Buffer;
     let mut chunk_timeout_ms = 5000u64;
+    let mut body_agent_time_ms: Option<u64> = None;
     let mut config: Option<serde_json::Value> = None;
     let mut max_concurrent_calls = 100usize; // Per-agent concurrency limit
 
@@ -702,6 +704,11 @@ fn parse_single_agent(node: &kdl::KdlNode) -> Result<AgentConfig> {
                     chunk_timeout_ms = v;
                 }
             }
+            "body-agent-time-ms" => {
+                if let Some(v) = node_int_as(child)? {
+                    body_agent_time_ms = Some(v);
+                }
+            }
             "config" => {
                 config = Some(kdl_to_json(child)?);
             }
@@ -747,6 +754,7 @@ fn parse_single_agent(node: &kdl::KdlNode) -> Result<AgentConfig> {
         request_body_mode,
         response_body_mode,
         chunk_timeout_ms,
+        body_agent_time_ms,
         config,
         max_concurrent_calls,
     })

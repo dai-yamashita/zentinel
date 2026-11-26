@@ -491,12 +491,19 @@ agents {
         request-body-mode "stream"
         max-request-body-bytes 104857600
         timeout-ms 200
+        chunk-timeout-ms 200
+        body-agent-time-ms 30000
     }
 }
 ```
 
 Each chunk is sent as a `RequestBodyChunk` event and forwarded upstream once
-the agent has answered it. In `stream` mode an agent can answer a chunk with a
+the agent has answered it. Two settings bound how long that can take:
+`chunk-timeout-ms` limits each chunk call (it can only shorten `timeout-ms`),
+and `body-agent-time-ms` limits the agents' total time on one body, so a slow
+agent cannot hold a large upload open one chunk at a time. Past either, the
+filter's `failure-mode` applies; for `body-agent-time-ms`, `open` sends the
+rest of the body on without the agents. In `stream` mode an agent can answer a chunk with a
 `BodyMutation`:
 
 - **pass through** (no data): the chunk goes upstream unchanged;

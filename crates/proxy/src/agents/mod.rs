@@ -117,6 +117,7 @@ mod tests {
             request_body_mode: Default::default(),
             response_body_mode: Default::default(),
             chunk_timeout_ms: 5000,
+            body_agent_time_ms: None,
             config: None,
             max_concurrent_calls: 50, // Custom limit
         };
@@ -141,6 +142,7 @@ mod tests {
             request_body_mode: Default::default(),
             response_body_mode: Default::default(),
             chunk_timeout_ms: 5000,
+            body_agent_time_ms: None,
             config: None,
             max_concurrent_calls: 100, // Default value
         };
@@ -182,6 +184,7 @@ mod tests {
             request_body_mode: Default::default(),
             response_body_mode: Default::default(),
             chunk_timeout_ms: 5000,
+            body_agent_time_ms: None,
             config: None,
             max_concurrent_calls: 100,
         };

@@ -569,6 +569,21 @@ impl AgentManager {
             .unwrap_or(0)
     }
 
+    /// The most time the route's body agents may spend on one request body,
+    /// summed over its chunk calls: the smallest `body-agent-time-ms` among
+    /// them, `None` when none sets one.
+    pub async fn body_agent_time_budget(&self, body_agents: &[BodyAgent]) -> Option<Duration> {
+        self.resolve_agents(body_agents, Some(EventType::RequestBodyChunk))
+            .await
+            .iter()
+            .filter_map(|resolved| match resolved {
+                Resolved::Loaded(_, agent) => agent.body_agent_time_ms(),
+                Resolved::NotLoaded(_) => None,
+            })
+            .min()
+            .map(Duration::from_millis)
+    }
+
     /// How the request body is sent to the route's body agents: their
     /// `request-body-mode`s, combined by `most_conservative_body_mode`.
     /// Agents that are not loaded have no say (their call fails on
@@ -1087,8 +1102,19 @@ impl AgentManager {
 
             // The call's `timeout-ms` covers the wait for a free call slot
             // as well as the call, so a busy agent cannot hold requests (and
-            // what they buffered for it) for longer than that (#821).
-            let timeout_ms = filter.effective_timeout_ms(agent.timeout_ms());
+            // what they buffered for it) for longer than that (#821). A
+            // request body chunk sent in `stream` or `hybrid` mode is also
+            // held to the agent's `chunk-timeout-ms`, which can only shorten
+            // it.
+            let mut timeout_ms = filter.effective_timeout_ms(agent.timeout_ms());
+            if event_type == EventType::RequestBodyChunk
+                && matches!(
+                    agent.request_body_mode(),
+                    BodyStreamingMode::Stream | BodyStreamingMode::Hybrid { .. }
+                )
+            {
+                timeout_ms = timeout_ms.min(agent.chunk_timeout_ms());
+            }
             let timeout_duration = Duration::from_millis(timeout_ms);
             let queued_at = Instant::now();
 
@@ -3044,6 +3070,70 @@ mod tests {
             assert_eq!(status_of(&decision), None, "{path}: open continues");
             assert!(elapsed < Duration::from_millis(1000), "{path}: {elapsed:?}");
         }
+    }
+
+    // ------------------------------------------------------------------
+    // #833: `chunk-timeout-ms` limits each streamed request body chunk
+    // ------------------------------------------------------------------
+
+    /// A body chunk call to an agent with `timeout-ms 10000`,
+    /// `chunk-timeout-ms 200` and `request-body-mode` `mode`, answering after
+    /// 1.5 s: its decision and how long it took.
+    async fn chunk_call_in_mode(mode: &str) -> (AgentDecision, Duration) {
+        let (manager, _dir) = manager_with_slow_agent_settings(
+            Duration::from_millis(1500),
+            10_000,
+            r#""request_body""#,
+            &format!("request-body-mode \"{mode}\"\nchunk-timeout-ms 200"),
+        )
+        .await;
+        let filters = [FilterAgent {
+            id: "slow".to_string(),
+            failure_mode: FailureMode::Closed,
+            timeout_ms: None,
+        }];
+        let bodies = [BodyAgent::from(&filters[0])];
+        let start = Instant::now();
+        let decision = if mode == "stream" {
+            manager
+                .process_request_body_streaming(
+                    &call_context(),
+                    b"body",
+                    true,
+                    0,
+                    4,
+                    Some(4),
+                    &bodies,
+                )
+                .await
+        } else {
+            manager
+                .process_request_body(&call_context(), b"body", true, &bodies)
+                .await
+        }
+        .expect("decision");
+        (decision, start.elapsed())
+    }
+
+    #[tokio::test]
+    async fn chunk_timeout_limits_a_streamed_request_body_chunk() {
+        let (decision, elapsed) = chunk_call_in_mode("stream").await;
+        assert_eq!(status_of(&decision), Some(504));
+        assert!(
+            elapsed < Duration::from_millis(1000),
+            "the chunk call took {elapsed:?}, longer than chunk-timeout-ms 200 allows"
+        );
+    }
+
+    #[tokio::test]
+    async fn chunk_timeout_does_not_apply_to_a_buffered_body() {
+        let (decision, elapsed) = chunk_call_in_mode("buffer").await;
+        assert_eq!(
+            status_of(&decision),
+            None,
+            "the agent answered within timeout-ms"
+        );
+        assert!(elapsed >= Duration::from_millis(1500), "{elapsed:?}");
     }
 
     // ------------------------------------------------------------------

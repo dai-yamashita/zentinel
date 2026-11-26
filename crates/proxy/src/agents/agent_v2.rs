@@ -157,6 +157,18 @@ impl AgentV2 {
         self.config.request_body_mode
     }
 
+    /// `chunk-timeout-ms`: the longest one request body chunk call may take
+    /// in `stream` and `hybrid` mode (it can only shorten `timeout-ms`).
+    pub fn chunk_timeout_ms(&self) -> u64 {
+        self.config.chunk_timeout_ms
+    }
+
+    /// `body-agent-time-ms`: the most time the agent may spend on one
+    /// request body, summed over its chunk calls; `None` for no limit.
+    pub fn body_agent_time_ms(&self) -> Option<u64> {
+        self.config.body_agent_time_ms
+    }
+
     /// Maximum request body size (bytes) this agent will inspect.
     pub fn max_request_body_bytes(&self) -> usize {
         self.config

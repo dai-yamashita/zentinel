@@ -235,6 +235,14 @@ pub struct AgentConfig {
     #[serde(default = "default_chunk_timeout")]
     pub chunk_timeout_ms: u64,
 
+    /// Most time the agent may spend on one request body, summed over its
+    /// chunk calls, in `stream` and `hybrid` mode (milliseconds). Unset: no
+    /// limit. Past it the agent's filter `failure-mode` applies: `closed`
+    /// refuses the request with 504, `open` sends the rest of the body on
+    /// without the agents.
+    #[serde(default)]
+    pub body_agent_time_ms: Option<u64>,
+
     /// Agent-specific configuration
     ///
     /// This configuration is passed to the agent via the Configure event

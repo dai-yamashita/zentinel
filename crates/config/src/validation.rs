@@ -943,6 +943,13 @@ fn validate_agents(config: &Config, errors: &mut Vec<String>) {
             ));
         }
 
+        if agent.body_agent_time_ms == Some(0) {
+            errors.push(format!(
+                "Agent '{}' has body-agent-time-ms 0. Timeouts must be greater than 0.",
+                agent.id
+            ));
+        }
+
         if agent.max_request_body_bytes == Some(0) {
             warn!(agent_id = %agent.id, "Agent has zero request body limit");
             errors.push(format!(
@@ -3520,6 +3527,44 @@ mod tests {
             errors.contains("Agent 'waf' has chunk_timeout_ms 0"),
             "expected zero chunk timeout error, got: {errors}"
         );
+    }
+
+    #[test]
+    fn agent_zero_body_agent_time_fails_validation() {
+        let config = config_with_agent_block(
+            r#"
+            agent "waf" type="waf" {
+                unix-socket path="/tmp/waf.sock"
+                body-agent-time-ms 0
+            }
+            "#,
+        );
+        let errors = validation_errors(&config);
+        assert!(
+            errors.contains("Agent 'waf' has body-agent-time-ms 0"),
+            "expected zero body-agent-time-ms error, got: {errors}"
+        );
+    }
+
+    #[test]
+    fn agent_body_agent_time_is_read() {
+        let config = config_with_agent_block(
+            r#"
+            agent "waf" type="waf" {
+                unix-socket path="/tmp/waf.sock"
+                body-agent-time-ms 30000
+            }
+            "#,
+        );
+        assert_eq!(config.agents[0].body_agent_time_ms, Some(30000));
+        let unset = config_with_agent_block(
+            r#"
+            agent "waf" type="waf" {
+                unix-socket path="/tmp/waf.sock"
+            }
+            "#,
+        );
+        assert_eq!(unset.agents[0].body_agent_time_ms, None);
     }
 
     #[test]

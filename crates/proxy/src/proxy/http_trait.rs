@@ -6076,6 +6076,46 @@ impl ZentinelProxy {
                 return Ok(());
             }
         }
+        // The body agents' `body-agent-time-ms`: the time they may spend on
+        // this body, summed over its chunks. Spent, a `closed` filter refuses
+        // the request; an `open` one lets the rest of the body go on without
+        // the agents, so a slow agent cannot hold a large body open one chunk
+        // at a time.
+        if ctx.request_body_agent_time_spent {
+            return Ok(());
+        }
+        let budget = self
+            .agent_manager
+            .body_agent_time_budget(&ctx.body_inspection_agents)
+            .await;
+        if let Some(budget) = budget {
+            if ctx.request_body_agent_time >= budget {
+                if ctx.request_body_agents_fail_closed() {
+                    error!(
+                        correlation_id = %ctx.trace_id,
+                        agent_correlation_id = %ctx.agent_correlation_id(),
+                        spent_ms = ctx.request_body_agent_time.as_millis() as u64,
+                        budget_ms = budget.as_millis() as u64,
+                        "Body agents spent their body-agent-time-ms, blocking (fail-closed)"
+                    );
+                    self.metrics
+                        .record_blocked_request("agent_body_time_exceeded");
+                    return Err(Error::explain(
+                        ErrorType::HTTPStatus(504),
+                        "Gateway timeout",
+                    ));
+                }
+                warn!(
+                    correlation_id = %ctx.trace_id,
+                    agent_correlation_id = %ctx.agent_correlation_id(),
+                    spent_ms = ctx.request_body_agent_time.as_millis() as u64,
+                    budget_ms = budget.as_millis() as u64,
+                    "Body agents spent their body-agent-time-ms, sending the rest of the body without them (fail-open)"
+                );
+                ctx.request_body_agent_time_spent = true;
+                return Ok(());
+            }
+        }
         let chunk_index = ctx.request_body_chunk_index;
         ctx.request_body_chunk_index += 1;
         ctx.body_bytes_inspected += chunk_data.len() as u64;
@@ -6115,7 +6155,8 @@ impl ZentinelProxy {
         let agent_ids = ctx.body_inspection_agents.clone();
         let total_size = None; // Unknown in streaming mode
 
-        match self
+        let call_started = std::time::Instant::now();
+        let outcome = self
             .agent_manager
             .process_request_body_streaming(
                 &agent_ctx,
@@ -6126,8 +6167,9 @@ impl ZentinelProxy {
                 total_size,
                 &agent_ids,
             )
-            .await
-        {
+            .await;
+        ctx.request_body_agent_time += call_started.elapsed();
+        match outcome {
             Ok(mut decision) => {
                 // Track if agent needs more data
                 ctx.agent_needs_more = decision.needs_more;
