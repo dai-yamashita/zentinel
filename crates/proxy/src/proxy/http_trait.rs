@@ -6145,15 +6145,52 @@ impl ZentinelProxy {
                                 "Agent dropped body chunk"
                             );
                         } else if let Some(ref new_data) = mutation.data {
-                            // Replace chunk with mutated content
-                            *body = Some(Bytes::from(new_data.clone()));
-                            trace!(
-                                correlation_id = %ctx.trace_id,
-                                chunk_index = chunk_index,
-                                original_size = chunk_data.len(),
-                                new_size = new_data.len(),
-                                "Agent mutated body chunk"
-                            );
+                            // Replace the chunk with the agent's content. The
+                            // protocol carries it base64 encoded (as for a
+                            // response body); sending the text as it is put
+                            // the base64 itself on the wire (#836).
+                            match base64::Engine::decode(
+                                &base64::engine::general_purpose::STANDARD,
+                                new_data,
+                            ) {
+                                Ok(decoded) => {
+                                    trace!(
+                                        correlation_id = %ctx.trace_id,
+                                        chunk_index = chunk_index,
+                                        original_size = chunk_data.len(),
+                                        new_size = decoded.len(),
+                                        "Agent mutated body chunk"
+                                    );
+                                    *body = Some(Bytes::from(decoded));
+                                }
+                                // An agent that replaces a chunk may be
+                                // redacting it, so a replacement that cannot be
+                                // read is not answered by sending the original:
+                                // it follows the body agents' failure mode, as
+                                // a failed call does.
+                                Err(e) if ctx.request_body_agents_fail_closed() => {
+                                    error!(
+                                        correlation_id = %ctx.trace_id,
+                                        agent_correlation_id = %ctx.agent_correlation_id(),
+                                        chunk_index = chunk_index,
+                                        error = %e,
+                                        "Agent body chunk replacement is not valid base64, blocking (fail-closed)"
+                                    );
+                                    return Err(Error::explain(
+                                        ErrorType::HTTPStatus(503),
+                                        "Service unavailable",
+                                    ));
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        correlation_id = %ctx.trace_id,
+                                        agent_correlation_id = %ctx.agent_correlation_id(),
+                                        chunk_index = chunk_index,
+                                        error = %e,
+                                        "Agent body chunk replacement is not valid base64, forwarding the original chunk (fail-open)"
+                                    );
+                                }
+                            }
                         }
                     }
                 }
