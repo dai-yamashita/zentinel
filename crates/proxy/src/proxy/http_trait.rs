@@ -6100,6 +6100,10 @@ impl ZentinelProxy {
                     );
                     self.metrics
                         .record_blocked_request("agent_body_time_exceeded");
+                    self.metrics.record_agent_body_time_exceeded(
+                        ctx.route_id.as_deref().unwrap_or("unknown"),
+                        "closed",
+                    );
                     return Err(Error::explain(
                         ErrorType::HTTPStatus(504),
                         "Gateway timeout",
@@ -6111,6 +6115,10 @@ impl ZentinelProxy {
                     spent_ms = ctx.request_body_agent_time.as_millis() as u64,
                     budget_ms = budget.as_millis() as u64,
                     "Body agents spent their body-agent-time-ms, sending the rest of the body without them (fail-open)"
+                );
+                self.metrics.record_agent_body_time_exceeded(
+                    ctx.route_id.as_deref().unwrap_or("unknown"),
+                    "open",
                 );
                 ctx.request_body_agent_time_spent = true;
                 return Ok(());
@@ -6168,7 +6176,13 @@ impl ZentinelProxy {
                 &agent_ids,
             )
             .await;
-        ctx.request_body_agent_time += call_started.elapsed();
+        let call_time = call_started.elapsed();
+        ctx.request_body_agent_time += call_time;
+        self.metrics.record_agent_body_chunk(
+            ctx.route_id.as_deref().unwrap_or("unknown"),
+            chunk_data.len(),
+            call_time,
+        );
         match outcome {
             Ok(mut decision) => {
                 // Track if agent needs more data

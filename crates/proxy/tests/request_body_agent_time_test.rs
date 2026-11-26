@@ -195,6 +195,7 @@ impl AgentHandlerV2 for Slow {
 
 struct Setup {
     port: u16,
+    metrics_port: u16,
     seen: Arc<Mutex<Vec<String>>>,
     chunks: Arc<AtomicUsize>,
     _proxy: Proxy,
@@ -223,7 +224,12 @@ fn setup(ports: std::ops::Range<u16>, failure_mode: &str) -> Setup {
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    let (port, backend) = free_ports(ports);
+    let (port, backend) = free_ports(ports.clone());
+    // A range of its own, so tests running side by side never reach for
+    // each other's ports.
+    let metrics_port = (ports.start + 1000..ports.end + 1000)
+        .find(|&p| TcpListener::bind(("127.0.0.1", p)).is_ok())
+        .expect("a free metrics port");
     let seen = Arc::new(Mutex::new(Vec::new()));
     spawn_backend(backend, seen.clone());
     let config = format!(
@@ -264,7 +270,11 @@ routes {{
     }}
 }}
 observability {{
-    metrics {{ enabled #false }}
+    metrics {{
+        enabled #true
+        address "127.0.0.1:{metrics_port}"
+        path "/metrics"
+    }}
 }}
 "#,
         socket = socket.display()
@@ -300,11 +310,33 @@ observability {{
     }
     Setup {
         port,
+        metrics_port,
         seen,
         chunks,
         _proxy: proxy,
         _rt: rt,
         _dir: dir,
+    }
+}
+
+impl Setup {
+    /// The value of the sample `name{labels}` on the metrics endpoint.
+    fn metric(&self, sample: &str) -> Option<f64> {
+        let mut stream = TcpStream::connect(("127.0.0.1", self.metrics_port)).ok()?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        write!(
+            stream,
+            "GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        )
+        .ok()?;
+        let mut raw = String::new();
+        let _ = stream.read_to_string(&mut raw);
+        raw.lines()
+            .find(|line| line.starts_with(sample))
+            .and_then(|line| line.rsplit(' ').next())
+            .and_then(|value| value.parse().ok())
     }
 }
 
@@ -342,5 +374,45 @@ fn spent_body_agent_time_sends_the_rest_on_when_open() {
     assert!(
         seen.iter().any(|b| b == &PARTS.concat()),
         "the upstream did not get the whole body: {seen:?}"
+    );
+}
+
+/// The streamed chunks, their bytes and how long the agents took are
+/// counted per route, and so is the body whose agent time was spent.
+#[test]
+fn streamed_body_chunks_and_spent_agent_time_are_counted() {
+    let setup = setup(20336..20342, "open");
+    let (status, raw) = send_in_parts(setup.port, &PARTS);
+    assert_eq!(status, 200, "{raw}");
+    let chunks = setup.chunks.load(Ordering::SeqCst) as f64;
+    let route = "{route=\"all\"}";
+    assert_eq!(
+        setup.metric(&format!("zentinel_agent_body_chunks_total{route}")),
+        Some(chunks),
+        "one count per chunk the agent was sent"
+    );
+    let bytes = setup
+        .metric(&format!("zentinel_agent_body_bytes_total{route}"))
+        .expect("bytes counted");
+    assert!(bytes >= chunks, "{bytes} bytes for {chunks} chunks");
+    assert_eq!(
+        setup.metric(&format!(
+            "zentinel_agent_body_chunk_duration_seconds_count{route}"
+        )),
+        Some(chunks)
+    );
+    let slow = setup
+        .metric(&format!(
+            "zentinel_agent_body_chunk_duration_seconds_sum{route}"
+        ))
+        .expect("durations observed");
+    assert!(
+        slow >= 0.3 * chunks,
+        "the agent takes 300 ms per chunk: {slow} s"
+    );
+    assert_eq!(
+        setup
+            .metric("zentinel_agent_body_time_exceeded_total{failure_mode=\"open\",route=\"all\"}"),
+        Some(1.0)
     );
 }

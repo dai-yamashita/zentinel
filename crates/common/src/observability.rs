@@ -106,6 +106,14 @@ pub struct RequestMetrics {
     websocket_connections_total: IntCounterVec,
     websocket_inspection_duration: HistogramVec,
     websocket_frame_size: HistogramVec,
+    /// Request body chunks sent to body agents in `stream` / `hybrid` mode
+    agent_body_chunks_total: IntCounterVec,
+    /// Request body bytes sent to body agents in `stream` / `hybrid` mode
+    agent_body_bytes_total: IntCounterVec,
+    /// How long the body agents took over one streamed request body chunk
+    agent_body_chunk_duration: HistogramVec,
+    /// Request bodies whose agents spent their `body-agent-time-ms`
+    agent_body_time_exceeded_total: IntCounterVec,
     /// Body decompression metrics
     decompression_total: IntCounterVec,
     decompression_ratio: HistogramVec,
@@ -372,6 +380,38 @@ impl RequestMetrics {
         )
         .context("Failed to register websocket_frame_size metric")?;
 
+        // Streamed request bodies sent to agents (#833)
+        let agent_body_chunks_total = register_int_counter_vec!(
+            "zentinel_agent_body_chunks_total",
+            "Request body chunks sent to body agents in stream or hybrid mode",
+            &["route"]
+        )
+        .context("Failed to register agent_body_chunks_total metric")?;
+
+        let agent_body_bytes_total = register_int_counter_vec!(
+            "zentinel_agent_body_bytes_total",
+            "Request body bytes sent to body agents in stream or hybrid mode",
+            &["route"]
+        )
+        .context("Failed to register agent_body_bytes_total metric")?;
+
+        let agent_body_chunk_duration = register_histogram_vec!(
+            "zentinel_agent_body_chunk_duration_seconds",
+            "How long the body agents took over one streamed request body chunk; \
+             the upload waits this long",
+            &["route"],
+            vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
+        )
+        .context("Failed to register agent_body_chunk_duration metric")?;
+
+        let agent_body_time_exceeded_total = register_int_counter_vec!(
+            "zentinel_agent_body_time_exceeded_total",
+            "Request bodies whose agents spent their body-agent-time-ms, by the \
+             failure mode that answered them",
+            &["route", "failure_mode"]
+        )
+        .context("Failed to register agent_body_time_exceeded_total metric")?;
+
         // Body decompression metrics
         let decompression_total = register_int_counter_vec!(
             "zentinel_decompression_total",
@@ -451,6 +491,10 @@ impl RequestMetrics {
             websocket_frames_total,
             websocket_connections_total,
             websocket_inspection_duration,
+            agent_body_chunks_total,
+            agent_body_bytes_total,
+            agent_body_chunk_duration,
+            agent_body_time_exceeded_total,
             websocket_frame_size,
             decompression_total,
             decompression_ratio,
@@ -728,6 +772,28 @@ impl RequestMetrics {
     }
 
     /// Record WebSocket frame inspection duration
+    /// Record one streamed request body chunk sent to the body agents: its
+    /// size, and how long the agents took over it.
+    pub fn record_agent_body_chunk(&self, route: &str, bytes: usize, duration: Duration) {
+        self.agent_body_chunks_total
+            .with_label_values(&[route])
+            .inc();
+        self.agent_body_bytes_total
+            .with_label_values(&[route])
+            .inc_by(bytes as u64);
+        self.agent_body_chunk_duration
+            .with_label_values(&[route])
+            .observe(duration.as_secs_f64());
+    }
+
+    /// Record a request body whose agents spent their `body-agent-time-ms`;
+    /// `failure_mode` is `closed` (refused) or `open` (sent on without them).
+    pub fn record_agent_body_time_exceeded(&self, route: &str, failure_mode: &str) {
+        self.agent_body_time_exceeded_total
+            .with_label_values(&[route, failure_mode])
+            .inc();
+    }
+
     pub fn record_websocket_inspection_duration(&self, route: &str, duration: Duration) {
         self.websocket_inspection_duration
             .with_label_values(&[route])

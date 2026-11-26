@@ -271,6 +271,32 @@ zentinel_websocket_connections_total{route}
 zentinel_websocket_inspection_duration_seconds{route}
 ```
 
+### Streamed Request Body Metrics
+
+Recorded for request bodies sent to body agents in `request-body-mode
+"stream"` or `"hybrid"` (after the hybrid threshold), per route:
+
+```rust
+metrics.record_agent_body_chunk("upload", chunk.len(), agents_took);
+metrics.record_agent_body_time_exceeded("upload", "open");
+```
+
+**Prometheus Metrics:**
+
+```
+zentinel_agent_body_chunks_total{route}
+zentinel_agent_body_bytes_total{route}
+zentinel_agent_body_chunk_duration_seconds{route}
+zentinel_agent_body_time_exceeded_total{route, failure_mode}
+```
+
+`zentinel_agent_body_chunk_duration_seconds` is how long the agents took over
+a chunk; the client's upload waits that long before the chunk goes upstream,
+so its high buckets show where agents slow uploads down.
+`zentinel_agent_body_time_exceeded_total` counts bodies whose agents spent
+their `body-agent-time-ms`: `failure_mode="closed"` were refused with 504,
+`"open"` were sent on without the agents.
+
 ### Decompression Metrics
 
 ```rust
@@ -399,6 +425,10 @@ zentinel_scoped_circuit_breaker_state{namespace="production", service="payments"
 | `zentinel_open_connections` | Gauge | - | Open connections |
 | `zentinel_websocket_frames_total` | Counter | route, direction, opcode, decision | WS frames |
 | `zentinel_websocket_connections_total` | Counter | route | WS connections |
+| `zentinel_agent_body_chunks_total` | Counter | route | Streamed request body chunks sent to body agents |
+| `zentinel_agent_body_bytes_total` | Counter | route | Streamed request body bytes sent to body agents |
+| `zentinel_agent_body_chunk_duration_seconds` | Histogram | route | How long the body agents took over one streamed chunk |
+| `zentinel_agent_body_time_exceeded_total` | Counter | route, failure_mode | Bodies whose agents spent their `body-agent-time-ms` |
 | `zentinel_decompression_total` | Counter | encoding, result | Decompressions |
 | `zentinel_decompression_ratio` | Histogram | encoding | Decompression ratio |
 | `zentinel_shadow_requests_total` | Counter | route, upstream, result | Shadow requests |
