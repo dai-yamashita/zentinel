@@ -18,6 +18,7 @@ for details.
 
 | CalVer | Crate Version | Date | Highlights |
 |--------|---------------|------|------------|
+| [26.11_9](#26119---2026-11-26) | 0.6.63 | 2026-11-26 | **Security fixes in two bundled agents: WAF 0.5.0 matches encoded headers and bodies, GraphQL Security 0.6.0 analyzes named fragments** (read the upgrade notes); a streaming request chunk replacement reaches the upstream as its bytes |
 | [26.11_8](#26118---2026-11-25) | 0.6.62 | 2026-11-25 | **Requests over the header limits get 431, not 500** (read the upgrade notes); **`bundle install --skip-verify` refuses an archive whose readable checksum does not match**; the ZentinelSec agent is pinned at 0.6.0; geo databases are read off the async workers; the Gateway API controller asks GRPCRoute backends for the whole server's health |
 | [26.11_7](#26117---2026-11-23) | 0.6.61 | 2026-11-23 | **A busy agent can hold a request for at most its `timeout-ms`**; **a geo database cut short or failing its trial lookups stops startup** (read the upgrade notes); replaced geo databases are re-read every time |
 | [26.11_6](#26116---2026-11-23) | 0.6.60 | 2026-11-23 | Geo filter lookup cache and inference rate limit buckets are bounded; stale `cargo audit` ignores removed |
@@ -101,6 +102,37 @@ for details.
 ---
 
 ## [Unreleased]
+
+---
+
+## [26.11_9] - 2026-11-26
+
+**Crate version:** 0.6.63
+
+### Upgrade notes
+- **WAF agent 0.5.0 (#840).** `zentinel bundle install waf` installs 0.5.0.
+  Header values and request bodies are matched as sent and percent-decoded,
+  as the path and query string already were: an encoded payload in a form
+  body or a header (`id=1%27%20OR%20%271%27%3D%271`) scored nothing before and
+  now scores as it does in the query string. Values that match only once
+  decoded add detections on existing traffic; check detect-only logs before
+  tightening thresholds.
+- **GraphQL Security agent 0.6.0 (#840).** `zentinel bundle install
+  graphql-security` installs 0.6.0. Up to 0.5.0, depth, complexity, alias and
+  introspection checks ignored the selections inside named fragments, so a
+  query moved into a fragment passed those limits; such queries can now be
+  refused. Fragments that spread each other in a cycle are refused with
+  `INVALID_REQUEST` instead of exhausting the agent's stack.
+- **Streaming request chunk replacements (#841).** In `request-body-mode
+  "stream"`, an agent's replacement of a request body chunk was sent upstream
+  as the base64 text the protocol carries it in; the upstream now gets its
+  bytes. A replacement that is not valid base64 follows the body agents'
+  `failure-mode` (`closed`: 503; `open`: the original chunk is forwarded with
+  a warning). A replacement of a different length still leaves the request's
+  `Content-Length` unchanged (#842).
+
+### Dependencies
+- Bundle: `waf` 0.4.1 → 0.5.0, `graphql-security` 0.5.0 → 0.6.0 (#840).
 
 ---
 
