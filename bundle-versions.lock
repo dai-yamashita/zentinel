@@ -30,7 +30,7 @@ platforms = ["linux-x86_64", "linux-aarch64", "darwin-aarch64"]
 
 [agents]
 # Core agents (included in default bundle install)
-waf = "0.4.1"
+waf = "0.5.0"
 denylist = "0.4.0"
 
 # Security agents
@@ -42,7 +42,7 @@ content-scanner = "0.5.0"
 ai-gateway = "0.3.0"
 
 # API security agents
-graphql-security = "0.5.0"
+graphql-security = "0.6.0"
 grpc-inspector = "0.5.0"
 soap = "0.5.0"
 api-deprecation = "0.5.0"
