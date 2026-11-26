@@ -18,6 +18,7 @@ for details.
 
 | CalVer | Crate Version | Date | Highlights |
 |--------|---------------|------|------------|
+| [26.11_10](#261110---2026-11-26) | 0.6.64 | 2026-11-26 | **Security fixes in two bundled agents: Content Scanner 0.6.0 scans uploads without a `Content-Type`, MQTT Gateway 0.6.0 checks every packet in a WebSocket frame** (read the upgrade notes); `chunk-timeout-ms` applies and new `body-agent-time-ms` bounds agent time per streamed body; streamed-body metrics; a replacement chunk of another length is refused when the length was declared |
 | [26.11_9](#26119---2026-11-26) | 0.6.63 | 2026-11-26 | **Security fixes in two bundled agents: WAF 0.5.0 matches encoded headers and bodies, GraphQL Security 0.6.0 analyzes named fragments** (read the upgrade notes); a streaming request chunk replacement reaches the upstream as its bytes |
 | [26.11_8](#26118---2026-11-25) | 0.6.62 | 2026-11-25 | **Requests over the header limits get 431, not 500** (read the upgrade notes); **`bundle install --skip-verify` refuses an archive whose readable checksum does not match**; the ZentinelSec agent is pinned at 0.6.0; geo databases are read off the async workers; the Gateway API controller asks GRPCRoute backends for the whole server's health |
 | [26.11_7](#26117---2026-11-23) | 0.6.61 | 2026-11-23 | **A busy agent can hold a request for at most its `timeout-ms`**; **a geo database cut short or failing its trial lookups stops startup** (read the upgrade notes); replaced geo databases are re-read every time |
@@ -102,6 +103,52 @@ for details.
 ---
 
 ## [Unreleased]
+
+---
+
+## [26.11_10] - 2026-11-26
+
+**Crate version:** 0.6.64
+
+### Upgrade notes
+- **Content Scanner agent 0.6.0 (#850).** `zentinel bundle install
+  content-scanner` installs 0.6.0. A request without a `Content-Type`, or with
+  one naming no media type, is now scanned whatever `content_types` says;
+  before, an upload sent without the header reached the upstream unscanned.
+  Expect more bodies going to `clamd`; a detection in such a request now gets
+  `403`. A marked request that sends no body no longer stays in memory.
+- **MQTT Gateway agent 0.6.0 (#850).** `zentinel bundle install mqtt-gateway`
+  installs 0.6.0. Every MQTT packet in a WebSocket frame is checked, including
+  the continuation frames of a split message; before, only the first packet of
+  each binary frame was, and the rest reached the broker unchecked. A frame
+  that does not split cleanly into packets is dropped as a whole, and a
+  malformed packet that crashed the agent is refused.
+- **`chunk-timeout-ms` applies (#848).** In `request-body-mode "stream"` or
+  `"hybrid"`, each request body chunk call is held to the smaller of
+  `timeout-ms` and `chunk-timeout-ms`; it used to run under `timeout-ms` only.
+  With the defaults (1000 and 5000) nothing changes; a `chunk-timeout-ms`
+  below `timeout-ms` now takes effect.
+- **Replacement chunks keep their length (#847).** In stream mode, when the
+  request declared a `Content-Length`, an agent's replacement chunk of another
+  length follows the body agents' `failure-mode` (`closed`: 503; `open`: the
+  original chunk is forwarded) instead of breaking the upstream request. A
+  chunked body takes a replacement of any length.
+- **`response-body-mode` is reported (#844).** It is not applied (response
+  bodies go to agents buffered), and a value other than `"buffer"` is now
+  reported as ignored when the configuration loads and by `zentinel lint`.
+
+### Added
+- Agent setting `body-agent-time-ms`: the most time the agents may spend on
+  one streamed request body, summed over its chunk calls. Once spent, a
+  `closed` filter refuses the request with 504 and an `open` one sends the rest
+  of the body on without the agents (#848).
+- Metrics for request bodies streamed to agents, per route:
+  `zentinel_agent_body_chunks_total`, `zentinel_agent_body_bytes_total`,
+  `zentinel_agent_body_chunk_duration_seconds` and
+  `zentinel_agent_body_time_exceeded_total{failure_mode}` (#849).
+
+### Dependencies
+- Bundle: `content-scanner` 0.5.0 → 0.6.0, `mqtt-gateway` 0.5.0 → 0.6.0 (#850).
 
 ---
 
