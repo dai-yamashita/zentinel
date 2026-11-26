@@ -557,6 +557,10 @@ fn parse_single_agent(node: &kdl::KdlNode) -> Result<AgentConfig> {
     let id = get_first_arg_string(node)
         .ok_or_else(|| anyhow::anyhow!("Agent requires an ID as first argument"))?;
 
+    for problem in unapplied::agent_settings(node, &id) {
+        warn!("{}", problem);
+    }
+
     // Get agent type, accepting either the property form
     // (`agent "waf" type="waf"`) or a `type` child node. The property form is
     // what the documentation shows; the child form is what four shipped configs

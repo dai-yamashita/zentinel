@@ -477,6 +477,36 @@ pub(crate) fn listener_settings(listener: &kdl::KdlNode, listener_id: &str) -> V
         .collect()
 }
 
+/// Settings of an `agent` block that are read and not applied.
+///
+/// - `response-body-mode` other than `"buffer"`: response bodies go to agents
+///   buffered (up to the largest `max-response-body-bytes` of the route's
+///   agents) whatever it says (#835). `"buffer"` is what happens, so it is not
+///   reported.
+pub(crate) fn agent_settings(agent: &kdl::KdlNode, agent_id: &str) -> Vec<String> {
+    let place = format!("agent '{agent_id}'");
+    children(agent)
+        .filter(|setting| setting.name().value() == "response-body-mode")
+        .filter(|setting| {
+            setting
+                .entries()
+                .first()
+                .and_then(|entry| entry.value().as_string())
+                .is_some_and(|mode| mode != "buffer")
+        })
+        .map(|_| {
+            finding(
+                &place,
+                "",
+                "response-body-mode",
+                "response bodies go to agents buffered, up to the largest \
+                 'max-response-body-bytes' of the route's agents, whatever this says. Remove the \
+                 line, or set it to \"buffer\".",
+            )
+        })
+        .collect()
+}
+
 /// Settings of the `logging` block that are read and not applied.
 ///
 /// - `level` and `format`: the proxy's own log takes its level from the

@@ -900,6 +900,9 @@ fn check_values(
         }
         ("agent", Some(agent_id)) if parent == Some("agents") => {
             report(agent_failure_mode_problem(node, agent_id, context));
+            for problem in crate::kdl::unapplied::agent_settings(node, agent_id) {
+                report(Some(problem));
+            }
         }
         ("system" | "server", _) if parent.is_none() => {
             for problem in crate::kdl::server::unapplied_system_settings(node, node.name().value())

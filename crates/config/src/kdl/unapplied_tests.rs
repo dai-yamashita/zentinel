@@ -432,6 +432,33 @@ fn a_listener_max_concurrent_streams_is_reported_even_at_its_default() {
 }
 
 // ---------------------------------------------------------------------------
+// Agents
+// ---------------------------------------------------------------------------
+
+fn agent_doc(line: &str) -> Doc {
+    Doc::top_level(&format!(
+        "agents {{\n agent \"a\" type=\"custom\" {{\n unix-socket \"/tmp/a.sock\"\n events \"response_body\"\n{line}\n }}\n}}"
+    ))
+}
+
+#[test]
+fn a_response_body_mode_other_than_buffer_is_reported() {
+    for mode in ["stream", "hybrid", "hybrid:8192"] {
+        assert_reported(
+            &agent_doc(&format!("response-body-mode \"{mode}\"")),
+            "response-body-mode",
+            "agent 'a'",
+        );
+    }
+}
+
+#[test]
+fn a_response_body_mode_of_buffer_is_what_happens_and_not_reported() {
+    assert_quiet(&agent_doc("response-body-mode \"buffer\""));
+    assert_quiet(&agent_doc(""));
+}
+
+// ---------------------------------------------------------------------------
 // Logging and the WAF block
 // ---------------------------------------------------------------------------
 
