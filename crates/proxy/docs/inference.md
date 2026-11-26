@@ -84,6 +84,38 @@ The inference module provides specialized handling for LLM inference endpoints:
 └───────────────────┘
 ```
 
+## Request body
+
+The token rate limit, the token budget, cost attribution and model routing
+work from the request body, so on a route that needs it the whole body is
+read in `request_filter`, before an upstream is chosen:
+
+- On a route with `service-type "inference"` and a `rate-limit`, a `budget`
+  or `cost-attribution`, the body of every request is read. On a route with
+  `model-routing`, it is read when no `x-model` / `x-model-id` header names
+  the model. Other routes are not affected.
+- It is read up to the route's body-size limit (`policies { max-body-size }`,
+  or the global `limits { max-body-size }`); a body over it is refused with
+  `413`, and the upstream is not contacted. It is held in memory, then
+  forwarded to the upstream byte for byte.
+- It is read once: the prompt check, API schema validation and
+  `request-body-mode "inspect-first"` are given the same body.
+- The request's tokens are estimated from it (`estimation-method`), and the
+  token rate limit and the budget are checked with that estimate. That
+  estimate is also the input side of the reconciliation with the count the
+  response reports, and of the cost.
+- The model is the `x-model` header, else the `x-model-id` header, else the
+  top-level `model` string of a JSON body (the OpenAI and Anthropic request
+  shape). A header takes precedence over the body. The same model is used for
+  routing, for the estimate and for cost attribution. The `model` of a body
+  with a `Content-Encoding` other than `identity` is not read (the body is
+  not decompressed).
+- A WebSocket upgrade and a proxied MCP tool call are not read.
+
+The token checks run after the route's other request checks that do not need
+the body (request rate limits, geo filters, route filters) and before the
+prompt check.
+
 ## Token Rate Limiting
 
 Unlike request-based rate limiting, token rate limiting accounts for the actual computational cost of LLM requests.
@@ -403,6 +435,12 @@ route "/v1/chat/completions" {
     }
 }
 ```
+
+The model is taken from the `x-model` or `x-model-id` request header; when
+neither is sent, from the `model` field of the JSON request body (see
+[Request body](#request-body)). A header takes precedence over the body. A
+request that names no model goes to `default-upstream`, or to the route's
+`upstream` when there is none.
 
 ### Model Mapping for Fallback
 

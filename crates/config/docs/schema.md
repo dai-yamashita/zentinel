@@ -334,13 +334,22 @@ Responses to requests with `Authorization` (unless `Cache-Control` has `public`,
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
 | `provider` | `string` | `"generic"` | Provider: `generic`, `openai`, `anthropic` |
-| `model-header` | `string` | - | Not applied ([details](#accepted-but-not-applied)). Model routing reads the model name only from the `x-model` or `x-model-id` request header; token counting also reads `model` from the request body |
+| `model-header` | `string` | - | Not applied ([details](#accepted-but-not-applied)). Model routing and token counting read the model name from the `x-model` or `x-model-id` request header, else from the `model` field of the request body |
 | `rate-limit` | `TokenRateLimit` | - | Token-based rate limiting |
 | `budget` | `TokenBudgetConfig` | - | Token budget tracking |
 | `cost-attribution` | `CostAttributionConfig` | - | Per-model pricing |
 | `routing` | `InferenceRouting` | - | Not applied ([details](#accepted-but-not-applied)). No upstream is chosen by it; an upstream's strategy is its `load-balancing` |
-| `model-routing` | `ModelRoutingConfig` | - | Model-based upstream routing: `model "<pattern>" upstream="<id>"` rules and `default-upstream "<id>"`, written directly in the block (a `mappings { mapping ... }` block is not read) |
+| `model-routing` | `ModelRoutingConfig` | - | Model-based upstream routing: `model "<pattern>" upstream="<id>"` rules and `default-upstream "<id>"`, written directly in the block (a `mappings { mapping ... }` block is not read). The model is the `x-model` or `x-model-id` request header; when neither is sent, the `model` field of the JSON request body |
 | `guardrails` | `GuardrailsConfig` | - | Semantic guardrails |
+
+On a route with a `rate-limit`, a `budget` or `cost-attribution` (and
+`service-type "inference"`), and on a route with `model-routing` when no
+`x-model` / `x-model-id` header names the model, the whole request body is
+read before an upstream is chosen, up to the route's body-size limit (`413`
+above it), and then forwarded unchanged. The token estimate of the request
+(`estimation-method`) is made from that body, so the token rate limit and the
+budget count the prompt. See
+[Request body](../../proxy/docs/inference.md#request-body).
 
 ### TokenRateLimit
 
@@ -349,7 +358,7 @@ Responses to requests with `Authorization` (unless `Cache-Control` has `public`,
 | `tokens-per-minute` | `u64` | **required** | Max tokens per minute |
 | `requests-per-minute` | `u64` | - | Max requests per minute |
 | `burst-tokens` | `u64` | `10000` | Burst token allowance |
-| `estimation-method` | `string` | `"chars"` | Token estimation: `chars`, `words`, `tiktoken` |
+| `estimation-method` | `string` | `"chars"` | How the request's tokens are estimated from its body: `chars`, `words`, `tiktoken` |
 
 ### TokenBudgetConfig
 
@@ -1122,7 +1131,7 @@ whatever value is written, including the default.
 | `max-connections`, `max-idle`, `max-lifetime-secs` (`max-lifetime`) | upstream `connection-pool` | Not applied. `idle-timeout-secs` is |
 | `level`, `format` | `observability { logging }` | The proxy's own log takes its level from `RUST_LOG` (`info`, or `debug` with `--verbose`) and is written as text. The `level` of `error-log` and the `format` of `access-log` are applied |
 | `inspect-response-body` | `waf { body-inspection }` | A response body goes to the agents that subscribe to the `response-body` event |
-| `model-header` | `inference` | It names no header that is read. Model routing reads the model name only from the `x-model` or `x-model-id` request header, and token counting also reads `model` from the request body |
+| `model-header` | `inference` | It names no header that is read. The model name is read from the `x-model` or `x-model-id` request header, else from the `model` field of the request body |
 | `routing { strategy, queue-depth-header }` | `inference` | No upstream is chosen by it. An upstream's strategy is its `load-balancing` setting |
 
 A setting leaves this list when the proxy starts to apply it.

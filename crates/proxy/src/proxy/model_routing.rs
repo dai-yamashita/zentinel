@@ -136,9 +136,54 @@ pub fn extract_model_from_headers(headers: &http::HeaderMap) -> Option<String> {
     None
 }
 
+/// Extract the model name from a request body.
+///
+/// Reads the top-level `model` string of a JSON body, the shape of OpenAI
+/// and Anthropic requests (`{"model": "gpt-4o", "messages": [...]}`).
+/// A body that is not JSON, or has no non-empty string `model`, names none.
+pub fn extract_model_from_body(body: &[u8]) -> Option<String> {
+    let json: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let model = json.get("model")?.as_str()?.trim();
+    (!model.is_empty()).then(|| model.to_string())
+}
+
+/// The model a request names: the `x-model` / `x-model-id` header, else
+/// the body's `model` field. The header takes precedence.
+pub fn extract_request_model(headers: &http::HeaderMap, body: &[u8]) -> Option<String> {
+    extract_model_from_headers(headers).or_else(|| extract_model_from_body(body))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_model_from_body() {
+        assert_eq!(
+            extract_model_from_body(br#"{"model":"gpt-4o","messages":[]}"#),
+            Some("gpt-4o".to_string())
+        );
+        assert_eq!(extract_model_from_body(br#"{"model":"  "}"#), None);
+        assert_eq!(extract_model_from_body(br#"{"model":4}"#), None);
+        assert_eq!(extract_model_from_body(br#"{"messages":[]}"#), None);
+        assert_eq!(extract_model_from_body(b"not json"), None);
+        assert_eq!(extract_model_from_body(b""), None);
+    }
+
+    #[test]
+    fn test_request_model_header_precedence() {
+        let body = br#"{"model":"from-body"}"#;
+        let mut headers = http::HeaderMap::new();
+        assert_eq!(
+            extract_request_model(&headers, body),
+            Some("from-body".to_string())
+        );
+        headers.insert("x-model-id", "from-header".parse().unwrap());
+        assert_eq!(
+            extract_request_model(&headers, body),
+            Some("from-header".to_string())
+        );
+    }
 
     fn create_test_config() -> ModelRoutingConfig {
         ModelRoutingConfig {

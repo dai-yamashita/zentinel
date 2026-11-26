@@ -225,8 +225,8 @@ fn hint(block: &str, key: &str) -> Option<&'static str> {
              default-upstream \"<id>\"."
         }
         ("model-routing", "model-header") => {
-            "it is not read here. Model routing reads the model name only from the 'x-model' or \
-             'x-model-id' request header."
+            "it is not read here. Model routing reads the model name from the 'x-model' or \
+             'x-model-id' request header, else from the 'model' field of the request body."
         }
         ("cost-attribution", "models") => {
             "per-model prices are written in a 'pricing' block, as model \"<pattern>\" { \
@@ -319,9 +319,9 @@ fn check_shape(node: &kdl::KdlNode, shape: &Shape, place: &str, found: &mut Vec<
 /// - `cache { vary-headers ... }`: which request headers keep cached entries
 ///   apart is decided by the response's `Vary` header.
 /// - `cache { ignore-query-params ... }`: the cache key is the request URI.
-/// - `inference { model-header ... }`: model routing reads the model name only
-///   from the `x-model` or `x-model-id` request header, and token counting also
-///   reads `model` from the request body.
+/// - `inference { model-header ... }`: the model name is read from the
+///   `x-model` or `x-model-id` request header, else from the `model` field of
+///   the request body.
 /// - `inference { routing { ... } }`: no upstream is chosen by it.
 ///
 /// And every key or property in `fallback` and `inference`, and the blocks
@@ -348,9 +348,9 @@ pub(crate) fn route_settings(route: &kdl::KdlNode, route_id: &str) -> Vec<String
                             &place,
                             "inference",
                             "model-header",
-                            "it names no header that is read. Model routing reads the model name \
-                             only from the 'x-model' or 'x-model-id' request header, and token \
-                             counting also reads 'model' from the request body. Remove the line.",
+                            "it names no header that is read. The model name is read from the \
+                             'x-model' or 'x-model-id' request header, else from the 'model' \
+                             field of the request body. Remove the line.",
                         )),
                         "routing" => found.push(finding(
                             &place,

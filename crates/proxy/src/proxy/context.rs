@@ -575,6 +575,11 @@ pub struct RequestContext {
     pub(crate) inference_rate_limit_key: Option<String>,
     /// Model name detected from request
     pub(crate) inference_model: Option<String>,
+    /// The `model` field of the request body, on an inference route whose
+    /// body is read before the upstream is chosen (see
+    /// `read_inference_request_body`). Model routing falls back to it when
+    /// no `x-model` / `x-model-id` header names a model.
+    pub(crate) inference_body_model: Option<String>,
     /// Provider override from model-based routing (for cross-provider routing)
     pub(crate) inference_provider_override: Option<zentinel_config::InferenceProvider>,
     /// Whether model-based routing was used to select the upstream
@@ -777,6 +782,7 @@ impl RequestContext {
             inference_estimated_tokens: 0,
             inference_rate_limit_key: None,
             inference_model: None,
+            inference_body_model: None,
             inference_provider_override: None,
             model_routing_used: false,
             inference_actual_tokens: None,

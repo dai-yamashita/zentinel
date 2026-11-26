@@ -1005,8 +1005,10 @@ impl ProxyHttp for ZentinelProxy {
         let mut model_routing_applied = false;
         if let Some(ref inference) = route_match.config.inference {
             if let Some(ref model_routing) = inference.model_routing {
-                // Try to extract model from headers (fast path - no body parsing needed)
-                let model = model_routing::extract_model_from_headers(&req_header.headers);
+                // The `x-model` / `x-model-id` header, else the `model` field
+                // of the body, read in `request_filter` when no header names one.
+                let model = model_routing::extract_model_from_headers(&req_header.headers)
+                    .or_else(|| ctx.inference_body_model.clone());
 
                 if let Some(ref model_name) = model {
                     // Find upstream for this model
@@ -1050,12 +1052,12 @@ impl ProxyHttp for ZentinelProxy {
                         }
                     }
                 } else if let Some(ref default_upstream) = model_routing.default_upstream {
-                    // No model in headers, use default upstream
+                    // No model in the headers or the body, use default upstream
                     debug!(
                         correlation_id = %ctx.trace_id,
                         route_id = %route_match.route_id,
                         upstream = %default_upstream,
-                        "Model-based routing using default upstream (no model header)"
+                        "Model-based routing using default upstream (no model named)"
                     );
                     ctx.record_model_routing(default_upstream, None, None);
                     model_routing_applied = true;
@@ -1642,204 +1644,6 @@ impl ProxyHttp for ZentinelProxy {
             }
         }
 
-        // Inference rate limiting (token-based, for LLM/AI routes)
-        // This runs after regular rate limiting and checks service type
-        if let Some(route_id) = ctx.route_id.as_deref() {
-            if let Some(ref route_config) = ctx.route_config {
-                if route_config.service_type == zentinel_config::ServiceType::Inference
-                    && self.inference_rate_limit_manager.has_route(route_id)
-                {
-                    // For inference rate limiting, we need access to the request body
-                    // to estimate tokens. We'll use buffered body if available.
-                    let headers = &session.req_header().headers;
-
-                    // Try to get buffered body, or use empty (will estimate from headers only)
-                    let body = ctx.body_buffer.as_slice();
-
-                    // Use the client as the rate limit key (could be enhanced to use API key
-                    // header). An IPv6 client is keyed by its network, like every other
-                    // per-client limit.
-                    let client_key = self.rate_limit_manager.client_key(&ctx.client_ip);
-                    let rate_limit_key: &str = &client_key;
-
-                    if let Some(check_result) = self.inference_rate_limit_manager.check(
-                        route_id,
-                        rate_limit_key,
-                        headers,
-                        body,
-                    ) {
-                        // Store inference rate limiting context for recording actual tokens later
-                        ctx.inference_rate_limit_enabled = true;
-                        ctx.inference_estimated_tokens = check_result.estimated_tokens;
-                        ctx.inference_rate_limit_key = Some(rate_limit_key.to_string());
-                        ctx.inference_model = check_result.model.clone();
-
-                        if !check_result.is_allowed() {
-                            let retry_after_ms = check_result.retry_after_ms();
-                            let retry_after_secs = retry_after_ms.div_ceil(1000);
-
-                            warn!(
-                                correlation_id = %ctx.trace_id,
-                                route_id = route_id,
-                                client_ip = %ctx.client_ip,
-                                estimated_tokens = check_result.estimated_tokens,
-                                model = ?check_result.model,
-                                retry_after_ms = retry_after_ms,
-                                "Inference rate limit exceeded (tokens)"
-                            );
-                            self.metrics
-                                .record_blocked_request("inference_rate_limited");
-
-                            // Audit log the token rate limit
-                            let audit_entry = AuditLogEntry::new(
-                                &ctx.trace_id,
-                                AuditEventType::RateLimitExceeded,
-                                &ctx.method,
-                                &ctx.path,
-                                &ctx.client_ip,
-                            )
-                            .with_route_id(route_id)
-                            .with_status_code(429)
-                            .with_reason(format!(
-                                "Token rate limit exceeded: estimated {} tokens, model={:?}",
-                                check_result.estimated_tokens, check_result.model
-                            ));
-                            self.log_manager.log_audit(&audit_entry);
-
-                            // Send 429 response with appropriate headers
-                            let body = "Token rate limit exceeded";
-                            let reset_at = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs()
-                                + retry_after_secs;
-
-                            // Use simplified error write for inference rate limit
-                            let refusal = rate_limit_refusal(
-                                429,
-                                body,
-                                handlers::rate_limit_headers(
-                                    0, // No request limit
-                                    0, // No remaining
-                                    reset_at,
-                                    retry_after_secs,
-                                ),
-                            );
-                            self.write_proxy_error(session, ctx, refusal).await?;
-                            return Ok(true); // Request complete, don't continue
-                        }
-
-                        trace!(
-                            correlation_id = %ctx.trace_id,
-                            route_id = route_id,
-                            estimated_tokens = check_result.estimated_tokens,
-                            model = ?check_result.model,
-                            "Inference rate limit check passed"
-                        );
-
-                        // Check budget tracking (cumulative per-period limits)
-                        if self.inference_rate_limit_manager.has_budget(route_id) {
-                            ctx.inference_budget_enabled = true;
-
-                            if let Some(budget_result) =
-                                self.inference_rate_limit_manager.check_budget(
-                                    route_id,
-                                    rate_limit_key,
-                                    check_result.estimated_tokens,
-                                )
-                            {
-                                if !budget_result.is_allowed() {
-                                    let retry_after_secs = budget_result.retry_after_secs();
-
-                                    warn!(
-                                        correlation_id = %ctx.trace_id,
-                                        route_id = route_id,
-                                        client_ip = %ctx.client_ip,
-                                        estimated_tokens = check_result.estimated_tokens,
-                                        retry_after_secs = retry_after_secs,
-                                        "Token budget exhausted"
-                                    );
-
-                                    ctx.inference_budget_exhausted = true;
-                                    self.metrics.record_blocked_request("budget_exhausted");
-
-                                    // Audit log the budget exhaustion
-                                    let audit_entry = AuditLogEntry::new(
-                                        &ctx.trace_id,
-                                        AuditEventType::RateLimitExceeded,
-                                        &ctx.method,
-                                        &ctx.path,
-                                        &ctx.client_ip,
-                                    )
-                                    .with_route_id(route_id)
-                                    .with_status_code(429)
-                                    .with_reason("Token budget exhausted".to_string());
-                                    self.log_manager.log_audit(&audit_entry);
-
-                                    // Send 429 response with budget headers
-                                    let body = "Token budget exhausted";
-                                    let reset_at = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_secs()
-                                        + retry_after_secs;
-
-                                    let refusal = rate_limit_refusal(
-                                        429,
-                                        body,
-                                        handlers::rate_limit_headers(
-                                            0,
-                                            0,
-                                            reset_at,
-                                            retry_after_secs,
-                                        ),
-                                    );
-                                    self.write_proxy_error(session, ctx, refusal).await?;
-                                    return Ok(true);
-                                }
-
-                                // Capture budget status for response headers
-                                let remaining = match &budget_result {
-                                    zentinel_common::budget::BudgetCheckResult::Allowed {
-                                        remaining,
-                                    } => *remaining as i64,
-                                    zentinel_common::budget::BudgetCheckResult::Soft {
-                                        remaining,
-                                        ..
-                                    } => *remaining,
-                                    _ => 0,
-                                };
-                                ctx.inference_budget_remaining = Some(remaining);
-
-                                // Get period reset time from budget status
-                                if let Some(status) = self
-                                    .inference_rate_limit_manager
-                                    .budget_status(route_id, rate_limit_key)
-                                {
-                                    ctx.inference_budget_period_reset = Some(status.period_end);
-                                }
-
-                                trace!(
-                                    correlation_id = %ctx.trace_id,
-                                    route_id = route_id,
-                                    budget_remaining = remaining,
-                                    "Token budget check passed"
-                                );
-                            }
-                        }
-
-                        // Check if cost attribution is enabled
-                        if self
-                            .inference_rate_limit_manager
-                            .has_cost_attribution(route_id)
-                        {
-                            ctx.inference_cost_enabled = true;
-                        }
-                    }
-                }
-            }
-        }
-
         // Geo filtering
         if let Some(route_id) = ctx.route_id.as_deref() {
             if let Some(ref route_config) = ctx.route_config {
@@ -2070,6 +1874,18 @@ impl ProxyHttp for ZentinelProxy {
                 };
                 return self.handle_builtin_route(session, ctx, &route_match).await;
             }
+        }
+
+        // The body of an inference route whose token limits, budget, cost
+        // attribution or model routing need it is read here, once the checks
+        // that can refuse a request without reading one are done, and before
+        // an upstream is chosen.
+        self.read_inference_request_body(session, ctx).await?;
+
+        // Token rate limit and budget of an inference route, on the estimate
+        // of that body.
+        if self.check_inference_limits(session, ctx).await? {
+            return Ok(true);
         }
 
         // Prompt check of an inference route. It needs the request body, so
@@ -6381,6 +6197,289 @@ impl ZentinelProxy {
             body.extend_from_slice(&chunk);
         }
         Ok(Bytes::from(body))
+    }
+
+    /// Read the whole request body of an inference route that needs it,
+    /// before an upstream is chosen.
+    ///
+    /// The token rate limit, the token budget and cost attribution estimate
+    /// the request's tokens from its body, and model routing reads the model
+    /// from the body's `model` field when no `x-model` / `x-model-id` header
+    /// names one. The body is read once, through the same path as the prompt
+    /// check (bounded by the route's body-size limit, 413 above it), and kept
+    /// in `validated_request_body`, from which the prompt check, API schema
+    /// validation and `inspect-first` take it and `request_body_filter`
+    /// forwards it unchanged.
+    ///
+    /// A route that needs none of this, a WebSocket upgrade and a proxied MCP
+    /// tool call are left alone.
+    async fn read_inference_request_body(
+        &self,
+        session: &mut Session,
+        ctx: &mut RequestContext,
+    ) -> Result<(), Box<Error>> {
+        let Some(route_config) = ctx.route_config.as_ref() else {
+            return Ok(());
+        };
+        let Some(inference) = route_config.inference.as_ref() else {
+            return Ok(());
+        };
+        if ctx.is_websocket_upgrade || ctx.mcp_proxied_call.is_some() {
+            return Ok(());
+        }
+        let headers = &session.req_header().headers;
+        // Token rate limit, budget or cost attribution (the routes
+        // `check_inference_limits` runs on).
+        let counts_tokens = route_config.service_type == zentinel_config::ServiceType::Inference
+            && ctx
+                .route_id
+                .as_deref()
+                .is_some_and(|route_id| self.inference_rate_limit_manager.has_route(route_id));
+        // Model routing needs the body only when no header names the model.
+        let routes_by_body = inference.model_routing.is_some()
+            && model_routing::extract_model_from_headers(headers).is_none();
+        if !counts_tokens && !routes_by_body {
+            return Ok(());
+        }
+        // A body with a `Content-Encoding` is not decompressed here, so its
+        // `model` is not read.
+        let encoded = has_content_encoding(headers);
+
+        let body = match &ctx.validated_request_body {
+            Some(body) => body.clone(),
+            None => {
+                self.read_whole_request_body(session, ctx, "inference")
+                    .await?
+            }
+        };
+        if body.is_empty() {
+            return Ok(());
+        }
+        if !encoded {
+            ctx.inference_body_model = model_routing::extract_model_from_body(&body);
+        }
+        trace!(
+            correlation_id = %ctx.trace_id,
+            body_bytes = body.len(),
+            body_model = ?ctx.inference_body_model,
+            "Read the inference request body before the upstream"
+        );
+        ctx.validated_request_body = Some(body);
+        Ok(())
+    }
+
+    /// The token rate limit and the token budget of an inference route,
+    /// checked on the estimate of the request body read by
+    /// `read_inference_request_body`.
+    ///
+    /// Returns `Ok(true)` when the response has been written and the request
+    /// must not be forwarded.
+    async fn check_inference_limits(
+        &self,
+        session: &mut Session,
+        ctx: &mut RequestContext,
+    ) -> Result<bool, Box<Error>> {
+        if let Some(route_id) = ctx.route_id.as_deref() {
+            if let Some(ref route_config) = ctx.route_config {
+                if route_config.service_type == zentinel_config::ServiceType::Inference
+                    && self.inference_rate_limit_manager.has_route(route_id)
+                {
+                    // The body was read whole by `read_inference_request_body`
+                    // (empty for a request without one).
+                    let body = ctx.validated_request_body.clone().unwrap_or_default();
+                    let headers = &session.req_header().headers;
+
+                    // Use the client as the rate limit key (could be enhanced to use API key
+                    // header). An IPv6 client is keyed by its network, like every other
+                    // per-client limit.
+                    let client_key = self.rate_limit_manager.client_key(&ctx.client_ip);
+                    let rate_limit_key: &str = &client_key;
+
+                    if let Some(check_result) = self.inference_rate_limit_manager.check(
+                        route_id,
+                        rate_limit_key,
+                        headers,
+                        &body,
+                    ) {
+                        // Store inference rate limiting context for recording actual tokens later
+                        ctx.inference_rate_limit_enabled = true;
+                        ctx.inference_estimated_tokens = check_result.estimated_tokens;
+                        // The estimate is of the request: the input side of the
+                        // reconciliation and of the cost.
+                        ctx.inference_input_tokens = check_result.estimated_tokens;
+                        ctx.inference_rate_limit_key = Some(rate_limit_key.to_string());
+                        // The model the request names, as model routing reads it
+                        // (header first, then the body), else the provider's guess.
+                        ctx.inference_model = model_routing::extract_model_from_headers(headers)
+                            .or_else(|| ctx.inference_body_model.clone())
+                            .or(check_result.model.clone());
+
+                        if !check_result.is_allowed() {
+                            let retry_after_ms = check_result.retry_after_ms();
+                            let retry_after_secs = retry_after_ms.div_ceil(1000);
+
+                            warn!(
+                                correlation_id = %ctx.trace_id,
+                                route_id = route_id,
+                                client_ip = %ctx.client_ip,
+                                estimated_tokens = check_result.estimated_tokens,
+                                model = ?check_result.model,
+                                retry_after_ms = retry_after_ms,
+                                "Inference rate limit exceeded (tokens)"
+                            );
+                            self.metrics
+                                .record_blocked_request("inference_rate_limited");
+
+                            // Audit log the token rate limit
+                            let audit_entry = AuditLogEntry::new(
+                                &ctx.trace_id,
+                                AuditEventType::RateLimitExceeded,
+                                &ctx.method,
+                                &ctx.path,
+                                &ctx.client_ip,
+                            )
+                            .with_route_id(route_id)
+                            .with_status_code(429)
+                            .with_reason(format!(
+                                "Token rate limit exceeded: estimated {} tokens, model={:?}",
+                                check_result.estimated_tokens, check_result.model
+                            ));
+                            self.log_manager.log_audit(&audit_entry);
+
+                            // Send 429 response with appropriate headers
+                            let body = "Token rate limit exceeded";
+                            let reset_at = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs()
+                                + retry_after_secs;
+
+                            // Use simplified error write for inference rate limit
+                            let refusal = rate_limit_refusal(
+                                429,
+                                body,
+                                handlers::rate_limit_headers(
+                                    0, // No request limit
+                                    0, // No remaining
+                                    reset_at,
+                                    retry_after_secs,
+                                ),
+                            );
+                            self.write_proxy_error(session, ctx, refusal).await?;
+                            return Ok(true); // Request complete, don't continue
+                        }
+
+                        trace!(
+                            correlation_id = %ctx.trace_id,
+                            route_id = route_id,
+                            estimated_tokens = check_result.estimated_tokens,
+                            model = ?check_result.model,
+                            "Inference rate limit check passed"
+                        );
+
+                        // Check budget tracking (cumulative per-period limits)
+                        if self.inference_rate_limit_manager.has_budget(route_id) {
+                            ctx.inference_budget_enabled = true;
+
+                            if let Some(budget_result) =
+                                self.inference_rate_limit_manager.check_budget(
+                                    route_id,
+                                    rate_limit_key,
+                                    check_result.estimated_tokens,
+                                )
+                            {
+                                if !budget_result.is_allowed() {
+                                    let retry_after_secs = budget_result.retry_after_secs();
+
+                                    warn!(
+                                        correlation_id = %ctx.trace_id,
+                                        route_id = route_id,
+                                        client_ip = %ctx.client_ip,
+                                        estimated_tokens = check_result.estimated_tokens,
+                                        retry_after_secs = retry_after_secs,
+                                        "Token budget exhausted"
+                                    );
+
+                                    ctx.inference_budget_exhausted = true;
+                                    self.metrics.record_blocked_request("budget_exhausted");
+
+                                    // Audit log the budget exhaustion
+                                    let audit_entry = AuditLogEntry::new(
+                                        &ctx.trace_id,
+                                        AuditEventType::RateLimitExceeded,
+                                        &ctx.method,
+                                        &ctx.path,
+                                        &ctx.client_ip,
+                                    )
+                                    .with_route_id(route_id)
+                                    .with_status_code(429)
+                                    .with_reason("Token budget exhausted".to_string());
+                                    self.log_manager.log_audit(&audit_entry);
+
+                                    // Send 429 response with budget headers
+                                    let body = "Token budget exhausted";
+                                    let reset_at = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs()
+                                        + retry_after_secs;
+
+                                    let refusal = rate_limit_refusal(
+                                        429,
+                                        body,
+                                        handlers::rate_limit_headers(
+                                            0,
+                                            0,
+                                            reset_at,
+                                            retry_after_secs,
+                                        ),
+                                    );
+                                    self.write_proxy_error(session, ctx, refusal).await?;
+                                    return Ok(true);
+                                }
+
+                                // Capture budget status for response headers
+                                let remaining = match &budget_result {
+                                    zentinel_common::budget::BudgetCheckResult::Allowed {
+                                        remaining,
+                                    } => *remaining as i64,
+                                    zentinel_common::budget::BudgetCheckResult::Soft {
+                                        remaining,
+                                        ..
+                                    } => *remaining,
+                                    _ => 0,
+                                };
+                                ctx.inference_budget_remaining = Some(remaining);
+
+                                // Get period reset time from budget status
+                                if let Some(status) = self
+                                    .inference_rate_limit_manager
+                                    .budget_status(route_id, rate_limit_key)
+                                {
+                                    ctx.inference_budget_period_reset = Some(status.period_end);
+                                }
+
+                                trace!(
+                                    correlation_id = %ctx.trace_id,
+                                    route_id = route_id,
+                                    budget_remaining = remaining,
+                                    "Token budget check passed"
+                                );
+                            }
+                        }
+
+                        // Check if cost attribution is enabled
+                        if self
+                            .inference_rate_limit_manager
+                            .has_cost_attribution(route_id)
+                        {
+                            ctx.inference_cost_enabled = true;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// The prompt check of an inference route: the `guardrails` block's
