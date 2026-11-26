@@ -188,6 +188,7 @@ Request routing configuration.
 | `websocket-max-frame-size` | `bytes` | `1MB` | Largest WebSocket frame payload the route's inspection decodes, as a byte count or a size such as `"4MB"`. Between 1 byte and 16MB. A larger frame closes the connection with status 1009. A frame too large for an agent's transport to carry in one message fails the call to the agent and follows its filter's `failure-mode`. Only used with `websocket-inspection`, and `zentinel lint` warns when it is set without |
 | `shadow` | `ShadowConfig` | - | Traffic mirroring config |
 | `fallback` | `FallbackConfig` | - | Fallback routing config. A block of the route itself, beside `inference`; inside `inference` it is not read |
+| `mcp` | `McpConfig` | - | Model Context Protocol policy (see [McpConfig](#mcpconfig)) |
 
 ### RetryPolicy
 
@@ -399,6 +400,46 @@ WebSocket upgrade and a proxied MCP tool call are not checked.
 | `fallback-upstream` | `[FallbackUpstream]` | `[]` | Ordered fallback upstreams, one `fallback-upstream "<id>" { provider ...; model-mapping { ... } }` node each. An `upstream` node, or `model-mapping` directly in `fallback`, is not read |
 | `triggers` | `FallbackTriggers` | `{}` | Conditions that trigger fallback |
 | `max-attempts` | `u32` | `3` | Max fallback attempts |
+
+### McpConfig
+
+The route's `mcp` block. Method and tool policy is resolved from the JSON-RPC
+request body (`method`, and `params.name` or `params.uri`), never from the
+mirrored `Mcp-Method`, `Mcp-Name` and `Mcp-Param-*` headers. A mirrored
+header that is present must agree with the body, whatever protocol revision
+the request claims; one that disagrees is refused.
+
+| Property | Type | Default | Description |
+|----------|------|---------|-------------|
+| `require-validated-version` | `bool` | unset | Which `MCP-Protocol-Version` values are accepted; see [Protocol versions](#mcp-protocol-versions). Unset, `#true` and `#false` are three different settings |
+| `validate-param-headers` | `bool` | `#true` | Check `Mcp-Param-*` headers against the tool arguments they mirror. Only a header whose suffix matches an argument name (case-insensitively) can be checked |
+| `filter-tool-list` | `bool` | `#true` | Remove tools, resources and prompts a call would be refused for from `tools/list`, `resources/list` and `prompts/list` responses. Does nothing unless a tool allow or deny list is set |
+| `on-uninspectable-body` | `string` | `"deny"` | A body that cannot be parsed: `deny` or `allow` |
+| `methods` | block | - | `allow "<method>" ...` and `deny "<method>" ...`. An empty allow list means all methods; the deny list applies after it |
+| `tools` | block | - | `allow "<name>" ...` and `deny "<name>" ...` for tools and resources, applied the same way |
+| `upstreams` | block | - | MCP servers presented as one endpoint, one `upstream "<id>" prefix="<p>"` each |
+| `session-key` | `string` | - | Hex-encoded 32-byte key for the session token; required with more than one entry in `upstreams` |
+
+<a id="mcp-protocol-versions"></a>
+#### Protocol versions
+
+| `require-validated-version` | Accepted `MCP-Protocol-Version` | Refused |
+|---|---|---|
+| unset (default) | `2026-07-28` or a later dated revision; `2025-03-26`, `2025-06-18`, `2025-11-25`; no header, which is taken as `2025-03-26` | Any other value, such as `2024-11-05`, `2026-01-01` or `latest` |
+| `#true` | `2026-07-28` or a later dated revision | Any earlier revision, any other value, and no header |
+| `#false` | Any value, and no header | Nothing on account of the version |
+
+The same method and tool policy, and the same header checks, apply to every
+accepted request. `2026-07-28` is the first revision that itself requires
+mirrored headers to match the body; earlier revisions do not define those
+headers, so a client of one sends none, and the proxy checks any that are
+present. A missing header is taken as `2025-03-26` because the MCP
+specification tells servers to assume that revision when the header is
+absent; on the earlier revisions the `initialize` request carries no header,
+since the version is negotiated in its body.
+
+Set `#true` to accept only clients on `2026-07-28` and later. A refused request
+gets `403`, or a JSON-RPC error on a route with `upstreams`.
 
 ---
 

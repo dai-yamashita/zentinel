@@ -133,7 +133,11 @@ impl From<&McpConfig> for mcp::Policy {
             denied_methods: c.denied_methods.iter().cloned().collect(),
             allowed_targets: c.allowed_tools.iter().cloned().collect(),
             denied_targets: c.denied_tools.iter().cloned().collect(),
-            require_validated_version: c.require_validated_version,
+            protocol_versions: match c.require_validated_version {
+                None => mcp::ProtocolVersions::KnownRevisions,
+                Some(true) => mcp::ProtocolVersions::ValidatedOnly,
+                Some(false) => mcp::ProtocolVersions::Any,
+            },
             validate_param_headers: c.validate_param_headers,
             on_uninspectable: match c.on_uninspectable_body {
                 ConfigUninspectable::Deny => mcp::UninspectableBody::Deny,
@@ -171,7 +175,7 @@ mod conversion_tests {
             denied_methods: vec!["resources/read".into()],
             allowed_tools: vec!["get_weather".into()],
             denied_tools: vec!["execute_sql".into()],
-            require_validated_version: false,
+            require_validated_version: Some(false),
             validate_param_headers: false,
             on_uninspectable_body: ConfigUninspectable::Allow,
             // Not part of `Policy`: listing filtering happens on the response
@@ -188,10 +192,34 @@ mod conversion_tests {
         assert!(p.denied_methods.contains("resources/read"));
         assert!(p.allowed_targets.contains("get_weather"));
         assert!(p.denied_targets.contains("execute_sql"));
-        // Both of these default to true; asserting the false case is the point.
-        assert!(!p.require_validated_version);
+        // Neither is the default; asserting the non-default case is the point.
+        assert_eq!(p.protocol_versions, mcp::ProtocolVersions::Any);
         assert!(!p.validate_param_headers);
         assert_eq!(p.on_uninspectable, mcp::UninspectableBody::Allow);
+    }
+
+    /// The setting has three states and each maps to its own policy; unset in
+    /// particular must not collapse into either explicit value.
+    #[test]
+    fn require_validated_version_maps_all_three_states() {
+        let with = |v| {
+            mcp::Policy::from(&McpConfig {
+                require_validated_version: v,
+                ..McpConfig::default()
+            })
+        };
+        assert_eq!(
+            with(None).protocol_versions,
+            mcp::ProtocolVersions::KnownRevisions
+        );
+        assert_eq!(
+            with(Some(true)).protocol_versions,
+            mcp::ProtocolVersions::ValidatedOnly
+        );
+        assert_eq!(
+            with(Some(false)).protocol_versions,
+            mcp::ProtocolVersions::Any
+        );
     }
 
     #[test]

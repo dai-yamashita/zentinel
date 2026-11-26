@@ -154,11 +154,78 @@ fn a_header_that_disagrees_with_the_body_is_denied() {
     }
 }
 
-/// A revision predating mandatory header/body agreement is refused by default,
-/// or the check is optional at the caller's discretion.
+/// The earlier published revisions are accepted by default and held to the
+/// same body-based policy: the allowed tool passes, the denied one does not.
 #[test]
-fn an_unvalidated_protocol_version_is_denied_by_default() {
+fn an_earlier_protocol_version_is_accepted_by_default_with_the_same_policy() {
     let config = config_with(TOOLS_BLOCK);
+    for version in ["2025-03-26", "2025-06-18", "2025-11-25"] {
+        let headers = vec![("mcp-protocol-version".to_string(), version.to_string())];
+
+        let outcome = decide(route(&config, "mcp"), &headers, &call("get_weather"));
+        assert!(
+            matches!(outcome, Some(Outcome::Allow { .. })),
+            "{version}: expected Allow, got {outcome:?}"
+        );
+
+        let outcome = decide(route(&config, "mcp"), &headers, &call("execute_sql"));
+        assert!(
+            matches!(outcome, Some(Outcome::Deny { .. })),
+            "{version}: expected Deny, got {outcome:?}"
+        );
+    }
+
+    // No header at all is taken as 2025-03-26.
+    let outcome = decide(route(&config, "mcp"), &[], &call("execute_sql"));
+    assert!(
+        matches!(outcome, Some(Outcome::Deny { .. })),
+        "expected Deny, got {outcome:?}"
+    );
+}
+
+/// Claiming an earlier revision does not let a spoofed header through.
+#[test]
+fn an_earlier_protocol_version_does_not_excuse_a_disagreeing_header() {
+    let config = config_with(TOOLS_BLOCK);
+    let mut headers = mcp_headers("get_weather");
+    headers[0].1 = "2025-06-18".to_string();
+
+    let outcome = decide(route(&config, "mcp"), &headers, &call("delete_everything"));
+    assert!(
+        matches!(outcome, Some(Outcome::Deny { .. })),
+        "expected Deny, got {outcome:?}"
+    );
+}
+
+#[test]
+fn an_unknown_protocol_version_is_denied_by_default() {
+    let config = config_with(TOOLS_BLOCK);
+    let mut headers = mcp_headers("get_weather");
+    headers[0].1 = "2026-01-01".to_string();
+
+    let outcome = decide(route(&config, "mcp"), &headers, &call("get_weather"));
+    match outcome {
+        Some(Outcome::Deny { reason, .. }) => {
+            assert!(reason.contains("not a known MCP revision"), "{reason}");
+        }
+        other => panic!("expected Deny, got {other:?}"),
+    }
+}
+
+/// `require-validated-version #true` keeps the strict behaviour: a revision
+/// predating mandatory header/body agreement is refused.
+#[test]
+fn require_validated_version_true_refuses_earlier_revisions() {
+    let config = config_with(
+        r#"
+                mcp {
+                    require-validated-version #true
+                    tools {
+                        allow "get_weather"
+                    }
+                }
+"#,
+    );
     let mut headers = mcp_headers("get_weather");
     headers[0].1 = "2025-06-18".to_string();
 
@@ -166,6 +233,20 @@ fn an_unvalidated_protocol_version_is_denied_by_default() {
     assert!(
         matches!(outcome, Some(Outcome::Deny { .. })),
         "expected Deny, got {outcome:?}"
+    );
+    let outcome = decide(route(&config, "mcp"), &[], &call("get_weather"));
+    assert!(
+        matches!(outcome, Some(Outcome::Deny { .. })),
+        "expected Deny, got {outcome:?}"
+    );
+    let outcome = decide(
+        route(&config, "mcp"),
+        &mcp_headers("get_weather"),
+        &call("get_weather"),
+    );
+    assert!(
+        matches!(outcome, Some(Outcome::Allow { .. })),
+        "expected Allow, got {outcome:?}"
     );
 }
 
@@ -184,12 +265,12 @@ fn require_validated_version_false_reaches_the_evaluator() {
 "#,
     );
     let mut headers = mcp_headers("get_weather");
-    headers[0].1 = "2025-06-18".to_string();
+    headers[0].1 = "2026-01-01".to_string();
 
     let outcome = decide(route(&config, "mcp"), &headers, &call("get_weather"));
     assert!(
         matches!(outcome, Some(Outcome::Allow { .. })),
-        "an old revision should be accepted once the check is off, got {outcome:?}"
+        "an unknown version should be accepted once the check is off, got {outcome:?}"
     );
 }
 

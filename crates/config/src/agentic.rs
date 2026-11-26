@@ -36,16 +36,24 @@ pub struct McpConfig {
     /// Tools and resources refused, applied after `allowed_tools`.
     #[serde(default)]
     pub denied_tools: Vec<String>,
-    /// Require a protocol revision that guarantees mirrored headers match the
-    /// request body.
+    /// Which `MCP-Protocol-Version` values the route accepts.
     ///
-    /// Defaults to true. With it off, a client can present
-    /// `Mcp-Name: safe_tool` alongside a body calling something else, and any
-    /// policy keyed on the header is bypassed. Zentinel resolves policy from
-    /// the body regardless — this setting governs whether requests that
-    /// *cannot* be checked are accepted at all.
-    #[serde(default = "default_true")]
-    pub require_validated_version: bool,
+    /// Three states, so unset is not the same as either value:
+    ///
+    /// - unset (the default): `2026-07-28` and later, the earlier published
+    ///   revisions `2025-03-26`, `2025-06-18` and `2025-11-25`, and no header
+    ///   (taken as `2025-03-26`, as the specification says). Any other value
+    ///   is refused.
+    /// - `true`: only `2026-07-28` and later, the revisions that themselves
+    ///   require mirrored headers to match the body. A missing header is
+    ///   refused.
+    /// - `false`: any value, or none.
+    ///
+    /// In every state the method and tool policy is resolved from the body,
+    /// and an `Mcp-Method`, `Mcp-Name` or `Mcp-Param-*` header that is present
+    /// is checked against it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_validated_version: Option<bool>,
     /// Check `Mcp-Param-*` headers against the tool arguments they mirror.
     ///
     /// Defaults to true. Only headers whose suffix matches an argument name
@@ -122,7 +130,7 @@ impl Default for McpConfig {
             denied_methods: Vec::new(),
             allowed_tools: Vec::new(),
             denied_tools: Vec::new(),
-            require_validated_version: true,
+            require_validated_version: None,
             validate_param_headers: true,
             on_uninspectable_body: UninspectableBody::Deny,
             filter_tool_list: true,

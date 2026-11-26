@@ -43,6 +43,30 @@
 //!
 //! So this module resolves policy against **the body**, and treats a
 //! header/body disagreement as an attack rather than a formatting error.
+//!
+//! # Earlier revisions
+//!
+//! The specification's advice is for intermediaries that enforce policy *from
+//! the mirrored headers*. This one does not: method and tool policy come from
+//! the body whatever revision a request claims. So a request on an earlier
+//! published revision (`2025-03-26`, `2025-06-18`, `2025-11-25`) can be held to
+//! exactly the same policy as a `2026-07-28` one, and by default it is
+//! accepted rather than refused. A request with no `MCP-Protocol-Version`
+//! header is treated as `2025-03-26`, the revision the specification tells
+//! servers to assume when the header is absent.
+//!
+//! What an earlier revision cannot give is a guarantee that mirrored headers
+//! match the body. The proxy supplies it instead: a mirrored header that is
+//! present is checked against the body on every revision, so no request
+//! carries an `Mcp-Method`, `Mcp-Name` or (checked) `Mcp-Param-*` header that
+//! disagrees with its own body past this point. Earlier revisions never
+//! defined those headers, so a conforming client of one never sends them and
+//! is never refused by the check.
+//!
+//! A version that is neither a published revision nor `2026-07-28` or later is
+//! refused: there is no revision to hold it to. [`ProtocolVersions`] selects
+//! between this default, accepting only `2026-07-28` and later, and accepting
+//! any version.
 
 use std::collections::HashSet;
 
@@ -71,6 +95,44 @@ const BASE64_SENTINEL_SUFFIX: &str = "?=";
 /// Revisions before this did not define `Mcp-Method` or `Mcp-Name`, so their
 /// header values carry no guarantee and cannot be a basis for policy.
 pub const FIRST_VALIDATED_VERSION: &str = "2026-07-28";
+
+/// Published revisions of the Streamable HTTP transport before
+/// [`FIRST_VALIDATED_VERSION`].
+///
+/// Requests on these are accepted under [`ProtocolVersions::KnownRevisions`]
+/// and held to the same body-based policy. `2024-11-05` is not here: it used
+/// the older HTTP+SSE transport and never sent an `MCP-Protocol-Version`
+/// header, so a request claiming it in that header is not from a client of
+/// that revision.
+pub const EARLIER_REVISIONS: &[&str] = &["2025-03-26", "2025-06-18", "2025-11-25"];
+
+/// Revision a request without an `MCP-Protocol-Version` header is taken to
+/// claim.
+///
+/// The specification: "If the server does not receive an
+/// `MCP-Protocol-Version` header, and has no other way to identify the
+/// version [...] the server SHOULD assume protocol version 2025-03-26." The
+/// `initialize` request of revisions before `2026-07-28` also legitimately
+/// precedes the header, since the version is negotiated in its body.
+pub const VERSION_ASSUMED_WHEN_ABSENT: &str = "2025-03-26";
+
+/// Which `MCP-Protocol-Version` values a route accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProtocolVersions {
+    /// `2026-07-28` and later, the published earlier revisions in
+    /// [`EARLIER_REVISIONS`], and no header at all (taken as
+    /// [`VERSION_ASSUMED_WHEN_ABSENT`]). Anything else is refused.
+    ///
+    /// Policy is resolved from the body for all of them, and mirrored headers
+    /// that are present are checked against the body for all of them.
+    #[default]
+    KnownRevisions,
+    /// Only `2026-07-28` and later, where the revision itself requires
+    /// mirrored headers to match the body. A missing header is refused.
+    ValidatedOnly,
+    /// Any value, or none. Policy is still resolved from the body.
+    Any,
+}
 
 /// What the proxy decided about an MCP request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,6 +186,12 @@ pub enum DenyReason {
         /// The version claimed, or `None` if the header was absent.
         claimed: Option<String>,
     },
+    /// The protocol version is not a revision the proxy knows, so there is no
+    /// revision to hold the request to.
+    UnknownProtocolVersion {
+        /// The version claimed.
+        claimed: String,
+    },
     /// The tool or resource is not permitted on this route.
     TargetNotAllowed {
         /// The method being invoked.
@@ -157,6 +225,7 @@ impl DenyReason {
             Self::HeaderBodyMismatch { .. }
             | Self::ParamHeaderMismatch { .. }
             | Self::UnvalidatedProtocolVersion { .. }
+            | Self::UnknownProtocolVersion { .. }
             | Self::Unparseable { .. } => None,
         }
     }
@@ -169,6 +238,7 @@ impl DenyReason {
             | Self::HeaderBodyMismatch { .. }
             | Self::ParamHeaderMismatch { .. }
             | Self::UnvalidatedProtocolVersion { .. }
+            | Self::UnknownProtocolVersion { .. }
             | Self::Unparseable { .. } => None,
         }
     }
@@ -210,6 +280,12 @@ impl std::fmt::Display for DenyReason {
                      that predates header/body validation"
                 ),
             },
+            Self::UnknownProtocolVersion { claimed } => write!(
+                f,
+                "protocol version {claimed:?} is not a known MCP revision; accepted are \
+                 {FIRST_VALIDATED_VERSION} and later, and {}",
+                EARLIER_REVISIONS.join(", ")
+            ),
             Self::TargetNotAllowed { method, target } => {
                 write!(f, "{target:?} is not permitted for {method} on this route")
             }
@@ -248,13 +324,8 @@ pub struct Policy {
     pub allowed_targets: HashSet<String>,
     /// Tools and resources refused, applied after `allowed_targets`.
     pub denied_targets: HashSet<String>,
-    /// Whether to require a protocol revision that guarantees header/body
-    /// agreement.
-    ///
-    /// Defaults to true in the config layer. Turning it off means accepting
-    /// that mirrored headers may be unvalidated, which is only safe if nothing
-    /// downstream makes decisions from them.
-    pub require_validated_version: bool,
+    /// Which protocol versions are accepted. See [`ProtocolVersions`].
+    pub protocol_versions: ProtocolVersions,
     /// Whether to check `Mcp-Param-*` headers against the tool arguments they
     /// mirror.
     ///
@@ -363,6 +434,15 @@ pub fn version_is_validated(version: &str) -> bool {
     looks_dated && version >= FIRST_VALIDATED_VERSION
 }
 
+/// Whether a protocol version is one [`ProtocolVersions::KnownRevisions`]
+/// accepts: `2026-07-28` or later, or a published earlier revision.
+///
+/// Matched exactly. An undated or unpublished value (`"latest"`,
+/// `"2026-01-01"`) is not known.
+pub fn version_is_known(version: &str) -> bool {
+    version_is_validated(version) || EARLIER_REVISIONS.contains(&version)
+}
+
 /// Apply MCP policy to a request.
 ///
 /// `headers` supplies mirrored header values by lowercase name. `body` is the
@@ -382,13 +462,31 @@ pub fn evaluate(policy: &Policy, headers: &[(String, String)], body: &[u8]) -> D
     // body are required to agree, which is only true from a certain revision
     // on — so checking anything else first would be reasoning from an
     // assumption not yet established.
-    if policy.require_validated_version {
-        let claimed = lookup(HEADER_PROTOCOL_VERSION);
-        let validated = claimed.as_deref().is_some_and(version_is_validated);
-        if !validated {
-            return Decision::Deny {
-                reason: DenyReason::UnvalidatedProtocolVersion { claimed },
-            };
+    //
+    // Under the default the assumption is not the revision's but the proxy's:
+    // `check_header_agreement` below runs on every revision, so a mirrored
+    // header that is present agrees with the body whichever version was
+    // claimed.
+    let claimed = lookup(HEADER_PROTOCOL_VERSION);
+    match policy.protocol_versions {
+        ProtocolVersions::Any => {}
+        ProtocolVersions::ValidatedOnly => {
+            if !claimed.as_deref().is_some_and(version_is_validated) {
+                return Decision::Deny {
+                    reason: DenyReason::UnvalidatedProtocolVersion { claimed },
+                };
+            }
+        }
+        ProtocolVersions::KnownRevisions => {
+            if let Some(version) = claimed {
+                if !version_is_known(&version) {
+                    return Decision::Deny {
+                        reason: DenyReason::UnknownProtocolVersion { claimed: version },
+                    };
+                }
+            }
+            // No header: the request is on `VERSION_ASSUMED_WHEN_ABSENT`,
+            // which is known, and gets the same body-based policy as any other.
         }
     }
 
@@ -547,7 +645,7 @@ mod tests {
             denied_methods: HashSet::new(),
             allowed_targets: HashSet::new(),
             denied_targets: HashSet::new(),
-            require_validated_version: true,
+            protocol_versions: ProtocolVersions::KnownRevisions,
             validate_param_headers: true,
             on_uninspectable: UninspectableBody::Deny,
         }
@@ -636,16 +734,136 @@ mod tests {
         );
     }
 
-    /// Opting out of validation by claiming an older revision must not work:
-    /// those revisions never required header and body to agree, so their
-    /// headers cannot support policy.
+    /// Claiming an earlier revision does not switch off the header check:
+    /// those revisions never required header and body to agree, so the proxy
+    /// requires it instead, and the spoof is refused exactly as it is on
+    /// `2026-07-28`.
     #[test]
-    fn an_older_protocol_version_cannot_be_used_to_escape_validation() {
-        let headers = headers_from(&[
-            ("mcp-protocol-version", "2025-06-18"),
-            ("mcp-method", "tools/call"),
-            ("mcp-name", "read_file"),
-        ]);
+    fn an_earlier_protocol_version_cannot_be_used_to_escape_validation() {
+        for &version in EARLIER_REVISIONS {
+            let mut policy = permissive_policy();
+            policy.allowed_targets = ["read_file".to_string()].into_iter().collect();
+            let headers = headers_from(&[
+                ("mcp-protocol-version", version),
+                ("mcp-method", "tools/call"),
+                ("mcp-name", "read_file"),
+            ]);
+            let decision = evaluate(&policy, &headers, &tools_call("delete_everything"));
+            assert!(
+                matches!(
+                    decision,
+                    Decision::Deny {
+                        reason: DenyReason::HeaderBodyMismatch {
+                            header: HEADER_NAME,
+                            ..
+                        }
+                    }
+                ),
+                "{version}: got {decision:?}"
+            );
+        }
+    }
+
+    /// An earlier-revision client sends no mirrored headers; the request
+    /// stands or falls on its body.
+    #[test]
+    fn each_earlier_revision_is_accepted_and_resolved_from_the_body() {
+        for &version in EARLIER_REVISIONS {
+            let headers = headers_from(&[("mcp-protocol-version", version)]);
+            let decision = evaluate(&permissive_policy(), &headers, &tools_call("get_weather"));
+            assert_eq!(
+                decision,
+                Decision::Allow {
+                    method: Some("tools/call".to_string()),
+                    target: Some("get_weather".to_string()),
+                },
+                "{version}"
+            );
+        }
+    }
+
+    /// The point of accepting earlier revisions only holds if they get the
+    /// same policy: a denied tool, a tool outside the allowlist and a denied
+    /// method are refused on every one of them.
+    #[test]
+    fn policy_applies_unchanged_on_earlier_revisions() {
+        let mut policy = permissive_policy();
+        policy.allowed_targets = ["get_weather".to_string(), "execute_sql".to_string()]
+            .into_iter()
+            .collect();
+        policy.denied_targets = ["execute_sql".to_string()].into_iter().collect();
+        policy.denied_methods = ["resources/read".to_string()].into_iter().collect();
+        let read = br#"{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"file:///etc/passwd"}}"#;
+
+        let mut cases: Vec<Vec<(String, String)>> = EARLIER_REVISIONS
+            .iter()
+            .map(|&v| headers_from(&[("mcp-protocol-version", v)]))
+            .collect();
+        // And with no header at all, taken as 2025-03-26.
+        cases.push(Vec::new());
+
+        for headers in &cases {
+            for tool in ["execute_sql", "send_email"] {
+                let decision = evaluate(&policy, headers, &tools_call(tool));
+                assert!(
+                    matches!(
+                        &decision,
+                        Decision::Deny {
+                            reason: DenyReason::TargetNotAllowed { target, .. }
+                        } if target == tool
+                    ),
+                    "{headers:?} {tool}: got {decision:?}"
+                );
+            }
+            assert!(
+                matches!(
+                    evaluate(&policy, headers, read),
+                    Decision::Deny {
+                        reason: DenyReason::MethodNotAllowed { .. }
+                    }
+                ),
+                "{headers:?}"
+            );
+        }
+    }
+
+    /// `initialize` negotiates the version in its body, so on the earlier
+    /// revisions it legitimately arrives without the header.
+    #[test]
+    fn initialize_without_a_protocol_version_header_is_accepted() {
+        let body = br#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"c","version":"1"}}}"#;
+        let decision = evaluate(&permissive_policy(), &[], body);
+        assert_eq!(
+            decision,
+            Decision::Allow {
+                method: Some("initialize".to_string()),
+                target: None,
+            }
+        );
+    }
+
+    /// A missing header means 2025-03-26, so a tool call without one is
+    /// accepted and held to the route's policy like any other.
+    #[test]
+    fn a_tool_call_without_a_protocol_version_header_is_taken_as_2025_03_26() {
+        let mut policy = permissive_policy();
+        policy.allowed_targets = ["get_weather".to_string()].into_iter().collect();
+        assert!(matches!(
+            evaluate(&policy, &[], &tools_call("get_weather")),
+            Decision::Allow { .. }
+        ));
+        assert!(matches!(
+            evaluate(&policy, &[], &tools_call("delete_everything")),
+            Decision::Deny {
+                reason: DenyReason::TargetNotAllowed { .. }
+            }
+        ));
+    }
+
+    /// Mirrored headers without a version header are still checked.
+    #[test]
+    fn a_spoofed_header_without_a_protocol_version_header_is_denied() {
+        let headers = headers_from(&[("mcp-method", "tools/call"), ("mcp-name", "read_file")]);
         let decision = evaluate(
             &permissive_policy(),
             &headers,
@@ -655,17 +873,78 @@ mod tests {
             matches!(
                 decision,
                 Decision::Deny {
-                    reason: DenyReason::UnvalidatedProtocolVersion { .. }
+                    reason: DenyReason::HeaderBodyMismatch { .. }
                 }
             ),
             "got {decision:?}"
         );
     }
 
+    /// Accepting earlier revisions is not accepting anything: a version that
+    /// is no known revision is refused before the body is looked at.
     #[test]
-    fn a_missing_protocol_version_header_is_denied() {
+    fn an_unknown_protocol_version_is_denied() {
+        for version in [
+            "2024-11-05",
+            "2026-01-01",
+            "2025-06-19",
+            "latest",
+            "",
+            "2025-06-18 ",
+            "2026-07-28-extra",
+        ] {
+            let headers = headers_from(&[("mcp-protocol-version", version)]);
+            let decision = evaluate(&permissive_policy(), &headers, &tools_call("get_weather"));
+            assert!(
+                matches!(
+                    &decision,
+                    Decision::Deny {
+                        reason: DenyReason::UnknownProtocolVersion { claimed }
+                    } if claimed == version
+                ),
+                "{version:?}: got {decision:?}"
+            );
+        }
+    }
+
+    /// The strict setting keeps the earlier behaviour: only revisions that
+    /// themselves require header/body agreement.
+    #[test]
+    fn strict_mode_refuses_earlier_revisions() {
+        let mut policy = permissive_policy();
+        policy.protocol_versions = ProtocolVersions::ValidatedOnly;
+        for &version in EARLIER_REVISIONS {
+            let headers = headers_from(&[("mcp-protocol-version", version)]);
+            let decision = evaluate(&policy, &headers, &tools_call("get_weather"));
+            assert_eq!(
+                decision,
+                Decision::Deny {
+                    reason: DenyReason::UnvalidatedProtocolVersion {
+                        claimed: Some(version.to_string())
+                    }
+                },
+                "{version}"
+            );
+        }
+        let headers = headers_from(&[("mcp-protocol-version", "latest")]);
+        assert!(matches!(
+            evaluate(&policy, &headers, &tools_call("get_weather")),
+            Decision::Deny {
+                reason: DenyReason::UnvalidatedProtocolVersion { .. }
+            }
+        ));
+        assert!(matches!(
+            evaluate(&policy, &good_headers("t"), &tools_call("t")),
+            Decision::Allow { .. }
+        ));
+    }
+
+    #[test]
+    fn strict_mode_refuses_a_missing_protocol_version_header() {
+        let mut policy = permissive_policy();
+        policy.protocol_versions = ProtocolVersions::ValidatedOnly;
         let headers = headers_from(&[("mcp-method", "tools/call")]);
-        let decision = evaluate(&permissive_policy(), &headers, &tools_call("t"));
+        let decision = evaluate(&policy, &headers, &tools_call("t"));
         assert!(matches!(
             decision,
             Decision::Deny {
@@ -677,8 +956,12 @@ mod tests {
     #[test]
     fn version_validation_can_be_turned_off_deliberately() {
         let mut policy = permissive_policy();
-        policy.require_validated_version = false;
-        let headers = headers_from(&[("mcp-method", "tools/call"), ("mcp-name", "t")]);
+        policy.protocol_versions = ProtocolVersions::Any;
+        let headers = headers_from(&[
+            ("mcp-protocol-version", "latest"),
+            ("mcp-method", "tools/call"),
+            ("mcp-name", "t"),
+        ]);
         assert!(matches!(
             evaluate(&policy, &headers, &tools_call("t")),
             Decision::Allow { .. }
@@ -1077,6 +1360,18 @@ mod tests {
 
         /// Anything not shaped like a dated revision guarantees nothing, and
         /// must not be read as a large number that sorts high.
+        #[test]
+        fn the_known_versions_are_the_published_ones_and_later() {
+            for &version in EARLIER_REVISIONS {
+                assert!(version_is_known(version), "{version}");
+            }
+            assert!(version_is_known(FIRST_VALIDATED_VERSION));
+            assert!(version_is_known("2027-01-01"));
+            assert!(!version_is_known("2024-11-05"));
+            assert!(!version_is_known("2026-01-01"));
+            assert!(!version_is_known("latest"));
+        }
+
         #[test]
         fn a_malformed_version_does_not_qualify() {
             assert!(!version_is_validated("latest"));

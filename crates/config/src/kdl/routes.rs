@@ -715,7 +715,7 @@ fn parse_mcp_upstreams(node: &kdl::KdlNode) -> Result<Vec<McpUpstream>> {
 ///
 /// ```kdl
 /// mcp {
-///     require-validated-version #true
+///     require-validated-version #true   // omit to also accept 2025-03-26..2025-11-25
 ///     filter-tool-list #true
 ///     on-uninspectable-body "deny"
 ///     methods {
@@ -729,11 +729,12 @@ fn parse_mcp_upstreams(node: &kdl::KdlNode) -> Result<Vec<McpUpstream>> {
 /// }
 /// ```
 fn parse_mcp_config(node: &kdl::KdlNode) -> Result<McpConfig> {
-    let mut config = McpConfig::default();
-
-    if let Some(value) = get_bool_entry(node, "require-validated-version")? {
-        config.require_validated_version = value;
-    }
+    let mut config = McpConfig {
+        // Left unset unless written: unset accepts the published revisions,
+        // `#true` only 2026-07-28 and later, `#false` anything.
+        require_validated_version: get_bool_entry(node, "require-validated-version")?,
+        ..McpConfig::default()
+    };
 
     if let Some(value) = get_bool_entry(node, "validate-param-headers")? {
         config.validate_param_headers = value;
@@ -2737,20 +2738,27 @@ mod tests {
             assert_eq!(mcp.denied_methods, ["resources/read"]);
         }
 
-        /// Defaults to true, so the test uses false to prove it is read.
         #[test]
         fn require_validated_version_is_read() {
             let route = route_with("    mcp {\n      require-validated-version #false\n    }");
-            assert!(!route.mcp.expect("parsed").require_validated_version);
+            assert_eq!(
+                route.mcp.expect("parsed").require_validated_version,
+                Some(false)
+            );
+            let route = route_with("    mcp {\n      require-validated-version #true\n    }");
+            assert_eq!(
+                route.mcp.expect("parsed").require_validated_version,
+                Some(true)
+            );
         }
 
+        /// Unset is its own state: the proxy then accepts the published
+        /// earlier revisions as well as 2026-07-28 and later. Reading it as
+        /// `#true` would refuse most clients in use; as `#false`, any version.
         #[test]
-        fn require_validated_version_defaults_to_true() {
+        fn require_validated_version_defaults_to_unset() {
             let route = route_with("    mcp {\n      tools {\n        deny \"x\"\n      }\n    }");
-            assert!(
-                route.mcp.expect("parsed").require_validated_version,
-                "a route that does not say otherwise must require a validated protocol version"
-            );
+            assert_eq!(route.mcp.expect("parsed").require_validated_version, None);
         }
 
         /// Defaults to Deny, so the test uses allow.
