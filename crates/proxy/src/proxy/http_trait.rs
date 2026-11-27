@@ -1313,7 +1313,7 @@ impl ProxyHttp for ZentinelProxy {
             );
 
             match pool.select_peer_with_metadata(Some(&selection_ctx)).await {
-                Ok((mut peer, metadata, trial)) => {
+                Ok((mut peer, metadata, trial, target)) => {
                     let selection_duration = selection_start.elapsed();
                     // Track active request for drain lifecycle. Once per
                     // request: Pingora re-enters upstream_peer on a retry, and
@@ -1321,9 +1321,14 @@ impl ProxyHttp for ZentinelProxy {
                     if ctx.selected_pool.is_none() {
                         pool.increment_active();
                     }
-                    // Store selected peer address for feedback reporting in logging()
+                    // The address the peer connects to (the access log's
+                    // `upstream_addr`).
                     let peer_addr = peer.address().to_string();
                     ctx.selected_upstream_address = Some(peer_addr.clone());
+                    // What the pool's breakers and balancer are keyed by:
+                    // this attempt's result is reported under it, not under
+                    // the address a hostname resolved to.
+                    ctx.selected_upstream_target = Some(target);
                     ctx.selected_pool = Some(pool.clone());
                     ctx.half_open_trial = trial;
 
@@ -4240,12 +4245,21 @@ impl ProxyHttp for ZentinelProxy {
         if is_upstream_error(&e) && !ctx.response_blocked && !ctx.request_refused_by_agent {
             // Counted here, once for this attempt; `logging` leaves it out.
             ctx.attempt_failure_reported = true;
-            let peer_address = peer.address().to_string();
+            // The target this attempt selected, as configured, which the
+            // pool's breakers are keyed by. A proxied request records it when
+            // its peer is selected. A multiplexed MCP tool call selects its own
+            // peer and records none: it is reported under the peer's address,
+            // as it always was, which is the target only when that was
+            // configured as an address.
+            let target = ctx
+                .selected_upstream_target
+                .clone()
+                .unwrap_or_else(|| peer.address().to_string());
             let upstream_pools = self.upstream_pools.clone();
             let upstream_id_owned = upstream_id.to_string();
             tokio::spawn(async move {
                 if let Some(pool) = upstream_pools.get(&upstream_id_owned).await {
-                    pool.report_result(&peer_address, false).await;
+                    pool.report_result(&target, false).await;
                 }
             });
         }
@@ -4433,6 +4447,12 @@ impl ProxyHttp for ZentinelProxy {
                 ctx.request_refused_by_agent || ctx.response_blocked,
             );
             let success = outcome == TargetOutcome::Success;
+            // The pool finds the target's breaker and balancer entry by the
+            // target as configured, not by the address the peer connected to.
+            let report_target = ctx
+                .selected_upstream_target
+                .as_deref()
+                .unwrap_or(peer_addr.as_str());
 
             if let Some(pool) = self.upstream_pools.get(upstream_id).await {
                 // `error_while_proxy` reports an upstream error when it
@@ -4441,7 +4461,7 @@ impl ProxyHttp for ZentinelProxy {
                 if !ctx.attempt_failure_reported {
                     match outcome {
                         TargetOutcome::Success | TargetOutcome::Failure => {
-                            pool.report_result_with_latency(peer_addr, success, Some(duration))
+                            pool.report_result_with_latency(report_target, success, Some(duration))
                                 .await;
                         }
                         // Neither a success, which would also reset the
@@ -4458,6 +4478,7 @@ impl ProxyHttp for ZentinelProxy {
                         correlation_id = %ctx.trace_id,
                         upstream = %upstream_id,
                         peer_address = %peer_addr,
+                        target = %report_target,
                         outcome = ?outcome,
                         duration_ms = duration.as_millis(),
                         status = status,

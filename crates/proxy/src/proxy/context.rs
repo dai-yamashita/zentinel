@@ -302,8 +302,15 @@ pub struct RequestContext {
     pub(crate) route_config: Option<Arc<RouteConfig>>,
     /// Selected upstream pool ID
     pub(crate) upstream: Option<String>,
-    /// Selected upstream peer address (IP:port) for feedback reporting
+    /// Selected upstream peer address (IP:port), as the peer connects to it.
+    /// Logged as the access log's `upstream_addr`.
     pub(crate) selected_upstream_address: Option<String>,
+    /// The configured target the current attempt selected, as written in the
+    /// upstream (`host:port` for a hostname). The pool's circuit breakers and
+    /// load balancer are keyed by it, so results are reported under it rather
+    /// than under `selected_upstream_address`. Not set for a multiplexed MCP
+    /// tool call, which selects its own peer.
+    pub(crate) selected_upstream_target: Option<String>,
     /// The pool the peer was selected from, for `fail_to_connect`, which is
     /// synchronous and so cannot look it up in the registry.
     pub(crate) selected_pool: Option<Arc<crate::upstream::UpstreamPool>>,
@@ -711,6 +718,7 @@ impl RequestContext {
             route_config: None,
             upstream: None,
             selected_upstream_address: None,
+            selected_upstream_target: None,
             selected_pool: None,
             half_open_trial: None,
             attempt_failure_reported: false,

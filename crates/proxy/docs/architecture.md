@@ -619,11 +619,15 @@ these made the proxy try again.
 
 ### What a request tells the breaker
 
-What a request tells the breaker of the target it was sent to. An attempt is
-reported at most once. An error of the upstream after the connection was
-established is reported when it happens, which is also how an attempt that a
-retry replaces is counted. Any other outcome is reported when the request
-ends, for its last attempt:
+What a request tells the breaker of the target it was sent to. A target is
+the `host:port` as written in the upstream's `target`, not the address it
+resolves to: a hostname that resolves to several addresses is one target with
+one breaker, and failures at any of its addresses count together. (The access
+log's `upstream_addr` is the resolved address the request was sent to.) An
+attempt is reported at most once. An error of the upstream after the
+connection was established is reported when it happens, which is also how an
+attempt that a retry replaces is counted. Any other outcome is reported when
+the request ends, for its last attempt:
 
 | Outcome | Reported as |
 |---------|-------------|

@@ -1565,10 +1565,22 @@ impl UpstreamPool {
     /// trial, the third element is the slot it holds. Report the request's result,
     /// or, if it ends without one, give the slot back with
     /// [`release_half_open_slot`](Self::release_half_open_slot).
+    ///
+    /// The fourth element is the configured target the peer was selected for,
+    /// as written in the upstream (`host:port` for a hostname, not the address
+    /// it resolved to). Report the request's result under it:
+    /// [`report_result`](Self::report_result) and
+    /// [`report_result_with_latency`](Self::report_result_with_latency) find
+    /// the target's circuit breaker and load balancer entry by this string.
     pub async fn select_peer_with_metadata(
         &self,
         context: Option<&RequestContext>,
-    ) -> ZentinelResult<(HttpPeer, HashMap<String, String>, Option<TrialTicket>)> {
+    ) -> ZentinelResult<(
+        HttpPeer,
+        HashMap<String, String>,
+        Option<TrialTicket>,
+        String,
+    )> {
         let request_num = self.stats.requests.fetch_add(1, Ordering::Relaxed) + 1;
 
         trace!(
@@ -1667,7 +1679,7 @@ impl UpstreamPool {
             );
 
             self.stats.successes.fetch_add(1, Ordering::Relaxed);
-            return Ok((peer, selection.metadata, ticket));
+            return Ok((peer, selection.metadata, ticket, selection.address));
         }
 
         self.stats.failures.fetch_add(1, Ordering::Relaxed);
@@ -1693,7 +1705,7 @@ impl UpstreamPool {
     /// For callers that report no result for the request. A half-open trial
     /// slot taken for it is given back at once, as nothing else would.
     pub async fn select_peer(&self, context: Option<&RequestContext>) -> ZentinelResult<HttpPeer> {
-        let (peer, _metadata, ticket) = self.select_peer_with_metadata(context).await?;
+        let (peer, _metadata, ticket, _target) = self.select_peer_with_metadata(context).await?;
         if let Some(ticket) = ticket {
             self.release_half_open_slot(ticket).await;
         }
@@ -1925,6 +1937,12 @@ impl UpstreamPool {
     }
 
     /// Report connection result for a target
+    ///
+    /// `target` is the configured target, as
+    /// [`select_peer_with_metadata`](Self::select_peer_with_metadata) returns
+    /// it, not the address it resolved to. A hostname that resolves to several
+    /// addresses is still one target, with one circuit breaker: the failures of
+    /// all its addresses count together.
     ///
     /// On failure, the circuit breaker records the failure but the load balancer
     /// health status is only updated when the circuit breaker transitions to Open.
@@ -2381,13 +2399,13 @@ mod breaker_trial_tests {
     #[tokio::test]
     async fn only_a_trial_request_is_given_a_ticket() {
         let pool = pool().await;
-        let (_, _, closed) = pool.select_peer_with_metadata(None).await.expect("a peer");
+        let (_, _, closed, _) = pool.select_peer_with_metadata(None).await.expect("a peer");
         assert!(closed.is_none(), "a closed breaker has no slots");
 
         pool.report_result(TARGET, false).await;
-        let (_, _, first) = pool.select_peer_with_metadata(None).await.expect("a peer");
+        let (_, _, first, _) = pool.select_peer_with_metadata(None).await.expect("a peer");
         assert!(first.is_none(), "it ended the open period");
-        let (_, _, trial) = pool.select_peer_with_metadata(None).await.expect("a peer");
+        let (_, _, trial, _) = pool.select_peer_with_metadata(None).await.expect("a peer");
         let trial = trial.expect("a trial holds a slot");
         pool.release_half_open_slot(trial).await;
     }
@@ -2404,5 +2422,128 @@ mod breaker_trial_tests {
         );
 
         assert!(pool.select_shadow_target(None).await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod reported_target_tests {
+    use super::*;
+    use pingora_core::upstreams::peer::Peer;
+    use std::net::SocketAddr;
+    use zentinel_common::types::{CircuitBreakerState, LoadBalancingAlgorithm};
+    use zentinel_config::{ConnectionPoolConfig, HttpVersionConfig, UpstreamTimeouts};
+
+    /// Hostname targets whose breakers open on `failure_threshold` failures
+    /// and stay open.
+    async fn pool(targets: &[&str], failure_threshold: u32) -> UpstreamPool {
+        let config = UpstreamConfig {
+            id: "reported-target-test".to_string(),
+            targets: targets
+                .iter()
+                .map(|address| zentinel_config::UpstreamTarget {
+                    address: (*address).to_string(),
+                    weight: 1,
+                    max_requests: None,
+                    metadata: HashMap::new(),
+                })
+                .collect(),
+            load_balancing: LoadBalancingAlgorithm::RoundRobin,
+            sticky_session: None,
+            health_check: None,
+            connection_pool: ConnectionPoolConfig::default(),
+            circuit_breaker: Some(CircuitBreakerConfig {
+                failure_threshold,
+                success_threshold: 1,
+                timeout_seconds: 300,
+                half_open_max_requests: 1,
+            }),
+            timeouts: UpstreamTimeouts::default(),
+            tls: None,
+            http_version: HttpVersionConfig::default(),
+            discovery: None,
+        };
+        UpstreamPool::new(config).await.expect("pool")
+    }
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    /// The target a selection returns is the configured one, not the address
+    /// the peer connects to, and each selection returns its own: a retry that
+    /// selects another target reports under that one.
+    #[tokio::test]
+    async fn a_selection_returns_the_configured_target_it_was_made_for() {
+        let (first, second) = ("a.example:19541", "b.example:19542");
+        let pool = pool(&[first, second], 1).await;
+        pool.resolver
+            .store(first, vec![addr("192.0.2.1:19541")].into());
+        pool.resolver
+            .store(second, vec![addr("192.0.2.2:19542")].into());
+
+        let (peer, _, _, target) = pool.select_peer_with_metadata(None).await.expect("a peer");
+        assert_eq!(target, first);
+        assert_eq!(peer.address().to_string(), "192.0.2.1:19541");
+
+        let (peer, _, _, target) = pool.select_peer_with_metadata(None).await.expect("a peer");
+        assert_eq!(target, second);
+        assert_eq!(peer.address().to_string(), "192.0.2.2:19542");
+
+        pool.report_result(&target, false).await;
+        assert_eq!(
+            pool.circuit_breaker_state(second).await,
+            Some(CircuitBreakerState::Open)
+        );
+        assert_eq!(
+            pool.circuit_breaker_state(first).await,
+            Some(CircuitBreakerState::Closed)
+        );
+    }
+
+    /// A success reported under the returned target leaves the balancer's
+    /// health table with the configured target only. Reported under the
+    /// address it resolved to, it added a row of its own, which counted as a
+    /// healthy target of the upstream whatever the configured one's state.
+    #[tokio::test]
+    async fn a_success_leaves_only_configured_targets_in_the_balancer() {
+        let name = "a.example:19544";
+        let pool = pool(&[name], 5).await;
+        pool.resolver
+            .store(name, vec![addr("192.0.2.1:19544")].into());
+
+        let (_, _, _, target) = pool.select_peer_with_metadata(None).await.expect("a peer");
+        pool.report_result_with_latency(&target, true, Some(Duration::from_millis(5)))
+            .await;
+
+        assert_eq!(pool.load_balancer.healthy_targets().await, vec![name]);
+        assert!(pool.has_healthy_targets().await);
+    }
+
+    /// One name, several addresses, one breaker: the failures of the name's
+    /// addresses count together against the configured target.
+    #[tokio::test]
+    async fn the_addresses_of_one_name_share_the_breaker_of_its_target() {
+        let name = "multi.example:19543";
+        let (one, two) = (addr("192.0.2.1:19543"), addr("192.0.2.2:19543"));
+        let pool = pool(&[name], 2).await;
+        pool.resolver.store(name, vec![one, two].into());
+
+        let (peer, _, _, target) = pool.select_peer_with_metadata(None).await.expect("a peer");
+        assert_eq!(peer.address().to_string(), one.to_string());
+        pool.report_result(&target, false).await;
+        assert!(pool.connect_failed(one), "the name has another address");
+        assert_eq!(
+            pool.circuit_breaker_state(name).await,
+            Some(CircuitBreakerState::Closed)
+        );
+
+        let (peer, _, _, target) = pool.select_peer_with_metadata(None).await.expect("a peer");
+        assert_eq!(peer.address().to_string(), two.to_string());
+        pool.report_result_with_latency(&target, false, None).await;
+        assert_eq!(
+            pool.circuit_breaker_state(name).await,
+            Some(CircuitBreakerState::Open),
+            "a failure at each address of the name is two failures of the target"
+        );
     }
 }
