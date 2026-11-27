@@ -18,6 +18,7 @@ for details.
 
 | CalVer | Crate Version | Date | Highlights |
 |--------|---------------|------|------------|
+ [26.11_11](#261111---2026-11-27) | 0.6.65 | 2026-11-27 | **Inference token limits, budgets and cost count real usage; PII `block` works** (read the upgrade notes); MCP routes accept earlier protocol revisions by default; model routing reads the body's `model` |
 | [26.11_10](#261110---2026-11-26) | 0.6.64 | 2026-11-26 | **Security fixes in two bundled agents: Content Scanner 0.6.0 scans uploads without a `Content-Type`, MQTT Gateway 0.6.0 checks every packet in a WebSocket frame** (read the upgrade notes); `chunk-timeout-ms` applies and new `body-agent-time-ms` bounds agent time per streamed body; streamed-body metrics; a replacement chunk of another length is refused when the length was declared |
 | [26.11_9](#26119---2026-11-26) | 0.6.63 | 2026-11-26 | **Security fixes in two bundled agents: WAF 0.5.0 matches encoded headers and bodies, GraphQL Security 0.6.0 analyzes named fragments** (read the upgrade notes); a streaming request chunk replacement reaches the upstream as its bytes |
 | [26.11_8](#26118---2026-11-25) | 0.6.62 | 2026-11-25 | **Requests over the header limits get 431, not 500** (read the upgrade notes); **`bundle install --skip-verify` refuses an archive whose readable checksum does not match**; the ZentinelSec agent is pinned at 0.6.0; geo databases are read off the async workers; the Gateway API controller asks GRPCRoute backends for the whole server's health |
@@ -103,6 +104,63 @@ for details.
 ---
 
 ## [Unreleased]
+
+---
+
+## [26.11_11] - 2026-11-27
+
+**Crate version:** 0.6.65
+
+### Upgrade notes
+- **MCP protocol revisions (#854).** A route that leaves
+  `require-validated-version` unset now accepts `2026-07-28` and later, the
+  earlier revisions `2025-03-26`, `2025-06-18` and `2025-11-25`, and requests
+  without `MCP-Protocol-Version` (taken as `2025-03-26`), all under the same
+  method and tool policy from the body; it refused all but `2026-07-28` and
+  later before. Other values are refused. `#true` keeps the strict behavior and
+  `#false` still accepts any version.
+- **Inference limits count the prompt (#855).** On inference routes with a
+  token `rate-limit`, a `budget`, cost attribution, or `model-routing` without
+  a model header, the request body is read once, before an upstream is chosen
+  (bounded by `max-body-size`, `413` above it), and tokens are estimated from
+  it; the estimate was made from an empty body before. Large prompts that
+  passed may now get `429`.
+- **Inference usage is counted (#857).** The usage a provider reports in a
+  JSON (non-streamed) response is counted; it was counted as 0, so budgets did
+  not fill and rate limits were not corrected. Streamed Anthropic responses
+  keep their input tokens. Budgets now run down at the real rate.
+- **PII detection actions (#856).** `pii-detection { action "block" }` checks
+  the prompt with the guardrail agent before an upstream is chosen and refuses
+  a request with PII in it (new `block-status`, default `400`, and
+  `block-message`; `failure-mode` applies when the check cannot be made); it
+  did nothing before. `action "redact"` never took effect and is now refused
+  when the configuration loads. `action "log"` is unchanged.
+
+### Added
+- Model routing takes the model from the request body's `model` field when no
+  `x-model` or `x-model-id` header is sent; the headers keep precedence. Cost
+  attribution uses the same model (#855).
+- The inference cost metrics are exported: `zentinel_inference_cost_total`,
+  `zentinel_inference_cost_per_request`,
+  `zentinel_inference_input_tokens_total` and
+  `zentinel_inference_output_tokens_total` (#857).
+- End-to-end tests for the inference features: token limits per client,
+  budgets, cost, PII in responses, model routing, streamed token counts and
+  the inference health check (#857, part of #792).
+
+### Fixed
+- The inference health check reads the whole response; a models list that
+  arrived in more than one read was cut off and a healthy provider was marked
+  down (#857).
+- PII detection on streamed responses runs whenever it is enabled; it ran only
+  on routes that also had a token limit, budget or cost attribution (#857).
+- Token limits and budgets are no longer charged for CORS
+  preflights and geo-blocked requests (#855).
+
+### Known issues
+- The model fallback mapping reports `X-Model-Mapping` but the fallback
+  upstream still receives the original model, and `least_tokens_queued` load
+  balancing always picks the first target. Both have ignored tests (#792).
 
 ---
 
