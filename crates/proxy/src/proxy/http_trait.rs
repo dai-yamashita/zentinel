@@ -5242,6 +5242,58 @@ impl ZentinelProxy {
                 .await
             {
                 Ok(Some(call)) => {
+                    // The controls a tool call gets on a plain MCP route apply
+                    // here too: the call is counted, and the rate limits keyed
+                    // on the tool are checked against the tool the client
+                    // named. `request_body_filter` substitutes the rewritten
+                    // body without looking at it, so they are applied now.
+                    let route = ctx.route_config.clone();
+                    let mcp_method = Some(method.clone());
+                    let mcp_target = Some(target.to_string());
+                    if let Some(route) = route.as_deref() {
+                        self.record_mcp_call(route, ctx, &mcp_method, &mcp_target, "allowed");
+                    }
+                    if let Some(route_id) = ctx.route_id.clone() {
+                        if let Some(result) = self
+                            .rate_limit_manager
+                            .check_body_keyed(&route_id, &ctx.client_ip, &ctx.path, Some(target))
+                            .await
+                        {
+                            if !result.allowed
+                                && result.action == zentinel_config::RateLimitAction::Reject
+                            {
+                                warn!(
+                                    correlation_id = %ctx.trace_id,
+                                    route_id = %route_id,
+                                    mcp_target = target,
+                                    limit = result.limit,
+                                    "MCP tool call rate limited on a multiplexing route"
+                                );
+                                self.metrics.record_blocked_request("rate_limited");
+                                if let Some(route) = route.as_deref() {
+                                    self.record_mcp_call(
+                                        route,
+                                        ctx,
+                                        &mcp_method,
+                                        &mcp_target,
+                                        "rate_limited",
+                                    );
+                                }
+                                return Err(Error::explain(
+                                    ErrorType::HTTPStatus(result.status_code),
+                                    result
+                                        .message
+                                        .unwrap_or_else(|| "Rate limit exceeded".to_string()),
+                                ));
+                            }
+                        }
+                    }
+                    ctx.mcp_method = mcp_method;
+                    ctx.mcp_target = mcp_target;
+                    // The body agents are sent the call as the client wrote it
+                    // (`inspect_request_body_first`), so keep it: the body
+                    // has been read here and cannot be read again.
+                    ctx.validated_request_body = Some(Bytes::from(body.clone()));
                     ctx.mcp_proxied_call = Some(call);
                     // Not answered here: fall through to the proxy path.
                     return Ok(false);
@@ -6937,19 +6989,27 @@ impl ZentinelProxy {
         session: &mut Session,
         ctx: &mut RequestContext,
     ) -> Result<(), Box<Error>> {
+        // A tool call on a multiplexing MCP route was read whole by
+        // `serve_mcp_multiplex`, and `request_body_filter` forwards its
+        // rewritten body without passing it to the agents. Whatever the
+        // agents' body mode, it is inspected here, as the client sent it,
+        // before the upstream is contacted.
+        let proxied_mcp_call = ctx.mcp_proxied_call.is_some();
         if !ctx.body_inspection_enabled
             || ctx.body_inspection_agents.is_empty()
-            || ctx.request_body_streaming_mode != zentinel_config::BodyStreamingMode::InspectFirst
             || ctx.is_websocket_upgrade
-            || ctx.mcp_proxied_call.is_some()
+            || (!proxied_mcp_call
+                && ctx.request_body_streaming_mode
+                    != zentinel_config::BodyStreamingMode::InspectFirst)
         {
             return Ok(());
         }
 
-        // Already read whole for the prompt check or API schema validation,
-        // or read now.
+        // Already read whole for the prompt check, API schema validation or
+        // a multiplexed MCP call, or read now.
         let body = match ctx.validated_request_body.take() {
             Some(body) => body,
+            None if proxied_mcp_call => return Ok(()),
             None => {
                 self.read_whole_request_body(session, ctx, "inspect-first")
                     .await?
