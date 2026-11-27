@@ -1607,6 +1607,8 @@ pub(crate) const RECOGNIZED_PII_DETECTION_KEYS: &[&str] = &[
     "enabled",
     "agent",
     "action",
+    "block-status",
+    "block-message",
     "categories",
     "timeout-ms",
     "failure-mode",
@@ -2413,15 +2415,24 @@ fn parse_pii_detection_config(node: &kdl::KdlNode) -> Result<PiiDetectionConfig>
 
     let action = match get_string_entry(node, "action")?.as_deref() {
         Some("log") | None => PiiAction::Log,
-        Some("redact") => PiiAction::Redact,
         Some("block") => PiiAction::Block,
+        // The agent is sent the text extracted from the body, not the body,
+        // so a redacted text it returns cannot be put back into the request.
+        Some("redact") => {
+            return Err(anyhow::anyhow!(
+                "PII action 'redact' is not implemented; use 'log' or 'block'"
+            ));
+        }
         Some(other) => {
             return Err(anyhow::anyhow!(
-                "Unknown PII action '{}'. Valid actions: log, redact, block",
+                "Unknown PII action '{}'. Valid actions: log, block",
                 other
             ));
         }
     };
+
+    let block_status = get_status_entry(node, "block-status")?.unwrap_or(400);
+    let block_message = get_string_entry(node, "block-message")?;
 
     // Parse categories as string arguments
     let categories = if let Some(children) = node.children() {
@@ -2451,6 +2462,7 @@ fn parse_pii_detection_config(node: &kdl::KdlNode) -> Result<PiiDetectionConfig>
         enabled = enabled,
         agent = %agent,
         action = ?action,
+        block_status = block_status,
         categories = ?categories,
         timeout_ms = timeout_ms,
         failure_mode = ?failure_mode,
@@ -2461,6 +2473,8 @@ fn parse_pii_detection_config(node: &kdl::KdlNode) -> Result<PiiDetectionConfig>
         enabled,
         agent,
         action,
+        block_status,
+        block_message,
         categories,
         timeout_ms,
         failure_mode,
@@ -3739,6 +3753,93 @@ mod tests {
                 resolve_builtin_handler(doc.nodes().first().unwrap(), "r").unwrap();
             assert_eq!(handler, Some(BuiltinHandler::CachePurge));
             assert_eq!(problem, None);
+        }
+    }
+
+    mod pii_detection {
+        fn config_with(settings: &str) -> anyhow::Result<crate::Config> {
+            crate::Config::from_kdl(&format!(
+                r#"
+                system {{ worker-threads 2 }}
+                listeners {{
+                    listener "http" {{
+                        address "127.0.0.1:8080"
+                        protocol "http"
+                    }}
+                }}
+                upstreams {{
+                    upstream "backend" {{
+                        target "127.0.0.1:9000"
+                    }}
+                }}
+                agents {{
+                    agent "pii" type="custom" {{
+                        unix-socket "/tmp/pii.sock"
+                        events "guardrail"
+                    }}
+                }}
+                routes {{
+                    route "chat" {{
+                        matches {{ path-prefix "/chat" }}
+                        upstream "backend"
+                        service-type "inference"
+                        inference {{
+                            provider "generic"
+                            guardrails {{
+                                pii-detection {{
+                                    enabled #true
+                                    agent "pii"
+                                    {settings}
+                                }}
+                            }}
+                        }}
+                    }}
+                }}
+                "#
+            ))
+        }
+
+        fn pii(config: &crate::Config) -> &crate::PiiDetectionConfig {
+            config.routes[0]
+                .inference
+                .as_ref()
+                .and_then(|inference| inference.guardrails.as_ref())
+                .and_then(|guardrails| guardrails.pii_detection.as_ref())
+                .unwrap()
+        }
+
+        /// `redact` used to be accepted and then did nothing: the request
+        /// went through unchanged and the response was not redacted.
+        #[test]
+        fn refuses_redact() {
+            let error = config_with(r#"action "redact""#).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("'redact' is not implemented; use 'log' or 'block'"),
+                "{message}"
+            );
+        }
+
+        #[test]
+        fn defaults_to_log_with_a_400_refusal() {
+            let config = config_with("").unwrap();
+            let pii = pii(&config);
+            assert_eq!(pii.action, crate::PiiAction::Log);
+            assert_eq!(pii.block_status, 400);
+            assert_eq!(pii.block_message, None);
+        }
+
+        #[test]
+        fn reads_block_with_its_status_and_message() {
+            let config = config_with(
+                r#"action "block"; block-status 451; block-message "no PII"; failure-mode "closed""#,
+            )
+            .unwrap();
+            let pii = pii(&config);
+            assert_eq!(pii.action, crate::PiiAction::Block);
+            assert_eq!(pii.block_status, 451);
+            assert_eq!(pii.block_message.as_deref(), Some("no PII"));
+            assert_eq!(pii.failure_mode, crate::GuardrailFailureMode::Closed);
         }
     }
 }

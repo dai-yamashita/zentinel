@@ -52,7 +52,7 @@ The inference module provides specialized handling for LLM inference endpoints:
           ▼
 ┌───────────────────┐
 │   Guardrails      │  Prompt injection detection
-│   (optional)      │  PII detection
+│   (optional)      │  PII detection (action "block")
 └─────────┬─────────┘
           │
      ┌────┴────┐
@@ -333,7 +333,8 @@ route "/v1/chat/completions" {
             pii-detection {
                 enabled #true
                 agent "pii-agent"
-                action "redact"
+                action "block"
+                // Or "log" to only log and count detections
                 // Categories: ssn, credit-card, email, phone, etc.
                 categories "ssn" "credit-card"
             }
@@ -412,6 +413,48 @@ A request refused because the agent flagged its content is counted in
 `zentinel_blocked_requests_total{reason="prompt_injection"}`. A request
 refused because the check could not be made (`failure-mode "closed"`) is
 counted in `zentinel_blocked_requests_total{reason="prompt_check_failed"}`.
+
+### PII check
+
+`pii-detection` asks its agent (a guardrail inspection event of type
+`pii_detection`, with the guardrail's `categories`) whether a text holds
+personal data. What is checked, and when, depends on `action`:
+
+| `action` | Request (the prompt) | Streamed response |
+|----------|----------------------|-------------------|
+| `block` | Checked before an upstream is chosen; a request with PII in it is refused | Checked after it was sent; a detection is logged and counted |
+| `log` (default) | Not checked | Checked after it was sent; a detection is logged and counted |
+
+There is no `redact`: the agent is sent the text taken from the body, not
+the body, so a redacted text it returns cannot be put back into the
+request, and a response is checked only after it was sent. `action
+"redact"` is refused when the configuration is loaded.
+
+**Request, `action "block"`.** The request body is read and its text taken
+exactly as for the [prompt check](#prompt-check) (same body-size limit, same
+fields, same requests left unchecked: no body, a WebSocket upgrade, a
+proxied MCP tool call). On a route with both checks, the prompt check runs
+first, on the same body, which is read once. The upstream is contacted only
+once both have passed.
+
+- PII detected: refused with `block-status` (default `400`) and
+  `block-message` (default `Request blocked: personal data detected`), as
+  `{"error": "pii_blocked", "message": ...}`. Counted in
+  `zentinel_blocked_requests_total{reason="pii"}`, and each detection in
+  `zentinel_pii_detected_total{route, category}`.
+- The check cannot be made: `failure-mode` applies. `open` (default)
+  forwards the request; `closed` refuses it with `504` (the guardrail's
+  `timeout-ms`, default 1000, ran out), `503` (the agent's call failed or
+  its answer is unusable) or `block-status` (the body has no text to
+  check), counted in `zentinel_blocked_requests_total{reason="pii_check_failed"}`.
+
+**Streamed response, any action.** Only a streamed (SSE) response of a
+route that counts tokens (`rate-limit`, `budget` or `cost-attribution`) is
+checked, on the text accumulated from the stream, when the request is
+logged, after the response was sent to the client. A detection is logged
+and counted in `zentinel_pii_detected_total{route, category}`; it changes
+nothing the client received. An agent failure or timeout is logged, and
+`failure-mode` does not apply. A non-streamed response is not checked.
 
 ## Model Routing
 
@@ -585,6 +628,8 @@ zentinel_inference_cost_dollars_total{route="chat", model="gpt-4"}
 # Guardrails
 zentinel_blocked_requests_total{reason="prompt_injection"}
 zentinel_blocked_requests_total{reason="prompt_check_failed"}
+zentinel_blocked_requests_total{reason="pii"}
+zentinel_blocked_requests_total{reason="pii_check_failed"}
 zentinel_pii_detected_total{route="chat", category="ssn"}
 
 # Model routing

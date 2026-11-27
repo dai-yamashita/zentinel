@@ -377,7 +377,7 @@ budget count the prompt. See
 | Property | Type | Description |
 |----------|------|-------------|
 | `prompt-injection` | `PromptInjectionConfig` | Prompt injection detection |
-| `pii-detection` | `PiiDetectionConfig` | PII detection |
+| `pii-detection` | `PiiDetectionConfig` | PII detection: refuses requests with `action "block"`, logs detections in streamed responses |
 
 ### PromptInjectionConfig
 
@@ -401,6 +401,26 @@ The text checked is taken from the request body as described in
 array of strings), `text`, `query`, `question`. A body of another shape, or
 with a `Content-Encoding` other than `identity`, has no text to check. A
 WebSocket upgrade and a proxied MCP tool call are not checked.
+
+### PiiDetectionConfig
+
+With `action "block"`, checked on the request body before an upstream is
+chosen, read and taken apart as for `prompt-injection` (after it, on the same
+body). Under either action, a streamed (SSE) response of a route with
+`rate-limit`, `budget` or `cost-attribution` is checked after it was sent,
+and a detection is only logged and counted. See
+[PII check](../../proxy/docs/inference.md#pii-check).
+
+| Property | Type | Default | Description |
+|----------|------|---------|-------------|
+| `enabled` | `bool` | `#false` | Run the check |
+| `agent` | `string` | **required** | Guardrail agent to ask (over a Unix socket) |
+| `action` | `string` | `"log"` | `block`: check the request and refuse one with PII in it. `log`: do not check the request; only log and count detections in streamed responses. `redact` is refused at load (not implemented) |
+| `block-status` | `int` | `400` | Status of the refusal when `action "block"` and PII is detected (also of a refusal for a body with no text to check, under `failure-mode "closed"`) |
+| `block-message` | `string` | - | Message of the refusal when `action "block"` and PII is detected |
+| `categories` | `[string]` | `[]` | PII categories sent to the agent (e.g. `ssn`, `credit-card`, `email`) |
+| `timeout-ms` | `int` | `1000` | How long to wait for the agent |
+| `failure-mode` | `string` | `"open"` | Request check (`action "block"`) only, when it cannot be made: `open` forwards the request, `closed` refuses it (`504` on timeout, `503` on agent failure, `block-status` when the body has no text). Not applied to the response check |
 
 ### FallbackConfig
 

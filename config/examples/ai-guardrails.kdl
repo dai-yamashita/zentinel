@@ -130,13 +130,13 @@ routes {
                     failure-mode "open"  // Allow if agent fails
                 }
 
-                // PII detection in responses
+                // PII detection (prompts with action "block", streamed responses)
                 pii-detection {
                     enabled #true
                     agent "pii-detector"
 
                     // What to do when PII is found
-                    action "redact"  // log, redact, block
+                    action "block"  // log or block (refuses a prompt with PII in it)
 
                     // PII types to detect
                     categories "ssn" "credit_card" "email" "phone" "address"
@@ -227,7 +227,7 @@ routes {
                 pii-detection {
                     enabled #true
                     agent "pii-detector"
-                    action "block"  // Block instead of redact
+                    action "block"  // Refuse a prompt with PII in it
                     categories "ssn" "credit_card" "email" "phone" "address" "dob"
                     timeout-ms 500
                     failure-mode "closed"

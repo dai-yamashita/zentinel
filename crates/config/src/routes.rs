@@ -1005,8 +1005,12 @@ pub struct PromptInjectionConfig {
 
 /// PII detection configuration.
 ///
-/// Detects sensitive data (SSN, credit cards, emails, etc.) in responses.
-/// Uses an external agent for content analysis.
+/// Detects sensitive data (SSN, credit cards, emails, etc.) through an
+/// external agent. With `action "block"` the request body (the prompt) is
+/// checked before an upstream is chosen, and a request with PII in it is
+/// refused. Under any action, a streamed (SSE) response of a route that
+/// counts tokens is checked after it was sent, and a detection is logged
+/// and counted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PiiDetectionConfig {
     /// Enable PII detection
@@ -1019,6 +1023,14 @@ pub struct PiiDetectionConfig {
     /// Action to take when PII is detected
     #[serde(default)]
     pub action: PiiAction,
+
+    /// HTTP status code when a request is refused for PII (default: 400)
+    #[serde(default = "default_guardrail_block_status")]
+    pub block_status: u16,
+
+    /// Custom message when a request is refused for PII
+    #[serde(default)]
+    pub block_message: Option<String>,
 
     /// PII categories to detect (e.g., "ssn", "credit-card", "email", "phone")
     #[serde(default)]
@@ -1046,16 +1058,20 @@ pub enum GuardrailAction {
     Warn,
 }
 
-/// Action to take when PII is detected in responses
+/// Action to take when PII is detected.
+///
+/// There is no `redact`: the agent is sent the text extracted from the body,
+/// not the body, so what it could give back cannot be put back into the
+/// request. `action "redact"` is refused when the config is loaded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum PiiAction {
-    /// Log the detection only (default)
+    /// Log and count the detection only (default). The request body is not
+    /// checked; a streamed response is, after it was sent.
     #[default]
     Log,
-    /// Redact PII in response (non-streaming only)
-    Redact,
-    /// Block response (non-streaming only)
+    /// Check the request body before an upstream is chosen and refuse a
+    /// request with PII in it.
     Block,
 }
 

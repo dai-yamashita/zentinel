@@ -34,7 +34,7 @@ Example configurations demonstrating Zentinel features and patterns.
 - **Model Routing** - Route requests based on model name
 - **Provider Support** - OpenAI, Anthropic, and generic providers
 - **Fallback Routing** - Cross-provider failover with model mapping
-- **Guardrails** - Prompt injection detection, PII detection/redaction
+- **Guardrails** - Prompt injection detection, PII detection (log or block)
 
 ## Traffic Management
 

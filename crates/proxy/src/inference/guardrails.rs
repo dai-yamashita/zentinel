@@ -2,7 +2,7 @@
 //!
 //! Provides content inspection via external agents:
 //! - Prompt injection detection on requests
-//! - PII detection on responses
+//! - PII detection on requests (`action "block"`) and streamed responses
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -61,8 +61,9 @@ pub enum PiiCheckResult {
         detections: Vec<GuardrailDetection>,
         redacted_content: Option<String>,
     },
-    /// Agent error
-    Error { message: String },
+    /// The check could not be made: the agent failed, or did not answer
+    /// within the guardrail's `timeout-ms` (`timed_out`).
+    Error { message: String, timed_out: bool },
 }
 
 /// Trait for calling guardrail agents.
@@ -289,11 +290,14 @@ impl GuardrailProcessor {
         }
     }
 
-    /// Check response content for PII.
+    /// Check content (a request's prompt or a response) for PII.
+    ///
+    /// The result does not depend on the configured action: the caller
+    /// decides what a detection or an error means.
     ///
     /// # Arguments
     /// * `config` - PII detection configuration
-    /// * `content` - Response content to inspect
+    /// * `content` - Content to inspect
     /// * `route_id` - Route ID for context
     /// * `correlation_id` - Request correlation ID
     pub async fn check_pii(
@@ -312,7 +316,7 @@ impl GuardrailProcessor {
             agent = %config.agent,
             content_len = content.len(),
             categories = ?config.categories,
-            "Checking response for PII"
+            "Checking content for PII"
         );
 
         let event = GuardrailInspectEvent {
@@ -364,6 +368,7 @@ impl GuardrailProcessor {
 
                 PiiCheckResult::Error {
                     message: e.to_string(),
+                    timed_out: false,
                 }
             }
             Err(_) => {
@@ -376,6 +381,7 @@ impl GuardrailProcessor {
 
                 PiiCheckResult::Error {
                     message: "Agent timeout".to_string(),
+                    timed_out: true,
                 }
             }
         }
@@ -533,6 +539,8 @@ mod tests {
             enabled: true,
             agent: "pii-scanner".to_string(),
             action: zentinel_config::PiiAction::Log,
+            block_status: 400,
+            block_message: None,
             categories: vec!["ssn".to_string(), "email".to_string()],
             timeout_ms: 5000,
             failure_mode: GuardrailFailureMode::Open,
@@ -1012,7 +1020,7 @@ mod tests {
             .await;
 
         match result {
-            PiiCheckResult::Error { message } => {
+            PiiCheckResult::Error { message, .. } => {
                 assert!(message.contains("unavailable"));
             }
             _ => panic!("Expected Error result, got {:?}", result),
@@ -1045,6 +1053,7 @@ mod tests {
 
         let result = PiiCheckResult::Error {
             message: "test error".to_string(),
+            timed_out: false,
         };
         let debug_str = format!("{:?}", result);
         assert!(debug_str.contains("Error"));

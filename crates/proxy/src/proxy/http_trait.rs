@@ -24,7 +24,7 @@ use crate::cache::{get_cache_eviction, get_cache_lock, get_cache_storage};
 use crate::disk_cache::DiskHitHandler;
 use crate::hybrid_cache::HybridHitHandler;
 use crate::inference::{
-    extract_inference_content, is_sse_response, BlockCause, PromptInjectionResult,
+    extract_inference_content, is_sse_response, BlockCause, PiiCheckResult, PromptInjectionResult,
     StreamingTokenCounter,
 };
 use crate::logging::{AccessLogEntry, AuditEventType, AuditLogEntry};
@@ -1892,6 +1892,12 @@ impl ProxyHttp for ZentinelProxy {
         // it runs once the checks that can refuse a request without reading
         // one are done.
         if self.check_prompt_guardrail(session, ctx).await? {
+            return Ok(true);
+        }
+
+        // PII check of an inference route whose `pii-detection` action is
+        // `block`, on the same body, also before an upstream is chosen.
+        if self.check_pii_guardrail(session, ctx).await? {
             return Ok(true);
         }
 
@@ -4540,7 +4546,7 @@ impl ProxyHttp for ZentinelProxy {
                                                             "No PII detected in response"
                                                         );
                                                     }
-                                                    crate::inference::PiiCheckResult::Error { message } => {
+                                                    crate::inference::PiiCheckResult::Error { message, .. } => {
                                                         debug!(
                                                             correlation_id = %ctx.trace_id,
                                                             agent_correlation_id = %ctx.agent_correlation_id(),
@@ -6686,6 +6692,192 @@ impl ZentinelProxy {
             }
         }
         Ok(false)
+    }
+
+    /// The PII check of an inference route's request: the `guardrails`
+    /// block's `pii-detection` entry with `action "block"`.
+    ///
+    /// Made on the request body, like the prompt check (see
+    /// `check_prompt_guardrail`): the whole body is read before an upstream
+    /// is chosen, bounded by the route's body-size limit (413 above it), and
+    /// the text sent to the agent is taken from it by
+    /// `extract_inference_content`. A request in which the agent detects PII
+    /// is refused with the guardrail's `block-status` (default 400). When
+    /// the check cannot be made, the guardrail's `failure-mode` applies:
+    /// `open` forwards the request, `closed` refuses it with 504 (the
+    /// guardrail's `timeout-ms` ran out), 503 (the agent's call failed) or
+    /// `block-status` (the body has no text to check).
+    ///
+    /// With `action "log"` the request is not checked here. A request
+    /// without a body, a WebSocket upgrade and a proxied MCP tool call are
+    /// not checked.
+    ///
+    /// Returns `Ok(true)` when the response has been written and the
+    /// request must not be forwarded.
+    async fn check_pii_guardrail(
+        &self,
+        session: &mut Session,
+        ctx: &mut RequestContext,
+    ) -> Result<bool, Box<Error>> {
+        use zentinel_config::{GuardrailFailureMode, PiiAction};
+
+        let Some(route_config) = ctx.route_config.clone() else {
+            return Ok(false);
+        };
+        let Some(pii_config) = route_config
+            .inference
+            .as_ref()
+            .and_then(|inference| inference.guardrails.as_ref())
+            .and_then(|guardrails| guardrails.pii_detection.as_ref())
+            .filter(|pii_config| pii_config.enabled && pii_config.action == PiiAction::Block)
+        else {
+            return Ok(false);
+        };
+        if ctx.is_websocket_upgrade || ctx.mcp_proxied_call.is_some() {
+            return Ok(false);
+        }
+
+        let body = match &ctx.validated_request_body {
+            Some(body) => body.clone(),
+            None => {
+                self.read_whole_request_body(session, ctx, "PII check")
+                    .await?
+            }
+        };
+        if body.is_empty() {
+            return Ok(false);
+        }
+        ctx.validated_request_body = Some(body.clone());
+        ctx.guardrails_enabled = true;
+
+        let route = ctx.route_id.as_deref().unwrap_or("unknown").to_string();
+        // A body with a `Content-Encoding` is not decompressed here, so it has
+        // no text to check.
+        let content = if has_content_encoding(&session.req_header().headers) {
+            None
+        } else {
+            extract_inference_content(&body)
+        };
+        let no_text = content.is_none();
+        let result = match content {
+            Some(content) => {
+                self.guardrail_processor
+                    .check_pii(
+                        pii_config,
+                        &content,
+                        ctx.route_id.as_deref(),
+                        ctx.agent_correlation_id(),
+                    )
+                    .await
+            }
+            None => {
+                warn!(
+                    correlation_id = %ctx.trace_id,
+                    route_id = %route,
+                    failure_mode = ?pii_config.failure_mode,
+                    "No message content to check for PII in the request body"
+                );
+                PiiCheckResult::Error {
+                    message: "no text to check".to_string(),
+                    timed_out: false,
+                }
+            }
+        };
+
+        // The refusal: (status, message, audit reason, metric reason).
+        let refusal = match result {
+            PiiCheckResult::Clean => {
+                trace!(correlation_id = %ctx.trace_id, "No PII detected in request");
+                return Ok(false);
+            }
+            PiiCheckResult::Detected { detections, .. } => {
+                warn!(
+                    correlation_id = %ctx.trace_id,
+                    agent_correlation_id = %ctx.agent_correlation_id(),
+                    route_id = %route,
+                    detection_count = detections.len(),
+                    "PII detected in request, blocking request"
+                );
+                for detection in &detections {
+                    self.metrics
+                        .record_pii_detected(&route, &detection.category);
+                }
+                ctx.pii_detection_categories =
+                    detections.iter().map(|d| d.category.clone()).collect();
+                (
+                    pii_config.block_status,
+                    pii_config
+                        .block_message
+                        .clone()
+                        .unwrap_or_else(|| "Request blocked: personal data detected".to_string()),
+                    "PII detected",
+                    "pii",
+                )
+            }
+            PiiCheckResult::Error { message, timed_out } => {
+                if pii_config.failure_mode == GuardrailFailureMode::Open {
+                    trace!(
+                        correlation_id = %ctx.trace_id,
+                        error = %message,
+                        "PII check did not complete, forwarding (failure-mode open)"
+                    );
+                    return Ok(false);
+                }
+                let (status, message) = if no_text {
+                    (
+                        pii_config.block_status,
+                        "Request blocked: its content could not be read for the check",
+                    )
+                } else if timed_out {
+                    (504, "Guardrail check timed out")
+                } else {
+                    (503, "Guardrail check unavailable")
+                };
+                warn!(
+                    correlation_id = %ctx.trace_id,
+                    route_id = %route,
+                    status = status,
+                    "PII check did not complete, blocking request"
+                );
+                (
+                    status,
+                    message.to_string(),
+                    "PII check did not complete",
+                    "pii_check_failed",
+                )
+            }
+        };
+        let (status, message, audit_reason, metric_reason) = refusal;
+        self.metrics.record_blocked_request(metric_reason);
+
+        let audit_entry = AuditLogEntry::new(
+            &ctx.trace_id,
+            AuditEventType::Blocked,
+            &ctx.method,
+            &ctx.path,
+            &ctx.client_ip,
+        )
+        .with_route_id(&route)
+        .with_status_code(status)
+        .with_reason(audit_reason.to_string());
+        self.log_manager.log_audit(&audit_entry);
+
+        // Same JSON as the prompt check's refusal.
+        let refusal = handlers::ProxyError {
+            status,
+            message: Some(&message),
+            default_body: bytes::Bytes::from(
+                serde_json::json!({
+                    "error": "pii_blocked",
+                    "message": message,
+                })
+                .to_string(),
+            ),
+            default_content_type: "application/json",
+            headers: Vec::new(),
+        };
+        self.write_proxy_error(session, ctx, refusal).await?;
+        Ok(true)
     }
 
     /// Send buffered body to agents (buffer mode).
