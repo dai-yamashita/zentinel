@@ -126,6 +126,26 @@ impl TokenCounter {
     }
 }
 
+/// The input and output tokens a provider reports in a response body that is
+/// not streamed: `usage.prompt_tokens` / `usage.completion_tokens` (OpenAI)
+/// or `usage.input_tokens` / `usage.output_tokens` (Anthropic).
+pub fn usage_from_body(body: &[u8]) -> Option<(u64, u64)> {
+    if body.is_empty() {
+        return None;
+    }
+    let json: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let usage = json.get("usage")?;
+    let count = |name: &str| usage.get(name).and_then(|n| n.as_u64());
+    match (count("prompt_tokens"), count("completion_tokens")) {
+        (None, None) => {}
+        (input, output) => return Some((input.unwrap_or(0), output.unwrap_or(0))),
+    }
+    match (count("input_tokens"), count("output_tokens")) {
+        (None, None) => None,
+        (input, output) => Some((input.unwrap_or(0), output.unwrap_or(0))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,5 +178,18 @@ mod tests {
         let estimate = counter.tokens_from_response(&headers, body);
         assert_eq!(estimate.tokens, 150);
         assert_eq!(estimate.source, TokenSource::Body);
+    }
+
+    #[test]
+    fn usage_split_from_a_response_body() {
+        let openai =
+            br#"{"usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}}"#;
+        assert_eq!(usage_from_body(openai), Some((10, 5)));
+        let anthropic = br#"{"usage": {"input_tokens": 7, "output_tokens": 3}}"#;
+        assert_eq!(usage_from_body(anthropic), Some((7, 3)));
+        assert_eq!(usage_from_body(br#"{"usage": {"total_tokens": 15}}"#), None);
+        assert_eq!(usage_from_body(br#"{"choices": []}"#), None);
+        assert_eq!(usage_from_body(b"not json"), None);
+        assert_eq!(usage_from_body(b""), None);
     }
 }

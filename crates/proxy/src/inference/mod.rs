@@ -61,14 +61,14 @@ pub use guardrails::{
     PromptInjectionResult,
 };
 pub use manager::{InferenceCheckResult, InferenceRateLimitManager, InferenceRouteStats};
-pub use metrics::InferenceMetrics;
+pub use metrics::{get_inference_metrics, init_inference_metrics, InferenceMetrics};
 pub use providers::{create_provider, InferenceProviderAdapter};
 pub use rate_limit::{TokenRateLimitResult, TokenRateLimiter};
 pub use streaming::{
     is_sse_response, StreamingTokenCounter, StreamingTokenResult, TokenCountSource,
 };
 pub use tiktoken::{tiktoken_manager, TiktokenEncoding, TiktokenManager};
-pub use tokens::{TokenCounter, TokenEstimate, TokenSource};
+pub use tokens::{usage_from_body, TokenCounter, TokenEstimate, TokenSource};
 
 use zentinel_config::{InferenceConfig, InferenceProvider};
 

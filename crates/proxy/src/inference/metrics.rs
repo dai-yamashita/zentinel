@@ -11,8 +11,28 @@ use prometheus::{
     CounterVec, HistogramVec, IntCounterVec, IntGaugeVec,
 };
 
+use std::sync::{Arc, OnceLock};
+
 use zentinel_common::budget::{BudgetAlert, BudgetCheckResult, CostResult};
 use zentinel_common::ids::Scope;
+
+/// The process's inference metrics, registered once.
+static INFERENCE_METRICS: OnceLock<Arc<InferenceMetrics>> = OnceLock::new();
+
+/// The inference metrics, if `init_inference_metrics` registered them.
+pub fn get_inference_metrics() -> Option<Arc<InferenceMetrics>> {
+    INFERENCE_METRICS.get().cloned()
+}
+
+/// Register the inference metrics with the default Prometheus registry (the
+/// one the metrics endpoint serves). Returns them when already registered.
+pub fn init_inference_metrics() -> Result<Arc<InferenceMetrics>> {
+    if let Some(metrics) = INFERENCE_METRICS.get() {
+        return Ok(metrics.clone());
+    }
+    let metrics = Arc::new(InferenceMetrics::new()?);
+    Ok(INFERENCE_METRICS.get_or_init(|| metrics).clone())
+}
 
 /// Inference-specific metrics collector.
 ///

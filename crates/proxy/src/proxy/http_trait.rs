@@ -43,6 +43,10 @@ use super::ZentinelProxy;
 use zentinel_common::observability::RequestMetrics;
 use zentinel_common::types::is_idempotent_method;
 
+/// How much of an inference response that is not streamed is kept to read
+/// the provider's `usage` from. A larger body is not read for it.
+const INFERENCE_USAGE_BODY_LIMIT: usize = 1024 * 1024;
+
 /// The IP socket address behind a Pingora endpoint, if it has one.
 ///
 /// Unix-domain listeners carry no `SocketAddr` to resolve against a configured
@@ -2517,8 +2521,16 @@ impl ProxyHttp for ZentinelProxy {
             }
         }
 
-        // Initialize streaming token counter for SSE responses on inference routes
-        if ctx.inference_rate_limit_enabled {
+        // Initialize streaming token counter for SSE responses on inference
+        // routes that count tokens or check responses for PII
+        let checks_response_pii = ctx
+            .route_config
+            .as_ref()
+            .and_then(|r| r.inference.as_ref())
+            .and_then(|i| i.guardrails.as_ref())
+            .and_then(|g| g.pii_detection.as_ref())
+            .is_some_and(|pii| pii.enabled);
+        if ctx.inference_rate_limit_enabled || checks_response_pii {
             // Check if this is an SSE response
             let content_type = upstream_response
                 .headers
@@ -3350,6 +3362,18 @@ impl ProxyHttp for ZentinelProxy {
                 end_of_stream = end_of_stream,
                 "Processing response body chunk"
             );
+
+            // Keep the body of a response that is not streamed, to read the
+            // provider's `usage` from in `logging`.
+            if ctx.inference_rate_limit_enabled && ctx.inference_streaming_counter.is_none() {
+                if let Some(kept) = ctx.inference_response_body.as_mut() {
+                    if kept.len() + chunk.len() <= INFERENCE_USAGE_BODY_LIMIT {
+                        kept.extend_from_slice(chunk);
+                    } else {
+                        ctx.inference_response_body = None;
+                    }
+                }
+            }
 
             // Process SSE chunks for streaming token counting
             if let Some(ref mut counter) = ctx.inference_streaming_counter {
@@ -4458,6 +4482,84 @@ impl ProxyHttp for ZentinelProxy {
             }
         }
 
+        // PII detection guardrail (for streaming inference responses), with
+        // or without a token limit, budget or cost attribution on the route
+        if ctx.inference_streaming_response {
+            if let Some(ref route_config) = ctx.route_config {
+                if let Some(ref inference) = route_config.inference {
+                    if let Some(ref guardrails) = inference.guardrails {
+                        if let Some(ref pii_config) = guardrails.pii_detection {
+                            if pii_config.enabled {
+                                // Get accumulated content from streaming counter
+                                if let Some(ref counter) = ctx.inference_streaming_counter {
+                                    let response_content = counter.content();
+                                    if !response_content.is_empty() {
+                                        let pii_result = self
+                                            .guardrail_processor
+                                            .check_pii(
+                                                pii_config,
+                                                response_content,
+                                                ctx.route_id.as_deref(),
+                                                ctx.agent_correlation_id(),
+                                            )
+                                            .await;
+
+                                        match pii_result {
+                                            crate::inference::PiiCheckResult::Detected {
+                                                detections,
+                                                redacted_content: _,
+                                            } => {
+                                                warn!(
+                                                    correlation_id = %ctx.trace_id,
+                                                    agent_correlation_id = %ctx.agent_correlation_id(),
+                                                    route_id = ctx.route_id.as_deref().unwrap_or("unknown"),
+                                                    detection_count = detections.len(),
+                                                    "PII detected in inference response"
+                                                );
+
+                                                // Store detection categories for logging
+                                                ctx.pii_detection_categories = detections
+                                                    .iter()
+                                                    .map(|d| d.category.clone())
+                                                    .collect();
+
+                                                // Record metrics for each category
+                                                for detection in &detections {
+                                                    self.metrics.record_pii_detected(
+                                                        ctx.route_id
+                                                            .as_deref()
+                                                            .unwrap_or("unknown"),
+                                                        &detection.category,
+                                                    );
+                                                }
+                                            }
+                                            crate::inference::PiiCheckResult::Clean => {
+                                                trace!(
+                                                    correlation_id = %ctx.trace_id,
+                                                    "No PII detected in response"
+                                                );
+                                            }
+                                            crate::inference::PiiCheckResult::Error {
+                                                message,
+                                                ..
+                                            } => {
+                                                debug!(
+                                                    correlation_id = %ctx.trace_id,
+                                                    agent_correlation_id = %ctx.agent_correlation_id(),
+                                                    error = %message,
+                                                    "PII detection check failed"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Record actual token usage for inference rate limiting
         // This adjusts the token bucket based on actual vs estimated tokens
         if ctx.inference_rate_limit_enabled {
@@ -4492,88 +4594,21 @@ impl ProxyHttp for ZentinelProxy {
                     );
                 }
 
-                // PII detection guardrail (for streaming inference responses)
-                if ctx.inference_streaming_response {
-                    if let Some(ref route_config) = ctx.route_config {
-                        if let Some(ref inference) = route_config.inference {
-                            if let Some(ref guardrails) = inference.guardrails {
-                                if let Some(ref pii_config) = guardrails.pii_detection {
-                                    if pii_config.enabled {
-                                        // Get accumulated content from streaming counter
-                                        if let Some(ref counter) = ctx.inference_streaming_counter {
-                                            let response_content = counter.content();
-                                            if !response_content.is_empty() {
-                                                let pii_result = self
-                                                    .guardrail_processor
-                                                    .check_pii(
-                                                        pii_config,
-                                                        response_content,
-                                                        ctx.route_id.as_deref(),
-                                                        ctx.agent_correlation_id(),
-                                                    )
-                                                    .await;
-
-                                                match pii_result {
-                                                    crate::inference::PiiCheckResult::Detected {
-                                                        detections,
-                                                        redacted_content: _,
-                                                    } => {
-                                                        warn!(
-                                                            correlation_id = %ctx.trace_id,
-                                                            agent_correlation_id = %ctx.agent_correlation_id(),
-                                                            route_id = ctx.route_id.as_deref().unwrap_or("unknown"),
-                                                            detection_count = detections.len(),
-                                                            "PII detected in inference response"
-                                                        );
-
-                                                        // Store detection categories for logging
-                                                        ctx.pii_detection_categories = detections
-                                                            .iter()
-                                                            .map(|d| d.category.clone())
-                                                            .collect();
-
-                                                        // Record metrics for each category
-                                                        for detection in &detections {
-                                                            self.metrics.record_pii_detected(
-                                                                ctx.route_id.as_deref().unwrap_or("unknown"),
-                                                                &detection.category,
-                                                            );
-                                                        }
-                                                    }
-                                                    crate::inference::PiiCheckResult::Clean => {
-                                                        trace!(
-                                                            correlation_id = %ctx.trace_id,
-                                                            "No PII detected in response"
-                                                        );
-                                                    }
-                                                    crate::inference::PiiCheckResult::Error { message, .. } => {
-                                                        debug!(
-                                                            correlation_id = %ctx.trace_id,
-                                                            agent_correlation_id = %ctx.agent_correlation_id(),
-                                                            error = %message,
-                                                            "PII detection check failed"
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Response body would require buffering, which is expensive
-                // For non-streaming, most LLM APIs provide token counts in headers
-                // For streaming, we use the accumulated SSE content
-                let empty_body: &[u8] = &[];
+                // A response that is not streamed: its body as kept by
+                // `response_body_filter` (empty when streamed or too large),
+                // for the provider's `usage`.
+                let response_body = if ctx.inference_streaming_response {
+                    Vec::new()
+                } else {
+                    ctx.inference_response_body.take().unwrap_or_default()
+                };
+                let body_usage = crate::inference::usage_from_body(&response_body);
 
                 if let Some(actual_estimate) = self.inference_rate_limit_manager.record_actual(
                     route_id,
                     rate_limit_key,
                     &response_headers,
-                    empty_body,
+                    &response_body,
                     ctx.inference_estimated_tokens,
                 ) {
                     // Use streaming result if available and header extraction failed
@@ -4650,6 +4685,9 @@ impl ProxyHttp for ZentinelProxy {
                                     streaming.input_tokens.unwrap_or(ctx.inference_input_tokens);
                                 let output = streaming.output_tokens;
                                 (input, output)
+                            } else if let Some((input, output)) = body_usage {
+                                // The provider's own count in the response body
+                                (input, output)
                             } else {
                                 // Fallback: estimate output from total - input
                                 let input = ctx.inference_input_tokens;
@@ -4663,6 +4701,9 @@ impl ProxyHttp for ZentinelProxy {
                                 .calculate_cost(route_id, model, input_tokens, output_tokens)
                             {
                                 ctx.inference_request_cost = Some(cost_result.total_cost);
+                                if let Some(metrics) = crate::inference::get_inference_metrics() {
+                                    metrics.record_cost(route_id, &cost_result, &ctx.scope());
+                                }
 
                                 trace!(
                                     correlation_id = %ctx.trace_id,

@@ -612,6 +612,10 @@ pub struct RequestContext {
     pub(crate) inference_streaming_response: bool,
     /// Streaming token counter for SSE responses
     pub(crate) inference_streaming_counter: Option<StreamingTokenCounter>,
+    /// The body of a response that is not streamed, kept (up to
+    /// `INFERENCE_USAGE_BODY_LIMIT` bytes) to read the provider's `usage`
+    /// from once it is complete. `None` once it went over the limit.
+    pub(crate) inference_response_body: Option<Vec<u8>>,
 
     // === Fallback Routing ===
     /// Current fallback attempt number (0 = primary, 1+ = fallback)
@@ -796,6 +800,7 @@ impl RequestContext {
             inference_output_tokens: 0,
             inference_streaming_response: false,
             inference_streaming_counter: None,
+            inference_response_body: Some(Vec::new()),
             fallback_attempt: 0,
             tried_upstreams: Vec::new(),
             fallback_reason: None,

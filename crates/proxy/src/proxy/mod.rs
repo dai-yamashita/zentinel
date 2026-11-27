@@ -368,6 +368,11 @@ impl ZentinelProxy {
             warn!("Failed to initialize fallback metrics: {}", e);
         }
 
+        // Initialize inference cost metrics (best-effort, log warning if fails)
+        if let Err(e) = crate::inference::init_inference_metrics() {
+            warn!("Failed to initialize inference metrics: {}", e);
+        }
+
         // Initialize model routing metrics (best-effort, log warning if fails)
         if let Err(e) = init_model_routing_metrics() {
             warn!("Failed to initialize model routing metrics: {}", e);

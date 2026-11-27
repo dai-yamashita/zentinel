@@ -137,9 +137,13 @@ impl StreamingTokenCounter {
                     result.is_done = true;
                     self.completed = true;
                 }
-                if line_result.usage.is_some() {
-                    result.usage = line_result.usage.clone();
-                    self.api_usage = line_result.usage;
+                if let Some(usage) = line_result.usage {
+                    // A stream can report its usage in parts: Anthropic sends
+                    // the input tokens in `message_start` and the output
+                    // tokens in `message_delta`.
+                    let usage = merge_usage(self.api_usage.as_ref(), usage);
+                    result.usage = Some(usage.clone());
+                    self.api_usage = Some(usage);
                 }
             }
 
@@ -405,6 +409,35 @@ impl StreamingTokenCounter {
     }
 }
 
+/// The usage a stream has reported so far, updated with a later report.
+///
+/// A count the later report leaves at zero keeps its earlier value, so
+/// Anthropic's `message_delta` (output tokens only) does not drop the input
+/// tokens `message_start` reported.
+fn merge_usage(earlier: Option<&ApiUsage>, later: ApiUsage) -> ApiUsage {
+    let Some(earlier) = earlier else {
+        return later;
+    };
+    if later.input_tokens > 0 && later.output_tokens > 0 {
+        return later;
+    }
+    let input_tokens = if later.input_tokens > 0 {
+        later.input_tokens
+    } else {
+        earlier.input_tokens
+    };
+    let output_tokens = if later.output_tokens > 0 {
+        later.output_tokens
+    } else {
+        earlier.output_tokens
+    };
+    ApiUsage {
+        input_tokens,
+        output_tokens,
+        total_tokens: input_tokens + output_tokens,
+    }
+}
+
 /// Source of token count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenCountSource {
@@ -512,6 +545,13 @@ mod tests {
 
         assert_eq!(counter.content(), "Hello there");
         assert!(counter.is_completed());
+
+        // The input tokens of `message_start` and the output tokens of
+        // `message_delta` together.
+        let result = counter.finalize();
+        assert_eq!(result.input_tokens, Some(25));
+        assert_eq!(result.output_tokens, 3);
+        assert_eq!(result.total_tokens, Some(28));
     }
 
     #[test]

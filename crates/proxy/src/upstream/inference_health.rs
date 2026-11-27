@@ -110,18 +110,20 @@ impl InferenceHealthCheck {
             .await
             .map_err(|e| format!("Failed to send request: {}", e))?;
 
-        // Read response with timeout
-        let mut response = vec![0u8; 65536]; // 64KB buffer for models list
-        let n = tokio::time::timeout(self.timeout, stream.read(&mut response))
+        // Read the whole response: the request asks the server to close the
+        // connection, so read until it does. A response can arrive in several
+        // reads (a large models list always does), and one read would see only
+        // its start. Bounded by the timeout and MAX_RESPONSE_BYTES.
+        let response = tokio::time::timeout(self.timeout, read_response(&mut stream))
             .await
             .map_err(|_| "Response timeout".to_string())?
             .map_err(|e| format!("Failed to read response: {}", e))?;
 
-        if n == 0 {
+        if response.is_empty() {
             return Err("Empty response".to_string());
         }
 
-        let response_str = String::from_utf8_lossy(&response[..n]);
+        let response_str = String::from_utf8_lossy(&response);
 
         // Parse HTTP status
         let status_code = self.parse_status_code(&response_str)?;
@@ -313,9 +315,58 @@ impl PingoraHealthCheck for InferenceHealthCheck {
     }
 }
 
+/// Largest health check response read; a models list is far smaller.
+const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+
+/// Read a response until the server closes the connection, or until
+/// `MAX_RESPONSE_BYTES` have been read.
+async fn read_response<R: tokio::io::AsyncRead + Unpin>(
+    stream: &mut R,
+) -> std::io::Result<Vec<u8>> {
+    let mut response = Vec::new();
+    let mut buf = [0u8; 16384];
+    loop {
+        let n = stream.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        let room = MAX_RESPONSE_BYTES - response.len();
+        response.extend_from_slice(&buf[..n.min(room)]);
+        if response.len() >= MAX_RESPONSE_BYTES {
+            break;
+        }
+    }
+    Ok(response)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn read_response_reads_a_response_sent_in_pieces() {
+        // The pipe holds the whole response, so the writer never waits on the
+        // reader; it yields after each piece, so the reader sees them one by one.
+        let (mut client, mut server) = tokio::io::duplex(1 << 20);
+        let body = format!(
+            "{{\"data\":[{}]}}",
+            vec!["{\"id\":\"gpt-4\"}"; 200].join(",")
+        );
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let sent = response.clone();
+        let writer = tokio::spawn(async move {
+            for piece in sent.as_bytes().chunks(10) {
+                server.write_all(piece).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        });
+        let read = read_response(&mut client).await.unwrap();
+        writer.await.unwrap();
+        assert_eq!(read, response.as_bytes());
+    }
 
     #[test]
     fn test_parse_openai_models_response() {
