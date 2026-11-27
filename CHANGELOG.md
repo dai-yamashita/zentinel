@@ -18,7 +18,7 @@ for details.
 
 | CalVer | Crate Version | Date | Highlights |
 |--------|---------------|------|------------|
- [26.11_11](#261111---2026-11-27) | 0.6.65 | 2026-11-27 | **Inference token limits, budgets and cost count real usage; PII `block` works** (read the upgrade notes); MCP routes accept earlier protocol revisions by default; model routing reads the body's `model` |
+ [26.11_11](#261111---2026-11-27) | 0.6.65 | 2026-11-27 | **Security fix: tool calls on multiplexing MCP routes go through body agents and per-tool rate limits ([GHSA-22x2-x9p8-m3q4](https://github.com/zentinelproxy/zentinel/security/advisories/GHSA-22x2-x9p8-m3q4)); inference token limits, budgets and cost count real usage; PII `block` works** (read the upgrade notes); MCP routes accept earlier protocol revisions by default; model routing reads the body's `model` |
 | [26.11_10](#261110---2026-11-26) | 0.6.64 | 2026-11-26 | **Security fixes in two bundled agents: Content Scanner 0.6.0 scans uploads without a `Content-Type`, MQTT Gateway 0.6.0 checks every packet in a WebSocket frame** (read the upgrade notes); `chunk-timeout-ms` applies and new `body-agent-time-ms` bounds agent time per streamed body; streamed-body metrics; a replacement chunk of another length is refused when the length was declared |
 | [26.11_9](#26119---2026-11-26) | 0.6.63 | 2026-11-26 | **Security fixes in two bundled agents: WAF 0.5.0 matches encoded headers and bodies, GraphQL Security 0.6.0 analyzes named fragments** (read the upgrade notes); a streaming request chunk replacement reaches the upstream as its bytes |
 | [26.11_8](#26118---2026-11-25) | 0.6.62 | 2026-11-25 | **Requests over the header limits get 431, not 500** (read the upgrade notes); **`bundle install --skip-verify` refuses an archive whose readable checksum does not match**; the ZentinelSec agent is pinned at 0.6.0; geo databases are read off the async workers; the Gateway API controller asks GRPCRoute backends for the whole server's health |
@@ -112,6 +112,14 @@ for details.
 **Crate version:** 0.6.65
 
 ### Upgrade notes
+- **Multiplexing MCP routes ([GHSA-22x2-x9p8-m3q4](https://github.com/zentinelproxy/zentinel/security/advisories/GHSA-22x2-x9p8-m3q4)).**
+  On a route that fronts several MCP servers (`mcp { upstreams { ... } }` with
+  two or more), a `tools/call` is now sent to the route's body agents before an
+  upstream is contacted, whatever their body mode, is checked against rate
+  limits keyed `mcp-tool` or `client-ip-and-mcp-tool`, and is counted in
+  `zentinel_mcp_calls_total`. From 0.6.40 to 0.6.64 these did not run for such
+  calls. Expect agent decisions and `429`s on these routes where there were
+  none.
 - **MCP protocol revisions (#854).** A route that leaves
   `require-validated-version` unset now accepts `2026-07-28` and later, the
   earlier revisions `2025-03-26`, `2025-06-18` and `2025-11-25`, and requests
