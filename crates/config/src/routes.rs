@@ -8,7 +8,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use validator::Validate;
 
-use zentinel_common::budget::{CostAttributionConfig, TokenBudgetConfig};
+use zentinel_common::budget::{
+    CostAttributionConfig, InferenceLimitKey, MissingKeyAction, TokenBudgetConfig,
+};
 use zentinel_common::types::{ByteSize, Priority, RetryPolicy};
 
 use crate::filters::RateLimitKey;
@@ -775,6 +777,15 @@ pub struct TokenRateLimit {
     /// Token estimation method (fallback when headers unavailable)
     #[serde(default)]
     pub estimation_method: TokenEstimation,
+
+    /// What a request is counted against: its client address (the default)
+    /// or the value of a request header
+    #[serde(default)]
+    pub key: InferenceLimitKey,
+
+    /// What to do with a request that lacks the `key` header
+    #[serde(default)]
+    pub missing_key: MissingKeyAction,
 }
 
 fn default_burst_tokens() -> u64 {

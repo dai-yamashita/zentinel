@@ -61,6 +61,43 @@ pub struct TokenBudgetConfig {
     /// the tenants with the oldest periods are evicted.
     #[serde(default = "default_max_tenants")]
     pub max_tenants: usize,
+
+    /// What a request is counted against: its client address (the default)
+    /// or the value of a request header
+    #[serde(default)]
+    pub key: InferenceLimitKey,
+
+    /// What to do with a request that lacks the `key` header
+    #[serde(default)]
+    pub missing_key: MissingKeyAction,
+}
+
+// ============================================================================
+// Key of a token rate limit or budget
+// ============================================================================
+
+/// What an inference token rate limit or budget counts a request against.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum InferenceLimitKey {
+    /// The client address (an IPv6 client by its network prefix)
+    #[default]
+    ClientIp,
+    /// The first value of this request header (name in lowercase), such as
+    /// an API key or a tenant id
+    Header(String),
+}
+
+/// What happens to a request without the header an [`InferenceLimitKey`]
+/// names, or whose first value of it is empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MissingKeyAction {
+    /// Count it against its client address
+    #[default]
+    ClientIp,
+    /// Refuse it with `401 Unauthorized`
+    Reject,
 }
 
 fn default_alert_thresholds() -> Vec<f64> {
@@ -86,6 +123,8 @@ impl Default for TokenBudgetConfig {
             rollover: false,
             burst_allowance: None,
             max_tenants: default_max_tenants(),
+            key: InferenceLimitKey::default(),
+            missing_key: MissingKeyAction::default(),
         }
     }
 }
