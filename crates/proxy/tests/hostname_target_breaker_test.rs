@@ -169,19 +169,25 @@ impl Proxy {
     }
 
     /// Send one request with `method`; the status and body of the answer.
+    ///
+    /// The status is `0` when no answer could be read. The proxy can answer
+    /// and close before it has read the body (when the upstream dropped the
+    /// connection, or when it refuses the request), and on Linux the client's
+    /// write or read then fails with a reset.
     fn request(&self, method: &str) -> (u16, String) {
         let mut stream = TcpStream::connect(("127.0.0.1", self.port)).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         let body = "{\"payload\":\"x\"}";
-        write!(
-            stream,
+        let request = format!(
             "{method} /work HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n\
              Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
-        )
-        .unwrap();
+        );
+        // One write, so the head is not sent in pieces. It can still fail when
+        // the proxy has already answered and closed; the answer is read anyway.
+        let _ = stream.write_all(request.as_bytes());
         let mut raw = Vec::new();
         let _ = stream.read_to_end(&mut raw);
         let raw = String::from_utf8_lossy(&raw).into_owned();
@@ -256,7 +262,11 @@ fn assert_breaker_opens(failure: Failure, method: &str, target: impl Fn(u16) -> 
 
     for n in 1..=FAILURE_THRESHOLD {
         let (status, body) = proxy.request(method);
-        assert!(status >= 500, "request {n} answered {status}: {body:?}");
+        // `0`: the connection was reset before an answer could be read.
+        assert!(
+            status == 0 || status >= 500,
+            "request {n} answered {status}: {body:?}"
+        );
         if matches!(failure, Failure::ServerError) {
             assert_eq!(
                 body, BACKEND_FAILURE_BODY,
@@ -283,8 +293,9 @@ fn assert_breaker_opens(failure: Failure, method: &str, target: impl Fn(u16) -> 
     let received = backend.received();
     for n in 1..=REQUESTS_AFTER_OPEN {
         let (status, body) = proxy.request(method);
+        // What reached the backend is checked below; `0` is a reset.
         assert!(
-            status >= 500 && body != BACKEND_FAILURE_BODY,
+            (status == 0 || status >= 500) && body != BACKEND_FAILURE_BODY,
             "request {n} after the breaker opened was not refused by the proxy: \
              {status} {body:?}"
         );
