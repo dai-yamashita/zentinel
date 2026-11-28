@@ -10,9 +10,10 @@
 //! and, for the PII check, an in-test guardrail agent (v2, over a Unix
 //! socket) that reports PII in content containing `123-45-6789`.
 //!
-//! The token limiter and the budget are keyed by the client address. The
-//! listener trusts `127.0.0.1` as a proxy, so a test speaks for different
-//! clients with `X-Forwarded-For`.
+//! The token limiter and the budget are keyed by the client address, or on
+//! the `keyed-*` routes by the `X-API-Key` header. The listener trusts
+//! `127.0.0.1` as a proxy, so a test speaks for different clients with
+//! `X-Forwarded-For`.
 
 #![cfg(unix)]
 
@@ -585,6 +586,53 @@ routes {{
             }}
         }}
     }}
+    route "keyed-tokens" {{
+        matches {{ path-prefix "/keyed-tokens/" }}
+        upstream "first"
+        service-type "inference"
+        inference {{
+            provider "openai"
+            rate-limit {{
+                tokens-per-minute 600
+                burst-tokens 500
+                estimation-method "chars"
+                key "header:X-API-Key"
+            }}
+        }}
+    }}
+    route "keyed-budget" {{
+        matches {{ path-prefix "/keyed-budget/" }}
+        upstream "first"
+        service-type "inference"
+        inference {{
+            provider "openai"
+            budget {{
+                period "daily"
+                limit 1000
+                enforce #true
+                key "header:X-API-Key"
+            }}
+        }}
+    }}
+    route "keyed-reject" {{
+        matches {{ path-prefix "/keyed-reject/" }}
+        upstream "first"
+        service-type "inference"
+        inference {{
+            provider "openai"
+            rate-limit {{
+                tokens-per-minute 1000000
+                burst-tokens 1000000
+                key "header:X-API-Key"
+                missing-key "reject"
+            }}
+            budget {{
+                limit 1000000
+                key "header:X-API-Key"
+                missing-key "reject"
+            }}
+        }}
+    }}
     route "soft-budget" {{
         matches {{ path-prefix "/soft-budget/" }}
         upstream "first"
@@ -987,6 +1035,174 @@ fn token_budget_counts_reported_usage() {
         assert_eq!(other.status, 200, "{route}: {}", other.body);
         assert_eq!(other.budget_remaining(), 1000 - estimate, "{route}");
     }
+}
+
+/// A raw API key the keyed tests send; it must not show up in the metrics.
+const SECRET_KEY: &str = "sk-live-zentinel-test-0123456789";
+
+/// The paths of the requests the provider got under `prefix`.
+fn forwarded(setup: &Setup, prefix: &str) -> Vec<String> {
+    setup
+        .first
+        .requests_to(prefix)
+        .iter()
+        .map(|(head, _)| head.split(' ').nth(1).unwrap().to_string())
+        .collect()
+}
+
+/// With `key "header:X-API-Key"` the token rate limit is per key: two keys
+/// from one address get a bucket each, and one key from two addresses
+/// shares one.
+#[test]
+fn token_rate_limit_is_per_header_key() {
+    let setup = setup();
+    // About 260 tokens: one fits in the burst of 500, two do not.
+    let prompt = chat("gpt-4", &"a".repeat(1000));
+    let key_a = [("X-Forwarded-For", "10.0.0.1"), ("X-API-Key", SECRET_KEY)];
+    let key_b = [("X-Forwarded-For", "10.0.0.1"), ("X-API-Key", "sk-other")];
+    let key_a_elsewhere = [("X-Forwarded-For", "10.0.0.2"), ("X-API-Key", SECRET_KEY)];
+
+    let response = send(setup.port, "/keyed-tokens/a1", Some(&prompt), &key_a);
+    assert_eq!(response.status, 200, "{}", response.body);
+    let response = send(setup.port, "/keyed-tokens/a2", Some(&prompt), &key_a);
+    assert_eq!(response.status, 429, "{}", response.body);
+    assert!(
+        response.body.contains("Token rate limit exceeded"),
+        "{}",
+        response.body
+    );
+
+    let response = send(setup.port, "/keyed-tokens/b1", Some(&prompt), &key_b);
+    assert_eq!(
+        response.status, 200,
+        "another key from the same address was refused: {}",
+        response.body
+    );
+
+    let response = send(
+        setup.port,
+        "/keyed-tokens/a3",
+        Some(&prompt),
+        &key_a_elsewhere,
+    );
+    assert_eq!(
+        response.status, 429,
+        "the same key from another address got a bucket of its own: {}",
+        response.body
+    );
+
+    assert_eq!(
+        forwarded(&setup, "/keyed-tokens/"),
+        ["/keyed-tokens/a1", "/keyed-tokens/b1"]
+    );
+}
+
+/// With `key "header:X-API-Key"` the token budget is per key: the usage of
+/// one key does not count against another key from the same address, and
+/// counts against the same key from another address.
+#[test]
+fn token_budget_is_per_header_key() {
+    let setup = setup();
+    let prompt = chat("gpt-4", "hello");
+    let key_a = [
+        ("X-Forwarded-For", "10.0.0.1"),
+        ("X-API-Key", SECRET_KEY),
+        ("x-test-usage", "300,100"),
+    ];
+    let key_b = [("X-Forwarded-For", "10.0.0.1"), ("X-API-Key", "sk-other")];
+    let key_a_elsewhere = [("X-Forwarded-For", "10.0.0.2"), ("X-API-Key", SECRET_KEY)];
+
+    let first = send(setup.port, "/keyed-budget/a1", Some(&prompt), &key_a);
+    assert_eq!(first.status, 200, "{}", first.body);
+    let estimate = 1000 - first.budget_remaining();
+    assert!((1..100).contains(&estimate), "{estimate}");
+    settle();
+
+    // Key A has used 400 tokens.
+    let other = send(setup.port, "/keyed-budget/b1", Some(&prompt), &key_b);
+    assert_eq!(other.status, 200, "{}", other.body);
+    assert_eq!(
+        other.budget_remaining(),
+        1000 - estimate,
+        "another key from the same address shares the budget"
+    );
+    settle();
+
+    let elsewhere = send(
+        setup.port,
+        "/keyed-budget/a2",
+        Some(&prompt),
+        &key_a_elsewhere,
+    );
+    assert_eq!(elsewhere.status, 200, "{}", elsewhere.body);
+    assert_eq!(
+        elsewhere.budget_remaining(),
+        1000 - 400 - estimate,
+        "the same key from another address has a budget of its own"
+    );
+
+    // The key is not a metric label, nor anywhere else in the metrics.
+    let metrics = send(setup.metrics_port, "/metrics", None, &[]);
+    assert_eq!(metrics.status, 200, "{}", metrics.body);
+    assert!(metrics.body.contains("zentinel_up 1"), "{}", metrics.body);
+    assert!(
+        !metrics.body.contains(SECRET_KEY) && !metrics.body.contains("sk-other"),
+        "a raw key is in the metrics"
+    );
+}
+
+/// A request without the key header is counted against its client address
+/// by default, and is refused with 401 under `missing-key "reject"`, as is
+/// one whose header is empty.
+#[test]
+fn a_request_without_the_key_header() {
+    let setup = setup();
+    let prompt = chat("gpt-4", &"a".repeat(1000));
+    let client_a = [("X-Forwarded-For", "10.0.0.3")];
+    let client_b = [("X-Forwarded-For", "10.0.0.4")];
+
+    // Falls back to the client address: a bucket per client.
+    let response = send(setup.port, "/keyed-tokens/a1", Some(&prompt), &client_a);
+    assert_eq!(response.status, 200, "{}", response.body);
+    let response = send(setup.port, "/keyed-tokens/a2", Some(&prompt), &client_a);
+    assert_eq!(response.status, 429, "{}", response.body);
+    let response = send(setup.port, "/keyed-tokens/b1", Some(&prompt), &client_b);
+    assert_eq!(response.status, 200, "{}", response.body);
+    // An empty header is no key.
+    let empty = [("X-Forwarded-For", "10.0.0.4"), ("X-API-Key", "")];
+    let response = send(setup.port, "/keyed-tokens/b2", Some(&prompt), &empty);
+    assert_eq!(response.status, 429, "{}", response.body);
+
+    // `missing-key "reject"`.
+    for (n, headers) in [
+        ("1", &client_a[..]),
+        (
+            "2",
+            &[("X-Forwarded-For", "10.0.0.3"), ("X-API-Key", "")][..],
+        ),
+    ] {
+        let response = send(
+            setup.port,
+            &format!("/keyed-reject/{n}"),
+            Some(&prompt),
+            headers,
+        );
+        assert_eq!(response.status, 401, "{n}: {}", response.body);
+        assert!(
+            response.body.contains("Missing x-api-key header"),
+            "{n}: {}",
+            response.body
+        );
+    }
+    let keyed = [("X-Forwarded-For", "10.0.0.3"), ("X-API-Key", SECRET_KEY)];
+    let response = send(setup.port, "/keyed-reject/3", Some(&prompt), &keyed);
+    assert_eq!(response.status, 200, "{}", response.body);
+
+    assert_eq!(
+        forwarded(&setup, "/keyed-tokens/"),
+        ["/keyed-tokens/a1", "/keyed-tokens/b1"]
+    );
+    assert_eq!(forwarded(&setup, "/keyed-reject/"), ["/keyed-reject/3"]);
 }
 
 /// The cost metrics move by the cost of the usage the provider reports, at

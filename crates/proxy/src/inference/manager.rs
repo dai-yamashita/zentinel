@@ -8,7 +8,9 @@ use http::HeaderMap;
 use std::sync::Arc;
 use tracing::{debug, info, trace};
 
-use zentinel_common::budget::{BudgetAlert, BudgetCheckResult, CostResult};
+use zentinel_common::budget::{
+    BudgetAlert, BudgetCheckResult, CostResult, InferenceLimitKey, MissingKeyAction,
+};
 use zentinel_config::{InferenceConfig, TokenEstimation};
 
 use super::budget::TokenBudgetTracker;
@@ -27,8 +29,72 @@ struct RouteInferenceState {
     cost_calculator: Option<CostCalculator>,
     /// Token counter (for estimation and actual counting)
     token_counter: TokenCounter,
+    /// What the rate limiter counts a request against
+    rate_limit_key: (InferenceLimitKey, MissingKeyAction),
+    /// What the budget counts a request against
+    budget_key: (InferenceLimitKey, MissingKeyAction),
     /// Route ID for logging
     route_id: String,
+}
+
+/// The keys a request is counted against by its route's token rate limit
+/// and budget. The pre-check and the recording of the actual usage use the
+/// same keys.
+///
+/// A key is the client key (the client address, an IPv6 client by its
+/// network) or, for `key "header:<name>"`, `key:` followed by the first 16
+/// hex digits of the SHA-256 of the header's value. The value itself (an API
+/// key, say) is never kept, logged or used as a metric label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InferenceKeys {
+    /// The key of the token rate limiter
+    pub rate_limit: String,
+    /// The key of the token budget
+    pub budget: String,
+}
+
+/// A request refused because it lacks the header its route's token rate
+/// limit or budget is keyed by, under `missing-key "reject"`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingInferenceKey {
+    /// `rate-limit` or `budget`
+    pub block: &'static str,
+    /// The header (lowercase)
+    pub header: String,
+}
+
+/// The key of one block (`block` names it), or the refusal of a request
+/// without its header under `missing-key "reject"`.
+fn limit_key(
+    block: &'static str,
+    (key, missing): &(InferenceLimitKey, MissingKeyAction),
+    client_key: &str,
+    headers: &HeaderMap,
+) -> Result<String, MissingInferenceKey> {
+    let InferenceLimitKey::Header(name) = key else {
+        return Ok(client_key.to_string());
+    };
+    // The first value; an empty one is no key.
+    let value = headers
+        .get(name.as_str())
+        .map(|value| value.as_bytes().trim_ascii())
+        .filter(|value| !value.is_empty());
+    match (value, missing) {
+        (Some(value), _) => Ok(hashed_key(value)),
+        (None, MissingKeyAction::ClientIp) => Ok(client_key.to_string()),
+        (None, MissingKeyAction::Reject) => Err(MissingInferenceKey {
+            block,
+            header: name.clone(),
+        }),
+    }
+}
+
+/// `key:` and the first 16 hex digits of the SHA-256 of a header value.
+/// The prefix keeps it apart from a client address.
+pub fn hashed_key(value: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(value);
+    format!("key:{}", hex::encode(&digest[..8]))
 }
 
 /// Manager for inference rate limiting, budgets, and cost tracking.
@@ -101,11 +167,23 @@ impl InferenceRateLimitManager {
 
         // Only register if at least one feature is enabled
         if rate_limiter.is_some() || budget_tracker.is_some() || cost_calculator.is_some() {
+            let rate_limit_key = config
+                .rate_limit
+                .as_ref()
+                .map(|rl| (rl.key.clone(), rl.missing_key))
+                .unwrap_or_default();
+            let budget_key = config
+                .budget
+                .as_ref()
+                .map(|budget| (budget.key.clone(), budget.missing_key))
+                .unwrap_or_default();
             let state = RouteInferenceState {
                 rate_limiter,
                 budget_tracker,
                 cost_calculator,
                 token_counter,
+                rate_limit_key,
+                budget_key,
                 route_id: route_id.to_string(),
             };
 
@@ -146,6 +224,34 @@ impl InferenceRateLimitManager {
                     .unwrap_or(false)
             })
             .unwrap_or(false)
+    }
+
+    /// The keys a request is counted against by the route's token rate limit
+    /// and budget, from its client key (the client address, an IPv6 client
+    /// by its network) and its headers.
+    ///
+    /// Returns `Err` for a request without the header a block is keyed by
+    /// under `missing-key "reject"` (the rate limit is looked at first), and
+    /// `None` for a route that is not registered.
+    pub fn keys(
+        &self,
+        route_id: &str,
+        client_key: &str,
+        headers: &HeaderMap,
+    ) -> Option<Result<InferenceKeys, MissingInferenceKey>> {
+        let state = self.routes.get(route_id)?;
+        let keys = || -> Result<InferenceKeys, MissingInferenceKey> {
+            let rate_limit = match state.rate_limiter {
+                Some(_) => limit_key("rate-limit", &state.rate_limit_key, client_key, headers)?,
+                None => client_key.to_string(),
+            };
+            let budget = match state.budget_tracker {
+                Some(_) => limit_key("budget", &state.budget_key, client_key, headers)?,
+                None => client_key.to_string(),
+            };
+            Ok(InferenceKeys { rate_limit, budget })
+        };
+        Some(keys())
     }
 
     /// Check rate limit for a request.
@@ -393,6 +499,8 @@ mod tests {
                 requests_per_minute: Some(100),
                 burst_tokens: 2000,
                 estimation_method: TokenEstimation::Chars,
+                key: Default::default(),
+                missing_key: Default::default(),
             }),
             budget: None,
             cost_attribution: None,
@@ -465,6 +573,8 @@ mod tests {
                 rollover: false,
                 burst_allowance: None,
                 max_tenants: 10_000,
+                key: Default::default(),
+                missing_key: Default::default(),
             }),
             cost_attribution: None,
             routing: None,
@@ -476,5 +586,129 @@ mod tests {
         assert!(manager.has_route("budget-route"));
         assert!(manager.has_budget("budget-route"));
         assert!(!manager.has_cost_attribution("budget-route"));
+    }
+
+    /// A route keyed by `x-api-key` for the rate limit and by `x-org-id`
+    /// for the budget, with the given `missing-key` for both.
+    fn keyed_manager(missing: MissingKeyAction) -> InferenceRateLimitManager {
+        let mut config = test_inference_config();
+        if let Some(rate_limit) = config.rate_limit.as_mut() {
+            rate_limit.key = InferenceLimitKey::Header("x-api-key".into());
+            rate_limit.missing_key = missing;
+        }
+        config.budget = Some(zentinel_common::budget::TokenBudgetConfig {
+            key: InferenceLimitKey::Header("x-org-id".into()),
+            missing_key: missing,
+            ..Default::default()
+        });
+        let manager = InferenceRateLimitManager::new();
+        manager.register_route("keyed", &config);
+        manager
+    }
+
+    fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.append(*name, value.parse().unwrap());
+        }
+        headers
+    }
+
+    #[test]
+    fn keys_default_to_the_client_key() {
+        let manager = InferenceRateLimitManager::new();
+        manager.register_route("r", &test_inference_config());
+        let keys = manager
+            .keys("r", "10.0.0.1", &headers(&[("x-api-key", "secret")]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(keys.rate_limit, "10.0.0.1");
+        assert_eq!(keys.budget, "10.0.0.1");
+        assert!(manager
+            .keys("other", "10.0.0.1", &HeaderMap::new())
+            .is_none());
+    }
+
+    #[test]
+    fn header_keys_are_hashed_per_block() {
+        let manager = keyed_manager(MissingKeyAction::ClientIp);
+        let keys = manager
+            .keys(
+                "keyed",
+                "10.0.0.1",
+                &headers(&[("x-api-key", "sk-secret-1"), ("x-org-id", "acme")]),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(keys.rate_limit, hashed_key(b"sk-secret-1"));
+        assert_eq!(keys.budget, hashed_key(b"acme"));
+        assert!(!keys.rate_limit.contains("secret"));
+        assert_eq!(keys.rate_limit.len(), "key:".len() + 16);
+        // The same key from another address is the same key; another key is
+        // another.
+        let again = manager
+            .keys(
+                "keyed",
+                "10.0.0.2",
+                &headers(&[("x-api-key", "sk-secret-1")]),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(again.rate_limit, keys.rate_limit);
+        let other = manager
+            .keys(
+                "keyed",
+                "10.0.0.1",
+                &headers(&[("x-api-key", "sk-secret-2")]),
+            )
+            .unwrap()
+            .unwrap();
+        assert_ne!(other.rate_limit, keys.rate_limit);
+    }
+
+    #[test]
+    fn the_first_header_value_is_the_key_and_an_empty_one_is_missing() {
+        let manager = keyed_manager(MissingKeyAction::ClientIp);
+        let keys = manager
+            .keys(
+                "keyed",
+                "10.0.0.1",
+                &headers(&[("x-api-key", "first"), ("x-api-key", "second")]),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(keys.rate_limit, hashed_key(b"first"));
+        let keys = manager
+            .keys("keyed", "10.0.0.1", &headers(&[("x-api-key", "")]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(keys.rate_limit, "10.0.0.1");
+        // Without `x-org-id` the budget falls back to the client.
+        assert_eq!(keys.budget, "10.0.0.1");
+    }
+
+    #[test]
+    fn a_missing_key_is_refused_with_reject() {
+        let manager = keyed_manager(MissingKeyAction::Reject);
+        let refused = manager
+            .keys("keyed", "10.0.0.1", &headers(&[("x-org-id", "acme")]))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            refused,
+            MissingInferenceKey {
+                block: "rate-limit",
+                header: "x-api-key".into()
+            }
+        );
+        let refused = manager
+            .keys(
+                "keyed",
+                "10.0.0.1",
+                &headers(&[("x-api-key", "k"), ("x-org-id", " ")]),
+            )
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(refused.block, "budget");
     }
 }

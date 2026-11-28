@@ -259,13 +259,13 @@ fn a_fallback_written_inside_inference_and_token_estimation_are_reported() {
 #[test]
 fn keys_the_token_limit_and_budget_blocks_do_not_read_are_reported() {
     assert_reported(
-        &Doc::route("inference {\n rate-limit {\n tokens-per-minute 100\n key \"x\"\n }\n}"),
-        "key",
+        &Doc::route("inference {\n rate-limit {\n tokens-per-minute 100\n tenant \"x\"\n }\n}"),
+        "tenant",
         "route 'r'",
     );
     assert_reported(
-        &Doc::route("inference {\n budget {\n limit 10\n key \"x\"\n }\n}"),
-        "key",
+        &Doc::route("inference {\n budget {\n limit 10\n tenant \"x\"\n }\n}"),
+        "tenant",
         "route 'r'",
     );
     assert_reported(
@@ -343,9 +343,11 @@ fn inference_routing_is_reported_as_not_applied() {
 fn every_inference_setting_the_parser_reads_and_the_proxy_applies_is_quiet() {
     assert_quiet(&Doc::route(
         "inference {\n provider \"openai\"\n rate-limit {\n tokens-per-minute 1000\n \
-         requests-per-minute 10\n burst-tokens 100\n estimation-method \"words\"\n }\n \
+         requests-per-minute 10\n burst-tokens 100\n estimation-method \"words\"\n \
+         key \"header:X-API-Key\"\n missing-key \"reject\"\n }\n \
          budget {\n period \"daily\"\n limit 100000\n alert-thresholds 0.8 0.9\n \
-         enforce #true\n rollover #false\n burst-allowance 0.1\n max-tenants 100\n }\n \
+         enforce #true\n rollover #false\n burst-allowance 0.1\n max-tenants 100\n \
+         key \"header:X-Org-Id\"\n missing-key \"client-ip\"\n }\n \
          cost-attribution {\n enabled #true\n default-input-cost 1.0\n \
          default-output-cost 2.0\n currency \"USD\"\n pricing {\n model \"gpt-4*\" {\n \
          input-cost-per-million 30.0\n output-cost-per-million 60.0\n currency \"USD\"\n }\n \

@@ -6,7 +6,8 @@ use std::path::PathBuf;
 use tracing::{trace, warn};
 
 use zentinel_common::budget::{
-    BudgetPeriod, CostAttributionConfig, ModelPricing, TokenBudgetConfig,
+    BudgetPeriod, CostAttributionConfig, InferenceLimitKey, MissingKeyAction, ModelPricing,
+    TokenBudgetConfig,
 };
 
 use crate::agentic::{A2aConfig, McpConfig, McpUpstream, UninspectableBody, UnknownMethods};
@@ -1556,6 +1557,8 @@ pub(crate) const RECOGNIZED_TOKEN_RATE_LIMIT_KEYS: &[&str] = &[
     "requests-per-minute",
     "burst-tokens",
     "estimation-method",
+    "key",
+    "missing-key",
 ];
 
 /// Every child node `parse_inference_routing` reads.
@@ -1570,6 +1573,8 @@ pub(crate) const RECOGNIZED_TOKEN_BUDGET_KEYS: &[&str] = &[
     "rollover",
     "burst-allowance",
     "max-tenants",
+    "key",
+    "missing-key",
 ];
 
 /// Every child node `parse_cost_attribution` reads.
@@ -2080,12 +2085,73 @@ fn parse_token_rate_limit(node: &kdl::KdlNode) -> Result<TokenRateLimit> {
         }
     };
 
+    let (key, missing_key) = parse_inference_limit_key(node, "rate-limit")?;
+
     Ok(TokenRateLimit {
         tokens_per_minute,
         requests_per_minute,
         burst_tokens,
         estimation_method,
+        key,
+        missing_key,
     })
+}
+
+/// Parse the `key` and `missing-key` of an inference `rate-limit` or
+/// `budget` block (`block` names it in errors).
+///
+/// `key` is `"client-ip"` (the default) or `"header:<name>"`; `missing-key`
+/// is `"client-ip"` (the default: a request without the header is counted
+/// against its client address) or `"reject"` (it is refused with 401).
+fn parse_inference_limit_key(
+    node: &kdl::KdlNode,
+    block: &str,
+) -> Result<(InferenceLimitKey, MissingKeyAction)> {
+    let key = match get_string_entry(node, "key")?.as_deref() {
+        None | Some("client-ip") => InferenceLimitKey::ClientIp,
+        Some(other) => match other.strip_prefix("header:") {
+            Some(name) => {
+                let name = name.trim();
+                if name.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "inference {block}: 'key \"header:\"' names no header; \
+                         use 'key \"header:<name>\"', e.g. 'key \"header:X-API-Key\"'"
+                    ));
+                }
+                // A header name is an RFC 9110 token.
+                let tchar = |b: u8| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b);
+                if !name.bytes().all(tchar) {
+                    return Err(anyhow::anyhow!(
+                        "inference {block}: '{name}' in 'key' is not a valid header name"
+                    ));
+                }
+                InferenceLimitKey::Header(name.to_ascii_lowercase())
+            }
+            None => {
+                return Err(anyhow::anyhow!(
+                    "inference {block}: unknown key '{other}'. Valid keys: \
+                     client-ip, header:<name>"
+                ));
+            }
+        },
+    };
+    let missing_key = match get_string_entry(node, "missing-key")?.as_deref() {
+        None | Some("client-ip") => MissingKeyAction::ClientIp,
+        Some("reject") => MissingKeyAction::Reject,
+        Some(other) => {
+            return Err(anyhow::anyhow!(
+                "inference {block}: unknown missing-key '{other}'. Valid values: \
+                 client-ip, reject"
+            ));
+        }
+    };
+    if missing_key == MissingKeyAction::Reject && key == InferenceLimitKey::ClientIp {
+        warn!(
+            block,
+            "inference: 'missing-key \"reject\"' has no effect without 'key \"header:<name>\"'"
+        );
+    }
+    Ok((key, missing_key))
 }
 
 /// Parse inference routing configuration
@@ -2174,6 +2240,8 @@ fn parse_token_budget(node: &kdl::KdlNode) -> Result<TokenBudgetConfig> {
         "Parsed token budget configuration"
     );
 
+    let (key, missing_key) = parse_inference_limit_key(node, "budget")?;
+
     Ok(TokenBudgetConfig {
         period,
         limit,
@@ -2182,6 +2250,8 @@ fn parse_token_budget(node: &kdl::KdlNode) -> Result<TokenBudgetConfig> {
         rollover,
         burst_allowance,
         max_tenants,
+        key,
+        missing_key,
     })
 }
 
@@ -3840,6 +3910,128 @@ mod tests {
             assert_eq!(pii.block_status, 451);
             assert_eq!(pii.block_message.as_deref(), Some("no PII"));
             assert_eq!(pii.failure_mode, crate::GuardrailFailureMode::Closed);
+        }
+    }
+
+    /// `key` and `missing-key` of an inference `rate-limit` and `budget`
+    /// (#861).
+    mod inference_limit_key {
+        use crate::{InferenceLimitKey, MissingKeyAction};
+
+        fn config_with(rate_limit: &str, budget: &str) -> anyhow::Result<crate::Config> {
+            crate::Config::from_kdl(&format!(
+                r#"
+                system {{ worker-threads 2 }}
+                listeners {{
+                    listener "http" {{
+                        address "127.0.0.1:8080"
+                        protocol "http"
+                    }}
+                }}
+                upstreams {{
+                    upstream "backend" {{
+                        target "127.0.0.1:9000"
+                    }}
+                }}
+                routes {{
+                    route "chat" {{
+                        matches {{ path-prefix "/chat" }}
+                        upstream "backend"
+                        service-type "inference"
+                        inference {{
+                            provider "openai"
+                            rate-limit {{
+                                tokens-per-minute 1000
+                                {rate_limit}
+                            }}
+                            budget {{
+                                limit 100000
+                                {budget}
+                            }}
+                        }}
+                    }}
+                }}
+                "#
+            ))
+        }
+
+        fn keys(
+            config: &crate::Config,
+        ) -> (
+            (InferenceLimitKey, MissingKeyAction),
+            (InferenceLimitKey, MissingKeyAction),
+        ) {
+            let inference = config.routes[0].inference.as_ref().unwrap();
+            let rate_limit = inference.rate_limit.as_ref().unwrap();
+            let budget = inference.budget.as_ref().unwrap();
+            (
+                (rate_limit.key.clone(), rate_limit.missing_key),
+                (budget.key.clone(), budget.missing_key),
+            )
+        }
+
+        #[test]
+        fn defaults_to_the_client_address() {
+            let config = config_with("", "").unwrap();
+            let client = (InferenceLimitKey::ClientIp, MissingKeyAction::ClientIp);
+            assert_eq!(keys(&config), (client.clone(), client));
+        }
+
+        #[test]
+        fn reads_a_header_key_and_missing_key_in_each_block() {
+            let config = config_with(
+                r#"key "header:X-API-Key"; missing-key "reject""#,
+                r#"key "header:X-Org-Id"; missing-key "client-ip""#,
+            )
+            .unwrap();
+            assert_eq!(
+                keys(&config),
+                (
+                    (
+                        InferenceLimitKey::Header("x-api-key".into()),
+                        MissingKeyAction::Reject
+                    ),
+                    (
+                        InferenceLimitKey::Header("x-org-id".into()),
+                        MissingKeyAction::ClientIp
+                    ),
+                )
+            );
+            let config = config_with(r#"key "client-ip""#, r#"key "client-ip""#).unwrap();
+            assert_eq!(keys(&config).0 .0, InferenceLimitKey::ClientIp);
+            assert_eq!(keys(&config).1 .0, InferenceLimitKey::ClientIp);
+        }
+
+        #[test]
+        fn an_empty_header_name_is_an_error() {
+            for (rate_limit, budget, block) in [
+                (r#"key "header:""#, "", "rate-limit"),
+                ("", r#"key "header:""#, "budget"),
+                (r#"key "header:  ""#, "", "rate-limit"),
+            ] {
+                let error = format!("{:#}", config_with(rate_limit, budget).unwrap_err());
+                assert!(
+                    error.contains(&format!("inference {block}"))
+                        && error.contains("names no header"),
+                    "{error}"
+                );
+            }
+        }
+
+        #[test]
+        fn an_invalid_header_name_or_unknown_key_is_an_error() {
+            let error = format!(
+                "{:#}",
+                config_with(r#"key "header:X API Key""#, "").unwrap_err()
+            );
+            assert!(error.contains("not a valid header name"), "{error}");
+            let error = format!("{:#}", config_with("", r#"key "path""#).unwrap_err());
+            assert!(error.contains("unknown key 'path'"), "{error}");
+            let error = format!(
+                "{:#}",
+                config_with(r#"missing-key "allow""#, "").unwrap_err()
+            );
+            assert!(error.contains("unknown missing-key 'allow'"), "{error}");
         }
     }
 }

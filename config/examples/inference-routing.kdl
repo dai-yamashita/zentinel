@@ -121,12 +121,20 @@ routes {
             rate-limit {
                 tokens-per-minute 100000
                 burst-tokens 20000
+                // A bucket per API key (held as a hash); a request without
+                // the header counts against its client address
+                key "header:X-API-Key"
+                missing-key "client-ip"
             }
 
             // Token budget for cumulative tracking
             budget {
                 limit 10000000  // 10M tokens per period
                 period "monthly"
+                // A budget per tenant; a request without X-Org-Id is
+                // refused with 401
+                key "header:X-Org-Id"
+                missing-key "reject"
             }
 
             // Cost attribution for billing

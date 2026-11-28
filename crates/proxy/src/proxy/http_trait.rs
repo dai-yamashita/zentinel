@@ -4644,10 +4644,16 @@ impl ProxyHttp for ZentinelProxy {
                     );
 
                     // Record budget usage with actual tokens (if budget tracking enabled)
-                    if ctx.inference_budget_enabled {
+                    // Recorded against the budget key the request was
+                    // checked against (set whenever the budget is enabled).
+                    let budget_key = ctx
+                        .inference_budget_key
+                        .as_deref()
+                        .filter(|_| ctx.inference_budget_enabled);
+                    if let Some(budget_key) = budget_key {
                         let alerts = self.inference_rate_limit_manager.record_budget(
                             route_id,
-                            rate_limit_key,
+                            budget_key,
                             actual_tokens,
                         );
 
@@ -4667,7 +4673,7 @@ impl ProxyHttp for ZentinelProxy {
                         // Update context with remaining budget
                         if let Some(status) = self
                             .inference_rate_limit_manager
-                            .budget_status(route_id, rate_limit_key)
+                            .budget_status(route_id, budget_key)
                         {
                             ctx.inference_budget_remaining = Some(status.tokens_remaining as i64);
                         }
@@ -6367,6 +6373,45 @@ impl ZentinelProxy {
         Ok(())
     }
 
+    /// Refuse a request without the header its route's token rate limit or
+    /// budget is keyed by, under `missing-key "reject"`: `401 Unauthorized`,
+    /// as for an agent's authentication challenge. The answer names the
+    /// header, never a value.
+    async fn refuse_missing_inference_key(
+        &self,
+        session: &mut Session,
+        ctx: &mut RequestContext,
+        route_id: &str,
+        missing: &crate::inference::MissingInferenceKey,
+    ) -> Result<(), Box<Error>> {
+        warn!(
+            correlation_id = %ctx.trace_id,
+            route_id = route_id,
+            client_ip = %ctx.client_ip,
+            block = missing.block,
+            header = %missing.header,
+            "Inference request without the header its token limit is keyed by"
+        );
+        self.metrics.record_blocked_request("inference_key_missing");
+        let audit_entry = AuditLogEntry::new(
+            &ctx.trace_id,
+            AuditEventType::Blocked,
+            &ctx.method,
+            &ctx.path,
+            &ctx.client_ip,
+        )
+        .with_route_id(route_id)
+        .with_status_code(401)
+        .with_reason(format!(
+            "Missing {} header (inference {} key)",
+            missing.header, missing.block
+        ));
+        self.log_manager.log_audit(&audit_entry);
+        let body = format!("Missing {} header", missing.header);
+        let refusal = rate_limit_refusal(401, &body, Vec::new());
+        self.write_proxy_error(session, ctx, refusal).await
+    }
+
     /// The token rate limit and the token budget of an inference route,
     /// checked on the estimate of the request body read by
     /// `read_inference_request_body`.
@@ -6388,11 +6433,30 @@ impl ZentinelProxy {
                     let body = ctx.validated_request_body.clone().unwrap_or_default();
                     let headers = &session.req_header().headers;
 
-                    // Use the client as the rate limit key (could be enhanced to use API key
-                    // header). An IPv6 client is keyed by its network, like every other
-                    // per-client limit.
+                    // The keys of the rate limit and the budget: the client
+                    // (an IPv6 client by its network, like every other
+                    // per-client limit) or, with `key "header:<name>"`, a hash
+                    // of that header's value. The same keys record the actual
+                    // usage once the response is in.
                     let client_key = self.rate_limit_manager.client_key(&ctx.client_ip);
-                    let rate_limit_key: &str = &client_key;
+                    let keys =
+                        match self
+                            .inference_rate_limit_manager
+                            .keys(route_id, &client_key, headers)
+                        {
+                            Some(Ok(keys)) => keys,
+                            Some(Err(missing)) => {
+                                let route_id = route_id.to_string();
+                                self.refuse_missing_inference_key(
+                                    session, ctx, &route_id, &missing,
+                                )
+                                .await?;
+                                return Ok(true);
+                            }
+                            None => return Ok(false),
+                        };
+                    let rate_limit_key: &str = &keys.rate_limit;
+                    let budget_key: &str = &keys.budget;
 
                     if let Some(check_result) = self.inference_rate_limit_manager.check(
                         route_id,
@@ -6407,6 +6471,7 @@ impl ZentinelProxy {
                         // reconciliation and of the cost.
                         ctx.inference_input_tokens = check_result.estimated_tokens;
                         ctx.inference_rate_limit_key = Some(rate_limit_key.to_string());
+                        ctx.inference_budget_key = Some(budget_key.to_string());
                         // The model the request names, as model routing reads it
                         // (header first, then the body), else the provider's guess.
                         ctx.inference_model = model_routing::extract_model_from_headers(headers)
@@ -6421,6 +6486,7 @@ impl ZentinelProxy {
                                 correlation_id = %ctx.trace_id,
                                 route_id = route_id,
                                 client_ip = %ctx.client_ip,
+                                limit_key = rate_limit_key,
                                 estimated_tokens = check_result.estimated_tokens,
                                 model = ?check_result.model,
                                 retry_after_ms = retry_after_ms,
@@ -6480,12 +6546,9 @@ impl ZentinelProxy {
                         if self.inference_rate_limit_manager.has_budget(route_id) {
                             ctx.inference_budget_enabled = true;
 
-                            if let Some(budget_result) =
-                                self.inference_rate_limit_manager.check_budget(
-                                    route_id,
-                                    rate_limit_key,
-                                    check_result.estimated_tokens,
-                                )
+                            if let Some(budget_result) = self
+                                .inference_rate_limit_manager
+                                .check_budget(route_id, budget_key, check_result.estimated_tokens)
                             {
                                 if !budget_result.is_allowed() {
                                     let retry_after_secs = budget_result.retry_after_secs();
@@ -6494,6 +6557,7 @@ impl ZentinelProxy {
                                         correlation_id = %ctx.trace_id,
                                         route_id = route_id,
                                         client_ip = %ctx.client_ip,
+                                        limit_key = budget_key,
                                         estimated_tokens = check_result.estimated_tokens,
                                         retry_after_secs = retry_after_secs,
                                         "Token budget exhausted"
@@ -6553,7 +6617,7 @@ impl ZentinelProxy {
                                 // Get period reset time from budget status
                                 if let Some(status) = self
                                     .inference_rate_limit_manager
-                                    .budget_status(route_id, rate_limit_key)
+                                    .budget_status(route_id, budget_key)
                                 {
                                     ctx.inference_budget_period_reset = Some(status.period_end);
                                 }

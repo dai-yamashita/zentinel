@@ -348,6 +348,8 @@ mod tests {
             requests_per_minute: Some(10),
             burst_tokens: 200,
             estimation_method: TokenEstimation::Chars,
+            key: Default::default(),
+            missing_key: Default::default(),
         }
     }
 
@@ -359,6 +361,8 @@ mod tests {
             requests_per_minute: None,
             burst_tokens: 200,
             estimation_method: TokenEstimation::Chars,
+            key: Default::default(),
+            missing_key: Default::default(),
         }
     }
 

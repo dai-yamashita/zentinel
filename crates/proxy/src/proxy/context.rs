@@ -571,8 +571,12 @@ pub struct RequestContext {
     pub(crate) inference_rate_limit_enabled: bool,
     /// Estimated tokens for this request (used for rate limiting)
     pub(crate) inference_estimated_tokens: u64,
-    /// Rate limit key used (client IP, API key, etc.)
+    /// The key the token rate limit counted this request against: the client
+    /// key, or a hash of the `key` header's value (see `InferenceKeys`)
     pub(crate) inference_rate_limit_key: Option<String>,
+    /// The key the token budget counted this request against, recorded with
+    /// the actual usage
+    pub(crate) inference_budget_key: Option<String>,
     /// Model name detected from request
     pub(crate) inference_model: Option<String>,
     /// The `model` field of the request body, on an inference route whose
@@ -785,6 +789,7 @@ impl RequestContext {
             inference_rate_limit_enabled: false,
             inference_estimated_tokens: 0,
             inference_rate_limit_key: None,
+            inference_budget_key: None,
             inference_model: None,
             inference_body_model: None,
             inference_provider_override: None,

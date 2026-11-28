@@ -447,6 +447,8 @@ mod tests {
             rollover: false,
             burst_allowance: None,
             max_tenants: 10_000,
+            key: Default::default(),
+            missing_key: Default::default(),
         }
     }
 

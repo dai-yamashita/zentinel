@@ -3229,10 +3229,10 @@ mod tests {
         fn the_blocks_of_an_inference_route_are_checked_against_what_the_parser_reads() {
             for (body, setting) in [
                 (
-                    r#"inference { rate-limit { tokens-per-minute 1; key "x" } }"#,
-                    "key",
+                    r#"inference { rate-limit { tokens-per-minute 1; tenant "x" } }"#,
+                    "tenant",
                 ),
-                (r#"inference { budget { limit 1; key "x" } }"#, "key"),
+                (r#"inference { budget { limit 1; tenant "x" } }"#, "tenant"),
                 (
                     r#"inference { budget { limit 1; daily-limit 1 } }"#,
                     "daily-limit",
@@ -3261,8 +3261,8 @@ mod tests {
                 assert_one_for(&route(body), setting, "route 'api'");
             }
             assert!(unapplied(&route(
-                r#"inference { rate-limit { tokens-per-minute 1; estimation-method "words" }
-                   budget { limit 1; period "daily"; alert-thresholds 0.5 }
+                r#"inference { rate-limit { tokens-per-minute 1; estimation-method "words"; key "header:X-API-Key"; missing-key "reject" }
+                   budget { limit 1; period "daily"; alert-thresholds 0.5; key "client-ip"; missing-key "client-ip" }
                    cost-attribution { pricing { model "m" { input-cost-per-million 1; output-cost-per-million 2 } } }
                    guardrails { pii-detection { agent "p"; categories "ssn" } } }"#
             ))

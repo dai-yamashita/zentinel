@@ -122,7 +122,8 @@ pub use zentinel_common::TraceIdFormat;
 
 // Re-export budget types from common for convenience
 pub use zentinel_common::budget::{
-    BudgetPeriod, CostAttributionConfig, ModelPricing, TokenBudgetConfig,
+    BudgetPeriod, CostAttributionConfig, InferenceLimitKey, MissingKeyAction, ModelPricing,
+    TokenBudgetConfig,
 };
 
 // Upstreams

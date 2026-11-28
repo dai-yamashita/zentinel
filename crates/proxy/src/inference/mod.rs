@@ -60,7 +60,10 @@ pub use guardrails::{
     extract_inference_content, BlockCause, GuardrailProcessor, PiiCheckResult,
     PromptInjectionResult,
 };
-pub use manager::{InferenceCheckResult, InferenceRateLimitManager, InferenceRouteStats};
+pub use manager::{
+    InferenceCheckResult, InferenceKeys, InferenceRateLimitManager, InferenceRouteStats,
+    MissingInferenceKey,
+};
 pub use metrics::{get_inference_metrics, init_inference_metrics, InferenceMetrics};
 pub use providers::{create_provider, InferenceProviderAdapter};
 pub use rate_limit::{TokenRateLimitResult, TokenRateLimiter};

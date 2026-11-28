@@ -135,6 +135,10 @@ route "/v1/chat/completions" {
 
             // Can also combine with request limits
             requests-per-minute 100
+
+            // Per client address (the default) or per header value,
+            // see "Keys" below
+            key "client-ip"
         }
     }
 }
@@ -198,6 +202,59 @@ route "/v1/chat/completions" {
     }
 }
 ```
+
+### Keys: Per Client or Per API Key
+
+The token rate limit and the budget count each request against a key. By
+default it is the client address (an IPv6 client by its network prefix), so
+clients behind one NAT share a bucket and a budget. With `key "header:<name>"`
+a block counts against the value of that request header instead, such as an
+API key or a tenant id: two keys from one address are counted apart, and one
+key from several addresses is counted once.
+
+```kdl
+route "/v1/chat/completions" {
+    service-type "inference"
+    inference {
+        provider "openai"
+        rate-limit {
+            tokens-per-minute 100000
+            key "header:X-API-Key"     // a bucket per API key
+            missing-key "reject"       // no X-API-Key: 401
+        }
+        budget {
+            period "monthly"
+            limit 10000000
+            key "header:X-Org-Id"      // a budget per organization
+            // missing-key "client-ip" (the default): no X-Org-Id, the
+            // request counts against its client address
+        }
+    }
+}
+```
+
+| Setting | Values | Default |
+|---------|--------|---------|
+| `key` | `"client-ip"`, `"header:<name>"` | `"client-ip"` |
+| `missing-key` | `"client-ip"`, `"reject"` | `"client-ip"` |
+
+- The first value of the header is the key; a request without the header or
+  whose first value is empty (or only whitespace) has no key.
+- A request without a key is counted against its client address, or with
+  `missing-key "reject"` refused with `401 Unauthorized` and the body
+  `Missing <header> header` before any token is counted (the status the
+  proxy uses for an authentication challenge). The response has no
+  `WWW-Authenticate` header, as the proxy does not know the scheme.
+- The header's value is never kept: the key is `key:` followed by the first
+  16 hex digits of the SHA-256 of the value, and that is what the buckets and
+  budgets are held under and what logs show (`limit_key`). No raw value
+  reaches a log line or a metric label.
+- The key the request was checked against is the key its actual usage is
+  recorded against when the response is in.
+- An empty header name (`key "header:"`), a name that is not a header name
+  and an unknown `key` or `missing-key` are configuration errors.
+- `max-tenants` bounds the number of keys a budget holds; a rate limit holds
+  at most 100000 buckets.
 
 ### Tenant Bounds
 

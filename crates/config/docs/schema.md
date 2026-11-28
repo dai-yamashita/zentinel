@@ -359,6 +359,8 @@ budget count the prompt. See
 | `requests-per-minute` | `u64` | - | Max requests per minute |
 | `burst-tokens` | `u64` | `10000` | Burst token allowance |
 | `estimation-method` | `string` | `"chars"` | How the request's tokens are estimated from its body: `chars`, `words`, `tiktoken` |
+| `key` | `string` | `"client-ip"` | What a request is counted against: `client-ip` (the client address, IPv6 by network prefix) or `header:<name>` (the first value of that header, held as a SHA-256 hash, never raw). An empty header name is an error |
+| `missing-key` | `string` | `"client-ip"` | A request without the `key` header (or with an empty value): `client-ip` counts it against its client address, `reject` refuses it with `401` |
 
 ### TokenBudgetConfig
 
@@ -370,7 +372,9 @@ budget count the prompt. See
 | `enforce` | `bool` | `true` | Block requests when exhausted |
 | `rollover` | `bool` | `false` | Carry unused tokens into the next period |
 | `burst-allowance` | `f64` | - | Soft-limit burst fraction above the limit |
-| `max-tenants` | `usize` | `10000` | Max distinct tenants tracked in memory; expired tenants are evicted at the cap (see `zentinel_inference_budget_tenants` / `zentinel_inference_budget_tenant_evictions_total` metrics) |
+| `max-tenants` | `usize` | `10000` | Max distinct tenants (keys) tracked in memory; expired tenants are evicted at the cap (see `zentinel_inference_budget_tenants` / `zentinel_inference_budget_tenant_evictions_total` metrics) |
+| `key` | `string` | `"client-ip"` | What a request is counted against: `client-ip` (the client address, IPv6 by network prefix) or `header:<name>` (the first value of that header, held as a SHA-256 hash, never raw). An empty header name is an error |
+| `missing-key` | `string` | `"client-ip"` | A request without the `key` header (or with an empty value): `client-ip` counts it against its client address, `reject` refuses it with `401` |
 
 ### GuardrailsConfig
 
